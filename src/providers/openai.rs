@@ -47,6 +47,7 @@ use crate::config::{
 };
 use crate::model::{ImageInput, RequestManifest};
 use crate::providers::aws;
+use crate::providers::catalog;
 use crate::providers::openai_login::{CodexCredential, LoginError as CodexLoginError};
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
@@ -111,16 +112,6 @@ const OPENCODE_ZEN_RESPONSES_BASE: &str = "https://opencode.ai/zen/v1";
 /// resolves this recorded API root.
 const OPENCODE_GO_RESPONSES_BASE: &str = "https://opencode.ai/zen/go/v1";
 
-/// The Responses aliases' `upstreamModelId` table (DEC-013): the routed
-/// owner translates the public alias before the wire.
-const GITLAB_RESPONSES_MODELS: &[&str] = &["gpt-5-codex", "gpt-5.2-codex"];
-
-/// The closed Codex route table (AC-040i): the account-scoped ChatGPT
-/// listing may name other ids, but only these recorded Responses ids
-/// ride the wire, and a pinned id outside the table denies before any
-/// request. The device alias shares the one table.
-const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5.2-codex"];
-
 /// The account-scope header the ChatGPT Codex backend binds a request
 /// to (HZN-16-03): the workspace recorded on the scoped credential,
 /// sent only when the credential carries one.
@@ -176,56 +167,6 @@ const OLLAMA_DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
 /// The per-entry max output default (DEC-012).
 const OLLAMA_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 8_192;
-
-/// The recorded source sample of Responses-capable model ids the
-/// `openai` connection's catalogue surface filters `/models` to
-/// (HZN-008): the static sample the offline contract pins — live
-/// discovery is a later leg.
-const RESPONSES_MODELS: &[&str] = &["gpt-5.2", "gpt-5.2-codex", "gpt-5.1", "o4-mini", "o3"];
-
-/// The recorded closed seed of `bedrock-mantle` model ids (DEC-012):
-/// the offer set a failed or unparseable listing keeps, replaced by a
-/// successful authoritative listing — which may name no ids at all.
-const MANTLE_MODELS: &[&str] = &[
-    "openai.gpt-5.4",
-    "openai.gpt-5.5",
-    "openai.gpt-5.6-luna",
-    "openai.gpt-5.6-sol",
-    "openai.gpt-5.6-terra",
-];
-
-/// The recorded static seed of `abliteration` model ids (HZN-008,
-/// `ABLITERATION_STATIC_MODELS`): the merge floor the catalogue
-/// unions over the authoritative `/models` listing — a seeded id
-/// offers even when the listing omits it. The recorded source seeded
-/// them so generation and first boot could offer models with no live
-/// key; that rationale stays upstream's — this adapter resolves a
-/// credential before any catalogue call, so the seed's role here is
-/// the floor, never a keyless offer path.
-const ABLITERATION_MODELS: &[&str] = &[
-    "abliterated-model",
-    "abliterated-model-large",
-    "abliterated-model-large-v2",
-];
-
-/// The recorded static Muse roster of `meta` model ids (HZN-008,
-/// `META_MUSE_STATIC_MODELS`): the merge floor the catalogue unions
-/// over the authoritative `/models` listing — a rostered id offers
-/// even when the listing omits it. The recorded tiers ride verbatim:
-/// `muse-spark-1.1` ships as the standard SKU only, while
-/// `muse-spark-1.2` and `muse-spark-1.3` each carry both the
-/// standard and the `-contributor` training-eligible variant, and
-/// the Standard-or-Contributor payment predicate is stated by the
-/// id itself, never chosen silently by omitting either half. The
-/// record names an excluded-id filter but never its contents, so no
-/// exclusion is applied here.
-const META_MUSE_MODELS: &[&str] = &[
-    "muse-spark-1.1",
-    "muse-spark-1.2",
-    "muse-spark-1.2-contributor",
-    "muse-spark-1.3",
-    "muse-spark-1.3-contributor",
-];
 
 /// How one listed `/models` entry becomes an offered
 /// [`CatalogModel`]: the id alone under the contract's filter, the
@@ -325,7 +266,7 @@ enum AuthHeader {
 fn contract_for(connection: &str) -> Option<SourceContract> {
     match connection {
         "openai" => Some(SourceContract {
-            seed: RESPONSES_MODELS,
+            seed: catalog::OPENAI,
             authoritative_models: false,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: true,
@@ -351,7 +292,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // the Responses wire and the encrypted reasoning artifact are
         // shared with `openai`.
         "bedrock-mantle" => Some(SourceContract {
-            seed: MANTLE_MODELS,
+            seed: catalog::BEDROCK_MANTLE,
             authoritative_models: false,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: true,
@@ -360,7 +301,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             auth_header: AuthHeader::Bearer,
         }),
         "abliteration" => Some(SourceContract {
-            seed: ABLITERATION_MODELS,
+            seed: catalog::ABLITERATION,
             authoritative_models: true,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
@@ -369,7 +310,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             auth_header: AuthHeader::Bearer,
         }),
         "meta" => Some(SourceContract {
-            seed: META_MUSE_MODELS,
+            seed: catalog::META,
             authoritative_models: true,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
@@ -442,7 +383,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // fixed proxy base as the configured endpoint; the listing is
         // not a source — the alias table is.
         "gitlab-duo" => Some(SourceContract {
-            seed: GITLAB_RESPONSES_MODELS,
+            seed: catalog::GITLAB_RESPONSES,
             authoritative_models: true,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
@@ -483,7 +424,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // one credential profile. The arm has no recorded default base,
         // so an empty endpoint denies before the wire.
         "openai-codex" | "openai-codex-device" => Some(SourceContract {
-            seed: CODEX_MODELS,
+            seed: catalog::OPENAI_CODEX,
             authoritative_models: false,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: true,
@@ -531,7 +472,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
 /// the record never admitted.
 fn recorded_image_input(connection: &str, model: &str) -> bool {
     match connection {
-        "bedrock-mantle" => MANTLE_MODELS.contains(&model),
+        "bedrock-mantle" => catalog::BEDROCK_MANTLE.contains(&model),
         _ => false,
     }
 }
@@ -956,7 +897,7 @@ impl OpenAiProvider {
             let ambient = aws::ambient_region();
             let region = aws::resolve_region(
                 connection,
-                MANTLE_MODELS[0],
+                catalog::BEDROCK_MANTLE[0],
                 conn.region.as_deref(),
                 None,
                 ambient.as_deref(),
@@ -1225,7 +1166,7 @@ impl OpenAiProvider {
 
     /// The recorded 5-id seed, offered when discovery fails.
     fn mantle_seed(&self) -> Vec<CatalogModel> {
-        MANTLE_MODELS
+        catalog::BEDROCK_MANTLE
             .iter()
             .map(|id| CatalogModel {
                 id: (*id).to_string(),
@@ -1245,7 +1186,7 @@ impl OpenAiProvider {
         };
         match retained.as_ref() {
             Some(offer) => offer.iter().any(|id| id == model_id),
-            None => MANTLE_MODELS.contains(&model_id),
+            None => catalog::BEDROCK_MANTLE.contains(&model_id),
         }
     }
 
@@ -1655,7 +1596,11 @@ impl OpenAiProvider {
     /// dropping them would break the stateless replay. The wedge's
     /// recorded escape is a prefix mutation opening a new epoch with
     /// an empty set (F15).
-    fn request_body(&self, manifest: &RequestManifest, fixed: &FixedModel) -> Value {
+    fn request_body(
+        &self,
+        manifest: &RequestManifest,
+        fixed: &FixedModel,
+    ) -> Result<Value, ProviderError> {
         let key = (
             manifest.world.clone(),
             manifest.purpose.clone(),
@@ -1693,21 +1638,10 @@ impl OpenAiProvider {
             body["reasoning"] = json!({ "effort": value.name() });
         }
         if !manifest.tools.is_empty() {
-            body["tools"] = Value::Array(
-                manifest
-                    .tools
-                    .iter()
-                    .map(|name| {
-                        let mut tool = json!({ "type": "function", "name": name });
-                        if let Some(parameters) = super::project_tool_parameters(name) {
-                            tool["parameters"] = parameters;
-                        }
-                        tool
-                    })
-                    .collect(),
-            );
+            body["tools"] =
+                super::ToolFormat::Responses.tools(&self.connection, &manifest.tools)?;
         }
-        body
+        Ok(body)
     }
 
     /// Reads the SSE body through the shared bounded parser and
@@ -2503,7 +2437,8 @@ impl Provider for OpenAiProvider {
         // may name ids this contract does not serve, so a pin outside
         // the recorded table denies typed before the body exists —
         // never a silently dropped or forwarded model.
-        if is_codex_connection(&self.connection) && !CODEX_MODELS.contains(&fixed.model_id.as_str())
+        if is_codex_connection(&self.connection)
+            && !self.contract.seed.contains(&fixed.model_id.as_str())
         {
             return Err(ProviderError::UnsupportedParameter {
                 connection: self.connection.clone(),
@@ -2526,7 +2461,7 @@ impl Provider for OpenAiProvider {
         // The recorded xAI residue rejects the effort dial: the denial
         // lands before the body exists, never a silently dropped pin.
         self.check_effort(manifest, &fixed.model_id)?;
-        let body = self.request_body(manifest, &fixed);
+        let body = self.request_body(manifest, &fixed)?;
         let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
         // catalogue leg that spent the clock fails the send typed
@@ -2708,7 +2643,7 @@ mod tests {
     /// image the record never admitted.
     #[test]
     fn recorded_image_input_is_the_mantle_seed_only() {
-        for id in MANTLE_MODELS {
+        for id in catalog::BEDROCK_MANTLE {
             assert!(
                 recorded_image_input("bedrock-mantle", id),
                 "{id} carries the recorded image mark"
@@ -2718,7 +2653,7 @@ mod tests {
                 "{id} is not recorded on openai"
             );
         }
-        for id in RESPONSES_MODELS {
+        for id in catalog::OPENAI {
             assert!(
                 !recorded_image_input("openai", id),
                 "{id} records no image mark"

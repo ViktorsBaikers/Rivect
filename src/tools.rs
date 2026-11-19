@@ -631,11 +631,23 @@ pub fn invoke_read(
     grant_id: &str,
     path: PathBuf,
 ) -> Result<EffectOutcome, ExecutorError> {
-    let request = EffectRequest::Read {
-        grant_id: grant_id.to_string(),
-        path,
-    };
+    invoke_bound_read(rt, task_id, grant_id.to_owned(), path, None)
+}
+
+pub(crate) fn invoke_bound_read(
+    rt: &mut Runtime,
+    task_id: &TaskId,
+    grant_id: String,
+    path: PathBuf,
+    pin: Option<(&crate::executor::FileReadPin, Option<&str>)>,
+) -> Result<EffectOutcome, ExecutorError> {
+    let request = EffectRequest::Read { grant_id, path };
     let mut executor = rt.executor();
-    let admitted = executor.admit(task_id, request, READ_FILE_MODE)?;
-    executor.execute(&admitted)
+    let admitted = executor.admit_pinned(
+        task_id,
+        request,
+        READ_FILE_MODE,
+        pin.map(|(location, _)| location),
+    )?;
+    executor.execute_pinned(&admitted, pin)
 }

@@ -152,6 +152,12 @@ pub mod vertex_login;
 pub mod zai;
 pub mod zai_login;
 
+mod catalog {
+    use super::Dialect;
+
+    include!(concat!(env!("OUT_DIR"), "/model_catalog.rs"));
+}
+
 /// The one catalogue record both dialect owners share (DEC-007):
 /// defined once in the local adapter, re-exported here so the
 /// Responses surface offers the same vocabulary.
@@ -232,19 +238,36 @@ pub(crate) fn loopback_base(connection: &str, raw: &str) -> Result<String, Provi
         connection: connection.to_string(),
         reason: "the base override is not a URL".to_string(),
     })?;
-    if !is_loopback_url(&url)
-        || !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
+    if !valid_loopback_base(&url) {
         return Err(ProviderError::UnsendableRequest {
             connection: connection.to_string(),
             reason: "the base override is not a loopback endpoint".to_string(),
         });
     }
     Ok(base.to_owned())
+}
+
+fn valid_loopback_base(url: &reqwest::Url) -> bool {
+    is_loopback_url(url)
+        && matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+pub(crate) fn ui_local_endpoint(connection: &str, entry: &Connection) -> bool {
+    entry.kind == ConnKind::Local
+        && entry.profile.is_none()
+        && entry.credential_ref.is_none()
+        && entry.region.is_none()
+        && match connection {
+            "loopback" => entry.endpoint.is_empty(),
+            // Unattended sends must not depend on an OS resolver mapping a name to loopback.
+            "vllm" => reqwest::Url::parse(entry.endpoint.trim())
+                .is_ok_and(|url| url.domain().is_none() && valid_loopback_base(&url)),
+            _ => false,
+        }
 }
 
 #[derive(Clone, PartialEq)]
@@ -271,32 +294,173 @@ impl std::fmt::Debug for ToolCall {
 
 pub(crate) const WRITE_FILE_TOOL: &str = "write_file";
 pub(crate) const RUN_CHECK_TOOL: &str = "run_check";
+const MAX_TEST_SELECTOR_BYTES: usize = 200;
 
-pub(crate) fn project_tool_parameters(tool: &str) -> Option<Value> {
-    match tool {
-        "read_file" => Some(serde_json::json!({
-            "type": "object",
-            "properties": { "path": {"type": "string", "description": "Project-relative file path"} },
-            "required": ["path"],
-            "additionalProperties": false
-        })),
-        WRITE_FILE_TOOL => Some(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Project-relative file path"},
-            "text": {"type": "string", "description": "Complete replacement text"}
-        },
-        "required": ["path", "text"],
-        "additionalProperties": false
-        })),
-        RUN_CHECK_TOOL => Some(serde_json::json!({
-            "type": "object",
-            "properties": { "test": {"type": "string", "description": "Exact Cargo library test name, including the module path"} },
-            "required": ["test"],
-            "additionalProperties": false
-        })),
-        _ => None,
+struct ProjectTool<'a> {
+    name: &'a str,
+    description: &'static str,
+    parameters: Value,
+}
+
+impl<'a> ProjectTool<'a> {
+    fn named(name: &'a str) -> Option<Self> {
+        let (description, properties, required) = match name {
+            "read_file" => (
+                crate::tools::catalog_row(name)?.description,
+                serde_json::json!({"path": {"type": "string", "description": "Project-relative file path"}}),
+                &["path"][..],
+            ),
+            WRITE_FILE_TOOL => (
+                "replace the contents of a project file",
+                serde_json::json!({
+                    "path": {"type": "string", "minLength": 1, "description": "Project-relative file path"},
+                    "text": {"type": "string", "description": "Complete replacement text"}
+                }),
+                &["path", "text"][..],
+            ),
+            RUN_CHECK_TOOL => (
+                "run one exact Cargo library test",
+                serde_json::json!({"test": {
+                    "type": "string", "description": "Exact Cargo library test name, including the module path",
+                    "pattern": "^[A-Za-z0-9_:]+$", "maxLength": MAX_TEST_SELECTOR_BYTES
+                }}),
+                &["test"][..],
+            ),
+            _ => return None,
+        };
+        let mut parameters = serde_json::json!({
+            "type": "object", "required": required, "additionalProperties": false
+        });
+        parameters["properties"] = properties;
+        Some(Self {
+            name,
+            description,
+            parameters,
+        })
     }
+
+    fn declaration(self, schema_key: &str) -> Value {
+        let mut declaration =
+            serde_json::json!({"name": self.name, "description": self.description});
+        declaration[schema_key] = self.parameters;
+        declaration
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ToolFormat {
+    Responses,
+    Chat,
+    Messages,
+    Gemini,
+}
+
+impl ToolFormat {
+    fn project(self, tool: ProjectTool<'_>) -> Value {
+        match self {
+            Self::Responses => {
+                let mut function = tool.declaration("parameters");
+                function["type"] = "function".into();
+                function
+            }
+            Self::Chat => {
+                let mut wrapper = serde_json::json!({"type": "function"});
+                wrapper["function"] = tool.declaration("parameters");
+                wrapper
+            }
+            Self::Messages => tool.declaration("input_schema"),
+            Self::Gemini => tool.declaration("parametersJsonSchema"),
+        }
+    }
+
+    fn tools(self, connection: &str, names: &[String]) -> Result<Value, ProviderError> {
+        let declarations = declarations(connection, names, |tool| self.project(tool))?;
+        if matches!(self, Self::Gemini) {
+            let mut group = serde_json::json!({});
+            group["functionDeclarations"] = declarations;
+            return Ok(Value::Array(vec![group]));
+        }
+        Ok(declarations)
+    }
+}
+
+fn declarations(
+    connection: &str,
+    names: &[String],
+    project: impl Fn(ProjectTool<'_>) -> Value,
+) -> Result<Value, ProviderError> {
+    let mut declarations = Vec::with_capacity(names.len());
+    for name in names {
+        let tool = ProjectTool::named(name).ok_or_else(|| ProviderError::UnsendableRequest {
+            connection: connection.to_owned(),
+            reason: "tool has no registered argument schema".to_owned(),
+        })?;
+        declarations.push(project(tool));
+    }
+    Ok(Value::Array(declarations))
+}
+
+/// All four function APIs transmit the same schema, even when a listing selects
+/// the transport after admission. Normalize the wrapper, not the argument schema.
+pub(crate) fn tool_prefix(connection: &str, names: &[String]) -> Result<String, ProviderError> {
+    if names.is_empty()
+        || !matches!(
+            dialect_for(connection),
+            Some(
+                Dialect::Responses
+                    | Dialect::ChatCompletions
+                    | Dialect::Messages
+                    | Dialect::Gemini
+                    | Dialect::CloudCode
+                    | Dialect::Vertex
+            )
+        )
+    {
+        return Ok(names.join(", "));
+    }
+    Ok(declarations(connection, names, |tool| tool.declaration("parameters"))?.to_string())
+}
+
+fn decode_chat_tool(
+    manifest: &RequestManifest,
+    connection: &str,
+    name: Option<String>,
+    raw: &str,
+) -> Result<ToolCall, ProviderError> {
+    let name = name.filter(|name| !name.is_empty()).ok_or_else(|| {
+        violation(
+            connection,
+            "a tool_call block never carried a function name",
+        )
+    })?;
+    if !manifest.tools.contains(&name) {
+        return Err(ProviderError::IncompatibleOutput {
+            connection: connection.to_owned(),
+            reason: bounded_reason(format!("tool_call names undeclared tool {name}")),
+        });
+    }
+    let args = if raw.is_empty() {
+        serde_json::Map::new()
+    } else {
+        let args: Value = serde_json::from_str(raw).map_err(|error| {
+            violation(
+                connection,
+                format!(
+                    "invalid tool arguments at {}:{}",
+                    error.line(),
+                    error.column()
+                ),
+            )
+        })?;
+        let Value::Object(args) = args else {
+            return Err(violation(
+                connection,
+                "a tool_call's arguments are not an object",
+            ));
+        };
+        args
+    };
+    decode_file_call(connection, name, &args)
 }
 
 pub(crate) fn decode_file_call(
@@ -326,7 +490,7 @@ pub(crate) fn decode_file_call(
             .and_then(Value::as_str)
             .filter(|test| {
                 arguments.len() == 1
-                    && test.len() <= 200
+                    && test.len() <= MAX_TEST_SELECTOR_BYTES
                     && crate::executor::plain_selector(test, true)
             })
         else {
@@ -670,6 +834,9 @@ pub enum ProviderError {
     /// incomplete response — a peer verdict, not a parse error.
     #[error("connection {connection} reported failure: {reason}")]
     ProviderFailed { connection: String, reason: String },
+    /// The owner interrupted the transport; remote execution and usage are unknown.
+    #[error("connection {connection} interrupted locally; remote outcome unknown")]
+    Interrupted { connection: String },
     /// The stream ended without a terminal event the dialect can
     /// classify, or a terminal carried an outcome it cannot — unknown
     /// is never success.
@@ -1829,56 +1996,8 @@ pub(crate) fn blind_retry_refused(from: &str, to: &str) -> bool {
 /// for an unrouted id or a model outside a closed recorded set.
 #[must_use]
 pub fn route_for(connection: &str, model: &str) -> Option<Dialect> {
-    routed_wire_model(connection, model).map(|(_, dialect)| dialect)
+    model_route(connection, model).map(|(_, dialect)| dialect)
 }
-
-/// The GitLab alias table (DEC-013): the public alias is deployment
-/// identity, and its `upstreamModelId` is the wire model. The table is
-/// closed — an alias outside it has no recorded route.
-const GITLAB_DUO_MODELS: &[(&str, &str, Dialect)] = &[
-    ("duo-chat-opus-4-6", "claude-opus-4-6", Dialect::Messages),
-    (
-        "duo-chat-sonnet-4-6",
-        "claude-sonnet-4-6",
-        Dialect::Messages,
-    ),
-    (
-        "duo-chat-opus-4-5",
-        "claude-opus-4-5-20251101",
-        Dialect::Messages,
-    ),
-    (
-        "duo-chat-sonnet-4-5",
-        "claude-sonnet-4-5-20250929",
-        Dialect::Messages,
-    ),
-    (
-        "duo-chat-haiku-4-5",
-        "claude-haiku-4-5-20251001",
-        Dialect::Messages,
-    ),
-    (
-        "duo-chat-gpt-5-1",
-        "gpt-5.1-2025-11-13",
-        Dialect::ChatCompletions,
-    ),
-    (
-        "duo-chat-gpt-5-2",
-        "gpt-5.2-2025-12-11",
-        Dialect::ChatCompletions,
-    ),
-    (
-        "duo-chat-gpt-5-mini",
-        "gpt-5-mini-2025-08-07",
-        Dialect::ChatCompletions,
-    ),
-    ("duo-chat-gpt-5-codex", "gpt-5-codex", Dialect::Responses),
-    (
-        "duo-chat-gpt-5-2-codex",
-        "gpt-5.2-codex",
-        Dialect::Responses,
-    ),
-];
 
 const GITLAB_DUO_ROUTES: &[Dialect] = &[
     Dialect::Messages,
@@ -1895,73 +2014,10 @@ const COPILOT_ROUTES: &[Dialect] = &[
     Dialect::Responses,
 ];
 
-/// The closed 44-id `github-copilot` catalogue table with each row's
-/// recorded `api` column. A model outside this table has no route, even
-/// when its name matches a recorded family prefix or glob.
-const COPILOT_MODELS: &[(&str, &str)] = &[
-    ("claude-fable-5", "anthropic-messages"),
-    ("claude-haiku-4.5", "anthropic-messages"),
-    ("claude-opus-4.5", "anthropic-messages"),
-    ("claude-opus-4.6", "anthropic-messages"),
-    ("claude-opus-4.7", "anthropic-messages"),
-    ("claude-opus-4.8", "anthropic-messages"),
-    ("claude-opus-5", "anthropic-messages"),
-    ("claude-sonnet-4", "anthropic-messages"),
-    ("claude-sonnet-4.5", "anthropic-messages"),
-    ("claude-sonnet-4.6", "anthropic-messages"),
-    ("claude-sonnet-5", "anthropic-messages"),
-    ("gemini-2.5-pro", "openai-completions"),
-    ("gemini-3-flash-preview", "openai-completions"),
-    ("gemini-3-pro-preview", "openai-completions"),
-    ("gemini-3.1-pro-preview", "openai-completions"),
-    ("gemini-3.5-flash", "openai-completions"),
-    ("gemini-3.6-flash", "openai-completions"),
-    ("gemini-3.7-flash", "openai-completions"),
-    ("gpt-4.1", "openai-completions"),
-    ("gpt-4o", "openai-completions"),
-    ("gpt-5", "openai-responses"),
-    ("gpt-5-mini", "openai-responses"),
-    ("gpt-5.1", "openai-responses"),
-    ("gpt-5.1-codex", "openai-responses"),
-    ("gpt-5.1-codex-max", "openai-responses"),
-    ("gpt-5.1-codex-mini", "openai-responses"),
-    ("gpt-5.2", "openai-responses"),
-    ("gpt-5.2-codex", "openai-responses"),
-    ("gpt-5.3-codex", "openai-responses"),
-    ("gpt-5.4", "openai-responses"),
-    ("gpt-5.4-mini", "openai-responses"),
-    ("gpt-5.4-nano", "openai-responses"),
-    ("gpt-5.5", "openai-responses"),
-    ("gpt-5.6-luna", "openai-responses"),
-    ("gpt-5.6-sol", "openai-responses"),
-    ("gpt-5.6-terra", "openai-responses"),
-    ("grok-4.5", "openai-responses"),
-    ("grok-4.6", "openai-responses"),
-    ("grok-code-fast-1", "openai-completions"),
-    ("kimi-k2.7-code", "openai-completions"),
-    ("kimi-k3", "openai-completions"),
-    ("mai-code-1-flash-picker", "openai-responses"),
-    ("mai-code-1.1-flash", "openai-responses"),
-    ("raptor-mini", "openai-completions"),
-];
-
-/// The recorded `github-copilot` route for one table row: its `api`
-/// column decides the codec, and only the three recorded columns have a
-/// route — an id outside the closed table answers `None`.
-fn copilot_route(model: &str) -> Option<Dialect> {
-    let (_, api) = COPILOT_MODELS.iter().find(|(id, _)| *id == model)?;
-    match *api {
-        "anthropic-messages" => Some(Dialect::Messages),
-        "openai-completions" => Some(Dialect::ChatCompletions),
-        "openai-responses" => Some(Dialect::Responses),
-        _ => None,
-    }
-}
-
 /// The sorted-first id of the closed `github-copilot` route table: the
 /// deterministic auto pick over the connection's recorded catalogue.
 fn copilot_first_model() -> Option<&'static str> {
-    COPILOT_MODELS.iter().map(|(id, _)| *id).min()
+    catalog::GITHUB_COPILOT.iter().map(|(id, _)| *id).min()
 }
 
 /// The `opencode-go` route table (DEC-014): Chat Completions is the
@@ -1975,32 +2031,6 @@ const OPENCODE_GO_ROUTES: &[Dialect] = &[
     Dialect::Responses,
 ];
 
-/// The recorded `opencode-go` route for one model (DEC-014): the
-/// Responses classes first, then the recorded CC exacts, then the
-/// Messages families, and finally the recorded Chat Completions
-/// default.
-fn opencode_go_route(model: &str) -> Dialect {
-    if model.starts_with("gpt-")
-        || model.starts_with("grok-")
-        || model.starts_with("muse-")
-        || model == "deepseek-v4-flash"
-    {
-        Dialect::Responses
-    } else if matches!(
-        model,
-        "minimax-m2.7" | "minimax-m3" | "minimax-m3-free" | "qwen3.5-plus" | "qwen3.6-plus"
-    ) {
-        Dialect::ChatCompletions
-    } else if model.starts_with("claude-")
-        || model.starts_with("qwen")
-        || model.starts_with("minimax-m2.5")
-    {
-        Dialect::Messages
-    } else {
-        Dialect::ChatCompletions
-    }
-}
-
 /// The `opencode-zen` route table (DEC-014/DEC-018): Chat Completions
 /// is the recorded `defaultResolution`, and the overrides route Claude/
 /// `qwen-` to Messages, GPT/Grok/Muse to Responses and Gemini to its
@@ -2011,21 +2041,6 @@ const OPENCODE_ZEN_ROUTES: &[Dialect] = &[
     Dialect::Responses,
     Dialect::Gemini,
 ];
-
-/// The recorded `opencode-zen` route for one model: the family
-/// overrides first, then the recorded Chat Completions default —
-/// an id matching no override rides that default (DEC-018).
-fn opencode_zen_route(model: &str) -> Dialect {
-    if model.starts_with("gpt-") || model.starts_with("grok-") || model.starts_with("muse-") {
-        Dialect::Responses
-    } else if model.starts_with("claude-") || model.starts_with("qwen-") {
-        Dialect::Messages
-    } else if model.starts_with("gemini-") {
-        Dialect::Gemini
-    } else {
-        Dialect::ChatCompletions
-    }
-}
 
 /// The `zenmux` route table: the recorded Chat Completions default and
 /// the Messages route its authoritative metadata's Anthropic class
@@ -2107,15 +2122,22 @@ fn zenmux_route(model: &str) -> Dialect {
 /// the `opencode-go`/`opencode-zen`/`zenmux` class route over the
 /// verbatim model id. `None` is the closed-set denial.
 pub(crate) fn routed_wire_model(connection: &str, model: &str) -> Option<(String, Dialect)> {
+    model_route(connection, model).map(|(wire, dialect)| (wire.to_owned(), dialect))
+}
+
+fn model_route<'a>(connection: &str, model: &'a str) -> Option<(&'a str, Dialect)> {
     match connection {
-        "gitlab-duo" => GITLAB_DUO_MODELS
+        "gitlab-duo" => catalog::GITLAB_DUO
             .iter()
             .find(|(alias, ..)| *alias == model)
-            .map(|(_, upstream, dialect)| ((*upstream).to_string(), *dialect)),
-        "github-copilot" => copilot_route(model).map(|dialect| (model.to_string(), dialect)),
-        "opencode-go" => Some((model.to_string(), opencode_go_route(model))),
-        "opencode-zen" => Some((model.to_string(), opencode_zen_route(model))),
-        "zenmux" => Some((model.to_string(), zenmux_route(model))),
+            .map(|(_, upstream, dialect)| (*upstream, *dialect)),
+        "github-copilot" => catalog::GITHUB_COPILOT
+            .iter()
+            .find(|(id, _)| *id == model)
+            .map(|(_, dialect)| (model, *dialect)),
+        "opencode-go" => Some((model, catalog::opencode_go(model))),
+        "opencode-zen" => Some((model, catalog::opencode_zen(model))),
+        "zenmux" => Some((model, zenmux_route(model))),
         _ => None,
     }
 }
@@ -2126,7 +2148,7 @@ pub(crate) fn routed_wire_model(connection: &str, model: &str) -> Option<(String
 pub(crate) fn routed_catalog(connection: &str) -> Option<Vec<CatalogModel>> {
     match connection {
         "gitlab-duo" => Some(
-            GITLAB_DUO_MODELS
+            catalog::GITLAB_DUO
                 .iter()
                 .map(|(alias, ..)| CatalogModel {
                     id: (*alias).to_string(),
@@ -2172,6 +2194,16 @@ pub trait Provider: Send {
         false
     }
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError>;
+
+    /// Foreground transports honor cancellation; streaming chat reports validated visible text.
+    fn send_with_cancel(
+        &mut self,
+        manifest: &RequestManifest,
+        _cancel: Option<&std::sync::atomic::AtomicBool>,
+        _preview: Option<&dyn Fn(&str)>,
+    ) -> Result<ProviderReply, ProviderError> {
+        self.send(manifest)
+    }
 }
 
 /// Offline loopback: answers from local fixtures only, zero network. The
@@ -2487,6 +2519,15 @@ impl Provider for ConfiguredProvider {
     }
 
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        self.send_with_cancel(manifest, None, None)
+    }
+
+    fn send_with_cancel(
+        &mut self,
+        manifest: &RequestManifest,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        preview: Option<&dyn Fn(&str)>,
+    ) -> Result<ProviderReply, ProviderError> {
         // The Broker narrows every send to one connection before this seam;
         // a manifest that still names a pool is a caller error, never a
         // reason to pick one.
@@ -2524,7 +2565,7 @@ impl Provider for ConfiguredProvider {
                 });
             }
         }
-        adapter.send(manifest)
+        adapter.send_with_cancel(manifest, cancel, preview)
     }
 }
 
@@ -2549,9 +2590,54 @@ pub fn configured_provider(
     config: &Config,
     store: &Arc<dyn CredentialStore>,
 ) -> Result<ProviderBuild, ProviderError> {
+    Ok(build_configured(config, store, Registry::Configured))
+}
+
+/// Builds only explicitly configured, keyless local adapters for the private
+/// UI pipe. Public runtime factories never acquire the offline fixture.
+pub fn private_ui_provider(
+    config: &Config,
+    store: &Arc<dyn CredentialStore>,
+) -> Result<ProviderBuild, ProviderError> {
+    Ok(build_configured(config, store, Registry::PrivateUi))
+}
+
+/// Installed adapters are available to witnessed project continuations only on the paired terminal.
+pub fn terminal_ui_provider(
+    config: &Config,
+    store: &Arc<dyn CredentialStore>,
+) -> Result<ProviderBuild, ProviderError> {
+    Ok(build_configured(config, store, Registry::TerminalUi))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Registry {
+    Configured,
+    PrivateUi,
+    TerminalUi,
+}
+
+fn build_configured(
+    config: &Config,
+    store: &Arc<dyn CredentialStore>,
+    registry: Registry,
+) -> ProviderBuild {
     let mut adapters: BTreeMap<String, (Connection, Box<dyn Provider>)> = BTreeMap::new();
     let mut refusals = Vec::new();
     for (connection, entry) in &config.connections {
+        if registry == Registry::PrivateUi && !ui_local_endpoint(connection, entry) {
+            continue;
+        }
+        if registry != Registry::Configured
+            && connection == "loopback"
+            && ui_local_endpoint(connection, entry)
+        {
+            adapters.insert(
+                connection.clone(),
+                (entry.clone(), Box::new(LoopbackProvider::new())),
+            );
+            continue;
+        }
         let Some(dialect) = installed_dialect(connection) else {
             continue;
         };
@@ -2565,10 +2651,10 @@ pub fn configured_provider(
             }),
         }
     }
-    Ok(ProviderBuild {
+    ProviderBuild {
         provider: Box::new(ConfiguredProvider { adapters }),
         refusals,
-    })
+    }
 }
 
 /// Whether a literal connection id records the credential-optional
@@ -2990,21 +3076,56 @@ mod tests {
     use super::*;
     use std::error::Error;
 
+    #[test]
+    fn private_local_dispatch_requires_a_loopback_ip_literal() {
+        for (host, admitted) in [
+            ("127.0.0.2", true),
+            ("[::1]", true),
+            ("localhost", false),
+            ("test.localhost", false),
+            ("192.0.2.1", false),
+        ] {
+            let entry = Connection {
+                kind: ConnKind::Local,
+                endpoint: format!("http://{host}:8080/v1"),
+                credential_ref: None,
+                region: None,
+                profile: None,
+            };
+            assert_eq!(ui_local_endpoint("vllm", &entry), admitted, "{host}");
+        }
+    }
+
+    #[test]
+    fn every_tool_format_preserves_a_required_argument_change() -> Result<(), Box<dyn Error>> {
+        for (format, required) in [
+            (ToolFormat::Responses, "/parameters/required"),
+            (ToolFormat::Chat, "/function/parameters/required"),
+            (ToolFormat::Messages, "/input_schema/required"),
+            (ToolFormat::Gemini, "/parametersJsonSchema/required"),
+        ] {
+            let mut previous = ProjectTool::named("read_file").ok_or("missing read descriptor")?;
+            previous.parameters["required"] = serde_json::json!([]);
+            let old_wire = format.project(previous);
+            let new_wire =
+                format.project(ProjectTool::named("read_file").ok_or("missing read descriptor")?);
+            assert_eq!(old_wire.pointer(required), Some(&serde_json::json!([])));
+            assert_eq!(
+                new_wire.pointer(required),
+                Some(&serde_json::json!(["path"]))
+            );
+        }
+        Ok(())
+    }
+
     /// The recorded `github-copilot` table is closed: its 44 `api`
     /// columns are the only routes, and a family-shaped id that is not a
     /// row (or a prefix the rules name without a row) has no route.
     #[test]
     fn copilot_route_table_matches_the_recorded_rows() {
-        assert_eq!(COPILOT_MODELS.len(), 44);
-        for (id, api) in COPILOT_MODELS {
-            let expected = match *api {
-                "anthropic-messages" => Some(Dialect::Messages),
-                "openai-completions" => Some(Dialect::ChatCompletions),
-                "openai-responses" => Some(Dialect::Responses),
-                _ => None,
-            };
-            assert!(expected.is_some(), "unrecorded copilot api column {api}");
-            assert_eq!(copilot_route(id), expected, "{id}");
+        assert_eq!(catalog::GITHUB_COPILOT.len(), 44);
+        for &(id, dialect) in catalog::GITHUB_COPILOT {
+            assert_eq!(route_for("github-copilot", id), Some(dialect), "{id}");
         }
         assert_eq!(
             route_for("github-copilot", "claude-opus-4.6"),
@@ -3034,12 +3155,20 @@ mod tests {
     fn copilot_route_table_is_pinned_by_content() {
         use sha2::{Digest, Sha256};
 
-        let mut rows: Vec<String> = COPILOT_MODELS
+        let mut rows: Vec<String> = catalog::GITHUB_COPILOT
             .iter()
-            .map(|(id, api)| format!("{id}\t{api}"))
+            .map(|(id, dialect)| {
+                let api = match dialect {
+                    Dialect::Messages => "anthropic-messages",
+                    Dialect::ChatCompletions => "openai-completions",
+                    Dialect::Responses => "openai-responses",
+                    _ => "unsupported",
+                };
+                format!("{id}\t{api}")
+            })
             .collect();
         rows.sort();
-        assert_eq!(COPILOT_MODELS.len(), 44);
+        assert_eq!(rows.len(), 44);
         assert_eq!(
             crate::model::hex(&Sha256::digest(rows.join("\n").as_bytes())),
             "6975cd5bde657fa75e3d8b860848be2e7cb46d261fa9c790ee24ae37a72e227b"

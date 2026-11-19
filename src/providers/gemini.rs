@@ -507,13 +507,7 @@ impl GeminiCodec {
             });
         }
         if !manifest.tools.is_empty() {
-            body["tools"] = json!([{
-                "functionDeclarations": manifest
-                    .tools
-                    .iter()
-                    .map(|name| json!({ "name": name, "description": "" }))
-                    .collect::<Vec<_>>(),
-            }]);
+            body["tools"] = super::ToolFormat::Gemini.tools(&self.connection, &manifest.tools)?;
         }
         Ok(body)
     }
@@ -906,24 +900,18 @@ impl GeminiCodec {
                     reason: bounded_reason(format!("functionCall names undeclared tool {name}")),
                 });
             }
-            let path = match call.get("args") {
-                None => None,
-                Some(args) => {
-                    let Some(args) = args.as_object() else {
-                        return Err(violation(
-                            &self.connection,
-                            "functionCall args are not an object",
-                        ));
-                    };
-                    args.get("path").and_then(Value::as_str).map(str::to_string)
-                }
+            let empty = serde_json::Map::new();
+            let args = match call.get("args") {
+                None => &empty,
+                Some(args) => args.as_object().ok_or_else(|| {
+                    violation(&self.connection, "functionCall args are not an object")
+                })?,
             };
-            state.tool_calls.push(ToolCall {
-                tool: name.to_string(),
-                path,
-                text: None,
-                test: None,
-            });
+            state.tool_calls.push(super::decode_file_call(
+                &self.connection,
+                name.to_owned(),
+                args,
+            )?);
         }
         state.parts.push(part.clone());
         Ok(())

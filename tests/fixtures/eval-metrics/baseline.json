@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "corpus_digest": "0ab8cad2452fc4de29184c33794b808347a109481bccc790ef5fe3f7701e192b",
+  "oracle_digest": "fba06f088b6fbe1da5d59d48d21e6c0f6dee30ac60f61b44cef9df2409b42595",
+  "candidate": "3b1b1a9d1a0c1a841491cdfab52d77425c38f499237ae225e01d76f6e17be0d4",
+  "rows": [
+    {
+      "case_id": "C001",
+      "mode": "deterministic",
+      "expected": "pass",
+      "observed": "fail",
+      "accepted": false,
+      "evidence": "7046b30769ade5ef287aca76e5c7c74349891861293e87c60f523e28026a9b5c",
+      "repairs": 0,
+      "elapsed_ns": 3332750,
+      "cost_usd_micros": null
+    },
+    {
+      "case_id": "C002",
+      "mode": "deterministic",
+      "expected": "pass",
+      "observed": "pass",
+      "accepted": true,
+      "evidence": "9c68f8d275a0b1fb4816731dc05f85a3e9f061e6beed34d548950e718606c7bd",
+      "repairs": 0,
+      "elapsed_ns": 2704250,
+      "cost_usd_micros": null
+    }
+  ]
+}

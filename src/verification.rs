@@ -1243,6 +1243,12 @@ pub struct OfflineEvidenceManifestRow {
     pub observation: String,
 }
 
+// Acceptance A36 can report the v2 size comparison without satisfying its budget.
+// Unlike the six provider denials, that receipt must block the final conjunction.
+fn offline_unserved(family: &str, case_id: &str) -> bool {
+    (family == "acceptance" && case_id == "A36") || is_unserved_case(case_id)
+}
+
 /// The checked-in manifest a receipt is bound to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfflineEvidenceManifest {
@@ -1334,12 +1340,12 @@ impl OfflineEvidenceManifest {
                 });
             }
             match row.expected {
-                TrialExpectation::Pass if is_unserved_case(&row.case_id) => {
+                TrialExpectation::Pass if offline_unserved(&self.family, &row.case_id) => {
                     return Err(OfflineEvidenceError::OutcomeMismatch {
                         case_id: row.case_id.clone(),
                     });
                 }
-                TrialExpectation::Unserved if !is_unserved_case(&row.case_id) => {
+                TrialExpectation::Unserved if !offline_unserved(&self.family, &row.case_id) => {
                     return Err(OfflineEvidenceError::UnservedOutsideRecordedSet {
                         case_id: row.case_id.clone(),
                     });
@@ -1572,7 +1578,9 @@ impl OfflineEvidenceReceipt {
                     case_id: row.case_id.clone(),
                 });
             }
-            if row.outcome == TrialOutcome::Unserved && !is_unserved_case(&row.case_id) {
+            if row.outcome == TrialOutcome::Unserved
+                && !offline_unserved(&self.family, &row.case_id)
+            {
                 return Err(OfflineEvidenceError::UnservedOutsideRecordedSet {
                     case_id: row.case_id.clone(),
                 });
@@ -1631,7 +1639,7 @@ pub enum OfflineEvidenceError {
     Observation { case_id: String },
     #[error("case {case_id} declares the wrong terminal outcome")]
     OutcomeMismatch { case_id: String },
-    #[error("case {case_id} claims unserved outside the recorded six")]
+    #[error("case {case_id} claims unserved outside its recorded receipt set")]
     UnservedOutsideRecordedSet { case_id: String },
     #[error("the offline evidence candidate digest is not 64 hex characters")]
     CandidateDigest,

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "oracle_digest": "fba06f088b6fbe1da5d59d48d21e6c0f6dee30ac60f61b44cef9df2409b42595",
+  "dataset_digest": "d65b6f03ce07d4f460b0d699c7af6edcbf1c9f03eacde5ebf0cfc70ad3b1febe",
+  "cases": [
+    {
+      "case_id": "C001",
+      "expected": "pass",
+      "mode": "deterministic"
+    },
+    {
+      "case_id": "C002",
+      "expected": "pass",
+      "mode": "deterministic"
+    }
+  ]
+}

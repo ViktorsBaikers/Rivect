@@ -211,6 +211,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::UnsupportedParameter { .. } => "UnsupportedParameter",
         ProviderError::UnsendableRequest { .. } => "UnsendableRequest",
         ProviderError::ReasoningProvenance { .. } => "ReasoningProvenance",
+        ProviderError::Interrupted { .. } => "Interrupted",
         ProviderError::Retried { .. } => "Retried",
     }
 }

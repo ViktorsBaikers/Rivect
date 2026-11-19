@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Run each Cargo target once; project family receipts from those exact logs."""
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -7,9 +9,17 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+from time import monotonic
 
 ROOT = Path(__file__).resolve().parents[1]
 CONJUNCTION = "final_acceptance_passes_the_installed_rows_and_prints_the_verdict"
+# Only targets with isolated stores, roots or loopback fixtures. Start the
+# longest suites first; new targets stay serial until their resources are audited.
+PARALLEL_TARGETS = (
+    "provider_local", "provider_gitlab", "provider_openai", "search_symbols",
+    "provider_anthropic", "provider_cloudcode", "provider_gemini", "search_text",
+    "provider_bedrock", "provider_copilot", "provider_vertex", "search_ast", "search_index",
+)
 
 
 def sha256(path):
@@ -18,6 +28,9 @@ def sha256(path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--jobs", type=int, choices=(1, 2), default=1)
+    jobs = parser.parse_args().jobs
     bundle = Path(os.environ["RIVECT_TEST_BUNDLE"]).resolve(strict=True)
     logs = ROOT / "target/ci-logs"
     # Logs are proof for this invocation, never a restored build cache.
@@ -36,25 +49,36 @@ def main():
     packages.sort(key=lambda p: (p["name"] != "rivect-sandbox-helper", p["name"]))
     failed = []
     skipped = []
+    parallel = {}
 
-    def run(name, command, threads="2"):
-        print(f"::group::{name}", flush=True)
+    def execute(name, command, threads):
+        start = monotonic()
         output = logs / f"{name}.log"
         with output.open("wb") as stream:
             result = subprocess.run(command, cwd=ROOT,
                                     env={**env, "RUST_TEST_THREADS": threads},
                                     stdout=stream, stderr=subprocess.STDOUT)
-        # Print complete diagnostics, including when the target fails.
-        with output.open() as stream:
-            for line in stream:
-                print(line, end="")
-        print("::endgroup::", flush=True)
+        seconds = round(monotonic() - start, 3)
         (logs / f"{name}.json").write_text(json.dumps({
             "command": shlex.join(command), "exit": result.returncode,
             "candidate_manifest_sha256": candidate, "output_sha256": sha256(output),
+            "duration_seconds": seconds,
         }) + "\n")
-        if result.returncode:
+        return name, result.returncode, seconds
+
+    def report(execution):
+        name, status, seconds = execution
+        # Only the main thread emits groups; the raw logs never interleave.
+        print(f"::group::{name}", flush=True)
+        with (logs / f"{name}.log").open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                print(line, end="")
+        print(f"\n{name}: {seconds:.2f}s (exit {status})\n::endgroup::", flush=True)
+        if status:
             failed.append(name)
+
+    def run(name, command, threads):
+        report(execute(name, command, threads))
 
     for package in packages:
         name = package["name"]
@@ -99,7 +123,16 @@ def main():
                 command += ["-p", name]
             command += ["--test", target_name, "--", "--show-output", *args]
             log_name = target_name if name == "rivect" else f"{name}-{target_name}"
-            run(log_name, command, threads)
+            if jobs > 1 and name == "rivect" and target_name in PARALLEL_TARGETS:
+                parallel[target_name] = command
+            else:
+                run(log_name, command, threads)
+    if parallel:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            work = [pool.submit(execute, name, parallel[name], "2")
+                    for name in PARALLEL_TARGETS if name in parallel]
+            for target in as_completed(work):
+                report(target.result())
     (logs / "not-run.json").write_text(json.dumps(skipped, indent=2) + "\n")
     if failed:
         raise RuntimeError(f"failed Cargo targets: {', '.join(failed)}")

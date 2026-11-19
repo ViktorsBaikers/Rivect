@@ -1039,7 +1039,7 @@ fn sandbox_worker_reads_scope_and_lands_checked_managed_write() {
     let mut worker = linux::LinuxWorker;
     let scope_root = file.parent().expect("scope root").to_path_buf();
 
-    let rivect::executor::ReadObservation { bytes, digest } = worker
+    let rivect::executor::ReadObservation { bytes, digest, .. } = worker
         .read_once(&scope_root, &file)
         .expect("confined scoped read");
     assert_eq!(bytes, b"scoped-by-landlock");

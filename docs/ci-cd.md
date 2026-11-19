@@ -35,11 +35,14 @@ curl -fsSL https://github.com/ViktorsBaikers/Rivect/releases/latest/download/ins
 Поддерживаются macOS Apple Silicon (`aarch64-apple-darwin`) и Linux x86_64
 с glibc (`x86_64-unknown-linux-gnu`, build/runtime baseline Ubuntu 24.04).
 Intel macOS, Linux ARM64 и musl этой поставкой не поддерживаются.
-Пользователю не нужны Cargo, `gh`, `jq` или Python. Архив содержит ровно
-`rivect`, `rivect-sandbox-helper`, `rivect.manifest.json`; helper устанавливается
-рядом с CLI. Архивы называются `rivect-v0.1.3-TARGET.tar.gz`, checksums —
-`TARGET.sha256`. Корневой пакет — 0.1.3, независимый helper остаётся 0.1.0;
-уже отправленные теги не переносятся.
+Установщик принимает только пятифайловый OpenTUI-пакет v2. Нужны Python 3
+и GitHub CLI с `gh attestation verify`: установщик проверяет подпись архива,
+workflow и исходный тег при установке и откате. Cargo и jq не нужны.
+Опубликованные и установленные пакеты v1 остаются нетронутыми. Новый
+установщик не выбирает v1 даже для отката: цель отката — только ранее
+активированный и повторно проверенный v2. Подробности — в [контракте установки](installed-release.md).
+Workflow не меняет настройки репозитория и не переносит существующие теги.
+Имя архива — `rivect-TAG-TARGET.tar.gz`, checksums — `TARGET.sha256`.
 До переключения активного bundle установщик проверяет запуск CLI через
 `--version`; несовместимый бинарник не заменяет работающую установку.
 Установка без `sudo`: полные bundles хранятся в
@@ -96,14 +99,75 @@ AC-078 / DEC-022 по-прежнему проверяется настоящим
 не введён privileged `workflow_run` или доверие произвольному старому cache.
 Дедупликация относится к одному workflow run, а не к произвольной истории сборок.
 
+## Ускорение native CI/CD
+
+Исторический hosted baseline v1, commit `5ae0d85`: [push на main — 44202208504](https://github.com/ViktorsBaikers/Rivect/actions/runs/44202208504), [tag — 44206567912](https://github.com/ViktorsBaikers/Rivect/actions/runs/44206567912). Ниже — фактические времена main, не целевые значения:
+
+| Метрика | Linux | macOS |
+| --- | ---: | ---: |
+| Native job `test` | 28:26 | 21:03 |
+| Шаг Cargo targets и формирования evidence | 23:48 | 18:37 |
+| Сумма времени компиляции по логам Cargo | 145 с | 196 с |
+| Длительный installed target | `installed`: 602 с | `installed_tui`: 296 с |
+
+Сумма времени компиляции не равна wall time шага. Эти цифры описывают v1 и не подтверждают ускорение v2/OpenTUI на hosted runners.
+
+### Порядок исполнения
+
+- [Native workflow](../.github/workflows/ci.yml) через [platform wrapper](../scripts/ci-platform-test.sh) запускает [`ci-test.py --jobs 2`](../scripts/ci-test.py). Только явно перечисленные независимые provider/search targets могут выполняться попарно; они используют изолированные хранилища, каталоги или loopback fixtures. Helper идёт первым с одним потоком libtest, остальные targets — с двумя потоками libtest на target. Native budget, keyring, PTY и измерительные targets остаются последовательными. Новый Cargo target обнаруживается автоматически через `cargo metadata` и выполняется последовательно, пока его явно не допустят к параллельному запуску. Логи не смешиваются: для каждого target сохраняются полный вывод, exit status, команда, SHA-256 манифеста и вывода, а также `duration_seconds`.
+- [`ci-tui-test.py`](../scripts/ci-tui-test.py) находит `tui/*_test.py` и запускает не более двух suites одновременно. Те же шесть suites используют приватный `libexec/rivect-tui`; остальные используют публичный `rivect` из кандидата. Полный вывод каждой suite сохраняется отдельно и печатается в CI вместе с её статусом и временем; при ошибке одной suite остальные завершаются, а шаг возвращает ненулевой статус. TypeScript-проверки, независимая MCP SDK-проверка, нативная установка с upgrade/rollback в PTY и отдельные doctests остаются в workflow.
+- `test` и `verify-release` используют общий Cargo cache для каждой платформы (`shared-key: native-v2-…`, `cache-bin: false`). Сохранять кэш может только `push` на `main`; verify только восстанавливает его. Первый прогон с новым ключом холодный до появления совместимой записи. Кэш не заменяет неизменяемый artifact текущего run: архив кандидата и receipts передаются отдельно. У `xhost-*` и `release-*` отключено повторное сжатие внешнего ZIP (`compression-level: 0`), потому что payload уже содержит `.tar.gz`. Exact gates, проверки digest и publisher не меняются. Nextest и xlarge runners не используются.
+- Упакованные headless-проверки на Linux используют только адрес выделенной
+  D-Bus-сессии от platform wrapper. В обычном офлайн-прогоне не обращаются
+  к пользовательскому bus. Нативная проверка Secret Service и пять
+  отказов `docs.search` с нулём HTTP-соединений по-прежнему обязательны.
+
+### Критерий повторного замера
+
+Сравнивать hosted v2 до и после правки на одинаковых входах, с тем же типом события и runner label/image отдельно для Linux и macOS. Сопоставлять cold с cold и warm с warm; по логам различать miss, частичное совпадение ключа и точный hit. Отдельно фиксировать ожидание runner, restore/save, сборку, wall time native шага и jobs, размеры и время передачи артефактов, время от события до последнего успешного gate. Ускорение подтверждается повторяемым снижением wall time при том же inventory проверок, сохранённых diagnostics и неизменных обязательных verdicts/receipts; исторический v1 служит ориентиром, не контрольным прогоном v2.
+
+Локально на одном установленном v2-комплекте macOS arm64: 21 Python suite
+прошла и старым последовательным циклом (115 с), и новым runner (61,45 с).
+Повтор на заново собранном комплекте (SHA-256 bundle manifest
+`1df42eba376f84c0c742d302d2b8444c385c47edb6485e743cc5ed4d2d49c3ee`):
+те же 21 suite прошли за 60,30 с; нативная установка и проверка SBOM прошли.
+На Ubuntu 24.04 x86_64 монитор выделенного D-Bus подтвердил 0 вызовов
+`OpenSession` без адреса и 5 с явным адресом на историческом бинарнике
+из run 44202208504. Обе ветки дали пять типизированных отказов без HTTP.
+Это проверка маршрута обращения, не замер 602-секундной задержки runner.
+Linux-only ветка `tests/installed.rs` также прошла `cargo check --locked`
+на `x86_64-unknown-linux-gnu` с Rust 1.98.1. Это проверка компиляции,
+не полный native Linux gate.
+
+PTY-проверки сохранены после смены интерфейса: Escape проверяет, что вопрос
+остаётся без ответа; вставка сравнивает физические колонки VT100;
+идентификаторы задач и скрытые строки проверяются в деталях и расширенном
+учёте. На 60×20 оставили предупреждение о заполнении контекста и целую
+команду /compact на одной строке.
+При прокрутке статус потока остаётся рядом с редактором. Итог в ленте
+отличает завершённый вывод от частичного и явно помечает усечение. Метка
+занимает строку отступа узла; офлайн-кадр 160×50 сохраняет первую реплику.
+Оракулы сверяют состояние ядра и VT100, включая перенос метки на две строки.
+PTY fixture сохраняет один VT100-экран при resize и проверяет видимый кадр,
+а не строку в последней ANSI-дельте. Loopback peer явно включает blocking
+после accept: иначе macOS наследует режим listener и не ждёт deadline чтения.
+
+Первоисточники: [GitHub Actions — dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching), [README upload-artifact v7.0.2](https://github.com/actions/upload-artifact/blob/cf430e030ddbb5b0abf93d22962f4752f3646cd9/README.md), [Cargo Book — cargo test](https://doc.rust-lang.org/cargo/commands/cargo-test.html), [Nextest — модель изоляции тестов по процессам](https://nexte.st/docs/design/how-it-works/). Проектные границы promotion: [ADR-0005](adr/0005-ci-artifact-promotion.md).
+
 ## Кандидат и evidence
 
-1. `package-release.sh` создаёт bundle вне checkout, отказывает при существующем
-   destination. Smoke: настоящий `rivect --version` и `--help`.
-2. Test-only `RIVECT_TEST_BUNDLE` заставляет baseline fixture проверить supplied
-   manifest/binary hashes и build identity, затем скопировать точные байты в свой
-   tempfile. Ошибочный override не вызывает альтернативную сборку.
-   Без override сохранён обычный локальный packaging fixture.
+1. `sh scripts/package-release.sh DESTINATION` создаёт только пакет v2 вне
+   checkout. Существующий destination отклоняется. Smoke: настоящий
+   `rivect --version` и `--help`.
+2. Установленные тесты берут `RIVECT_TEST_BUNDLE`, проверяют хэши и
+   идентификатор сборки, затем копируют пакет в отдельный каталог.
+   Ошибочный override останавливает тест, а не подменяет пакет новой сборкой.
+   История измерений пакета v1 сохранена, но в текущем CI он не строится и
+   не проверяется. Замороженный [ресурсный корпус AC-003](release-budgets.md)
+   описывает трёхфайловый v1 и не подтверждает PASS для v2. Обязательная
+   ресурсная приёмка v2 остаётся открытой: нужен заранее согласованный
+   бюджет и измерения точного кандидата. Неподтверждённая обязательная
+   проверка не разрешает stable-публикацию.
 3. Runner сохраняет полный лог, exit code, фактическую команду, manifest SHA-256 и
    output SHA-256 на target. `--show-output` сохраняет per-test PASS строки и
    успешные markers без nocapture-interleaving. Failed targets сохраняют логи,
@@ -126,6 +190,8 @@ AC-078 / DEC-022 по-прежнему проверяется настоящим
    `install.sh.sha256`, не исполняя скачанный код с write token.
    Тег проверяется до создания draft и повторно после загрузки assets,
    непосредственно перед публикацией. Только общий ready публикует draft.
+   GitHub Actions аттестует архивы обеих платформ независимо от настройки
+   immutable releases. Non-ready по-прежнему сохраняется как диагностический draft.
    Upload failure не выставляет частичный stable.
 
 Exit 0 — ready и ноль retained legs; exit 5 — честно вычисленный non-ready,
@@ -142,7 +208,7 @@ Exit 0 — ready и ноль retained legs; exit 5 — честно вычисл
   у него нет checkout, Cargo, cache или запуска скачанного кода.
 - Download ограничен текущим workflow run; digest mismatch — error. Проверяется
   полнота ожидаемых файлов, а не только успех wildcard download.
-- Cache — только ускоритель зависимостей. Save разрешён main, PR — restore-only.
+- Cache — только ускоритель зависимостей; запись только на `push` в `main`.
 - Rust/components берутся из `rust-toolchain.toml`; lockfile не обновляется CI.
 - Linux namespace prerequisite задан каждому job, который реально исполняет
   sandbox. Раньше его отсутствие ломало package с errno 13.
@@ -175,15 +241,35 @@ repository rulesets. Не двигать существующий `v0.1.0`: из
 ## Проверка изменения
 
 - `python3 scripts/ci-contract-tests.py`: реальные subprocess/fs проверки dedup,
-  failed/stale/tampered evidence, cross-host binding, gate exit semantics и 12
-  исполняемых сценариев publisher: исходные девять плюс подмена, отсутствие
-  и несовпадение installer; проверяется единственный uploaded installer asset.
+  failed/stale/tampered evidence, cross-host binding и gate exit semantics.
+  Отдельно — 17 сценариев publisher, включая подмену installer и блокировку
+  stable при выключенной, недоступной или изменившейся политике immutability.
+- `python3 scripts/ci-tui-contract-tests.py`: обнаружение и маршрутизация
+  suites, предел двух процессов, целостность логов и неуспешный статус шага.
 - `python3 scripts/install-contract-tests.py`: offline installer contracts.
 - `actionlint .github/workflows/ci.yml`; `sh -n install.sh`;
   `shellcheck install.sh scripts/*.sh`.
 - Полный локальный §14-набор и authentic supplied-bundle regressions.
 - Remote CI/publication не считаются проверенными по локальным mocks. Конкретный
   результат запуска и оставшиеся ограничения записываются в отчёте исполнения.
+
+### Проверка переключения на единственный формат v2
+
+- macOS arm64, SHA-256 манифеста `32479d34f2ac3b3d7ffc7fe9de33db93b6fdc3e8784e5e5f8fc9baf80b32fc8c`: SBOM, установка и откат с живой сессией, 21 OpenTUI-набор и 9 Bun-тестов прошли. Источник архива и аттестация в installer-тестах — локальные fixtures.
+- Установщик отклоняет v1 до выполнения его бинарника. Проверены пустой HOME, сохранение активного v2 и отказ отката на v1 с существующей записью активации. Установка v2 не меняет файлы прежнего пакета.
+- На Ubuntu x86_64 прошли четыре сценария установщика с fixtures: выбор Linux-архива, отказ v1, откат v2 и отказ без подтверждённой аттестации. Это не нативная приёмка релизного комплекта или hosted CI.
+- Linux x86_64: образ Rust 1.98.1 и Bun 1.4.4 собрали пакет `20ac1bcc861a4a14a9d2073eb76bbf75dc5e622e1155a380d81c1899611d85f3`; SBOM и публичный `--version` прошли. Нативный тест установщика не прошёл под Rosetta: `probe-write` завершился сигналом (`exit 133`, `mmap_anonymous_rw mmap failed`), так же как helper исторического пакета. Оба не создали файл; это не доказательство правильного sandbox-отказа. Установщик не активировал пакет, sandbox не ослабляли. Hosted Linux — NOT_RUN.
+- macOS workspace: 3797 PASS, 1 FAIL, 87 ignored; `release` — 19 PASS. PTY-оракул подсказки после resize разбивал логический текст вместо чтения физических строк сетки. После исправления оракула тот же сценарий на том же v2 — PASS; весь workspace повторно не запускался.
+
+### Локальный результат оптимизации v2
+
+- Финальный пакет (префикс SHA-256 манифеста `b99111fe62227`):
+  21 OpenTUI suite, SBOM и кадры четырёх размеров прошли.
+- Полный macOS workspace: 3798 PASS, 1 FAIL, 87 ignored. Последний отказ
+  был в PTY-оракуле. После исправлений только тестовых fixtures повторены
+  обе затронутые цели на том же пакете: `effect_boundary` — 83 PASS,
+  `mcp` — 52 PASS, 1 ignored. Workspace Clippy и rustfmt прошли; цельный
+  workspace после правки fixtures и новый hosted run не повторялись.
 
 ### Локальный результат 2026-11-16
 

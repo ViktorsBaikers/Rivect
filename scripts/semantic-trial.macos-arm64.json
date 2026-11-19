@@ -1,0 +1,362 @@
+{
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "typescript": "7.0.2",
+  "server_sha256": "a82f731365ad69d5c4c15f5e18fba4584bf3b7b839960172a76c3462b5114bf2",
+  "server_bytes": 23653616,
+  "platform_package_bytes": 27498111,
+  "kit": {
+    "build": "rivect 0.1.5 (slice001-20260909T180108Z-retry)",
+    "files": [
+      "rivect",
+      "rivect-sandbox-helper",
+      "rivect.manifest.json"
+    ],
+    "manifest_sha256": "4483e82174b9a756f9cdfdff0e35654dcd052a0831d3d49997ae4a3d081ea832"
+  },
+  "corpus_sha256": {
+    "app.tsx": "476e50e2b06ac57aa78cdaf53f19bbc7e4bf0c2348c331b5c741b995e04cb5ce",
+    "barrel.ts": "941245715b98680a8bc826fe718e054cec51339bcdd6a6bceb1a270e5db989e6",
+    "model.ts": "b7c19507c9e5f1eaf5b164e129981f4cde245418fc74062a6ee924548db06be3",
+    "tsconfig.json": "298bbabfc594593ba9474152bbefea0bb5b7140f481b5b3c8d24479f2ddd42ac"
+  },
+  "native": {
+    "sites": [
+      {
+        "candidates": [],
+        "use_bound": false,
+        "exact": false,
+        "two_workers_ms": 28.9
+      },
+      {
+        "candidates": [
+          [
+            "model.ts",
+            2,
+            13,
+            17
+          ],
+          [
+            "model.ts",
+            5,
+            2,
+            6
+          ]
+        ],
+        "use_bound": false,
+        "exact": false,
+        "two_workers_ms": 25.253
+      },
+      {
+        "candidates": [
+          [
+            "model.ts",
+            2,
+            13,
+            17
+          ],
+          [
+            "model.ts",
+            5,
+            2,
+            6
+          ]
+        ],
+        "use_bound": false,
+        "exact": false,
+        "two_workers_ms": 29.638
+      },
+      {
+        "candidates": [
+          [
+            "model.ts",
+            7,
+            16,
+            21
+          ]
+        ],
+        "use_bound": false,
+        "exact": false,
+        "two_workers_ms": 24.628
+      },
+      {
+        "candidates": [
+          [
+            "app.tsx",
+            7,
+            6,
+            11
+          ]
+        ],
+        "use_bound": true,
+        "exact": true,
+        "two_workers_ms": 27.973
+      }
+    ],
+    "exact": 1,
+    "old_pin": "stale_document_version",
+    "new_pin": "served"
+  },
+  "lsp": [
+    {
+      "answers": [
+        [
+          [
+            "model.ts",
+            0,
+            16,
+            21
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            2,
+            13,
+            17
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            5,
+            2,
+            6
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            7,
+            16,
+            21
+          ]
+        ],
+        [
+          [
+            "app.tsx",
+            7,
+            6,
+            11
+          ]
+        ]
+      ],
+      "exact": 5,
+      "encoding": "utf-16",
+      "v1_reply_after_edit": [
+        [
+          "model.ts",
+          2,
+          13,
+          17
+        ]
+      ],
+      "v1_visible": null,
+      "v2_target": [
+        [
+          "model.ts",
+          5,
+          2,
+          6
+        ]
+      ],
+      "initialize_ms": 22.245,
+      "first_answer_ms": 47.901,
+      "warm_ms": [
+        0.367,
+        0.327,
+        0.456,
+        0.298,
+        0.306,
+        0.33,
+        0.293,
+        0.407,
+        0.218,
+        0.223,
+        0.352,
+        0.308
+      ],
+      "warm_median_ms": 0.3175,
+      "server_rss_kib": 58928,
+      "cancel": -32800,
+      "cancel_reply_ms": 0.233,
+      "shutdown_to_reap_ms": 21.168,
+      "exit_code": 1,
+      "stderr_prefix": "context canceled",
+      "group_gone": true
+    },
+    {
+      "answers": [
+        [
+          [
+            "model.ts",
+            0,
+            16,
+            21
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            2,
+            13,
+            17
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            5,
+            2,
+            6
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            7,
+            16,
+            21
+          ]
+        ],
+        [
+          [
+            "app.tsx",
+            7,
+            6,
+            11
+          ]
+        ]
+      ],
+      "exact": 5,
+      "encoding": "utf-16",
+      "v1_reply_after_edit": [
+        [
+          "model.ts",
+          2,
+          13,
+          17
+        ]
+      ],
+      "v1_visible": null,
+      "v2_target": [
+        [
+          "model.ts",
+          5,
+          2,
+          6
+        ]
+      ],
+      "initialize_ms": 12.951,
+      "first_answer_ms": 42.0,
+      "warm_ms": [
+        0.268,
+        0.43,
+        0.313,
+        0.291,
+        0.255,
+        0.295,
+        0.373,
+        0.268,
+        0.263,
+        0.361,
+        0.242,
+        0.424
+      ],
+      "warm_median_ms": 0.293,
+      "server_rss_kib": 60064,
+      "cancel": "completed_before_cancel",
+      "cancel_reply_ms": 20.719,
+      "shutdown_to_reap_ms": 4.854,
+      "exit_code": 1,
+      "stderr_prefix": "context canceled",
+      "group_gone": true
+    },
+    {
+      "answers": [
+        [
+          [
+            "model.ts",
+            0,
+            16,
+            21
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            2,
+            13,
+            17
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            5,
+            2,
+            6
+          ]
+        ],
+        [
+          [
+            "model.ts",
+            7,
+            16,
+            21
+          ]
+        ],
+        [
+          [
+            "app.tsx",
+            7,
+            6,
+            11
+          ]
+        ]
+      ],
+      "exact": 5,
+      "encoding": "utf-16",
+      "v1_reply_after_edit": [
+        [
+          "model.ts",
+          2,
+          13,
+          17
+        ]
+      ],
+      "v1_visible": null,
+      "v2_target": [
+        [
+          "model.ts",
+          5,
+          2,
+          6
+        ]
+      ],
+      "initialize_ms": 12.297,
+      "first_answer_ms": 35.461,
+      "warm_ms": [
+        0.217,
+        0.233,
+        0.345,
+        0.268,
+        0.234,
+        0.163,
+        0.179,
+        0.235,
+        0.195,
+        0.226,
+        0.2,
+        0.198
+      ],
+      "warm_median_ms": 0.2215,
+      "server_rss_kib": 58768,
+      "cancel": -32800,
+      "cancel_reply_ms": 0.431,
+      "shutdown_to_reap_ms": 8.774,
+      "exit_code": 1,
+      "stderr_prefix": "context canceled",
+      "group_gone": true
+    }
+  ]
+}

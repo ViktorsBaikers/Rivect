@@ -11,12 +11,9 @@
 //! packaged `--ui-review` entry: its report carries 285 state×theme
 //! observations with per-state status/dock/composer/modal SGR fingerprints,
 //! so the row is PASS evidence when the candidate, every cell and every
-//! renderer-only claim match. The default run asserts the fail-closed pending
-//! path; `RIVECT_OFFLINE_EVIDENCE=release` asserts the offline full pass and
-//! the separate release answer. Under the DEC-032 formal scope deferral the
-//! in-scope deferred set is empty, so the reduced claim reads `release_ready`
-//! true; the deferred external obligations stay tracked follow-up, NOT_RUN,
-//! and are never claimed as performed.
+//! renderer-only claim match. V2 package and headless measurements do not
+//! establish an AC-003 budget. A36 stays NOT_RUN and the release verdict
+//! stays false even with complete host-store evidence.
 
 #![allow(
     clippy::expect_used,
@@ -52,6 +49,8 @@ use std::process::{Command, Output, Stdio};
 
 const INSTALLED_ORDINARY_EVIDENCE_MARKER: &str = "#installed-ordinary";
 const INSTALLED_UI_EVIDENCE_MARKER: &str = "#installed-ui";
+const V2_MEASUREMENT_ORACLE: &str = "measurement::v2_installed_package_measurement";
+const V2_BUDGET_PREREQUISITE: &str = "v2 has no approved AC-003 budget";
 
 /// The three rendered themes and the observation each state must carry.
 const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
@@ -277,15 +276,15 @@ fn deferred_owner_rows() -> Result<DeferredLedger, String> {
 const RENDERER_ONLY_CLAIMS: [(&str, &str); 4] = [
     (
         "awaiting-permission",
-        "renderer-only: no production approval/decision path opens the permission panel; the Ask verdict carries no class or target and the sole constructor is the passive `--ui-review` renderer in src/ui/review.rs (DEC-017)",
+        "renderer-only: this passive permission fixture does not initiate a request or confer authority",
     ),
     (
         "streaming-long-output",
-        "renderer-only: no production producer feeds view.output (the step-driver feed is deferred); the frame proves the renderer paints the seeded stream",
+        "renderer-only: this seeded output tests presentation, not delivery by a running provider or tool",
     ),
     (
         "error-offline-partial",
-        "renderer-only: no production producer feeds view.output (the step-driver feed is deferred); the frame proves the renderer paints the seeded stream",
+        "renderer-only: this seeded output tests presentation, not delivery by a running provider or tool",
     ),
     (
         "non-tty",
@@ -908,7 +907,10 @@ fn acceptance_receipt(
             case_id: row.case_id.clone(),
             evidence: row.oracle.first().expect("one oracle").clone(),
             marker: row.marker.clone(),
-            outcome: TrialOutcome::Pass,
+            outcome: match row.expected {
+                TrialExpectation::Pass => TrialOutcome::Pass,
+                TrialExpectation::Unserved => TrialOutcome::Unserved,
+            },
         })
         .collect();
     let mut cases: BTreeMap<String, u32> = BTreeMap::new();
@@ -931,6 +933,10 @@ fn acceptance_receipt(
             cases,
         })
         .collect();
+    let unserved = rows
+        .iter()
+        .filter(|row| row.outcome == TrialOutcome::Unserved)
+        .count();
     OfflineEvidenceReceipt {
         schema_version: 1,
         producer_version: "1".to_string(),
@@ -940,8 +946,8 @@ fn acceptance_receipt(
         targets,
         counts: OfflineEvidenceCounts {
             rows: rows.len(),
-            pass: rows.len(),
-            unserved: 0,
+            pass: rows.len() - unserved,
+            unserved,
         },
         rows,
     }
@@ -968,10 +974,29 @@ fn acceptance_group_receipts_missing_stale_unmarked_short_or_swapped_are_never_p
 
     let rows = acceptance_rows_from(&groups, &candidate);
     assert_eq!(rows.len(), 40);
+    let measurement = rows.iter().find(|row| row.case_id == "A36").expect("A36");
+    assert_eq!(measurement.outcome, TrialOutcome::Censored);
+    assert_eq!(measurement.cause.as_deref(), Some(V2_BUDGET_PREREQUISITE));
     assert!(
-        rows.iter().all(|row| row.outcome == TrialOutcome::Pass),
-        "every current marker-checked group row passes"
+        measurement
+            .evidence
+            .as_deref()
+            .expect("measurement receipt")
+            .ends_with(V2_MEASUREMENT_ORACLE)
     );
+    assert!(
+        rows.iter()
+            .filter(|row| row.case_id != "A36")
+            .all(|row| row.outcome == TrialOutcome::Pass)
+    );
+    let mut complete = complete_rows(&candidate);
+    *complete
+        .iter_mut()
+        .find(|row| row.case_id == "A36")
+        .expect("declared A36") = measurement.clone();
+    let blocked = counted(&candidate, &complete).with_deferred_rows(0);
+    assert_eq!(blocked.blockers.not_run, ["A36"]);
+    assert!(!blocked.full_pass && !blocked.offline_full_pass && !blocked.release_ready);
     assert!(rows.iter().all(|row| row.evidence.is_some()));
 
     // A missing receipt censors its whole group, never a smaller denominator.
@@ -1025,6 +1050,20 @@ fn acceptance_group_receipts_missing_stale_unmarked_short_or_swapped_are_never_p
         OfflineEvidenceManifest::load(&unmarked_manifest_bytes).expect("manifest");
     let mut unmarked_receipt =
         acceptance_receipt(&unmarked_manifest_bytes, &unmarked_manifest, &candidate);
+    let mut promoted = unmarked_receipt.clone();
+    let a36 = promoted
+        .rows
+        .iter_mut()
+        .find(|row| row.case_id == "A36")
+        .expect("A36");
+    a36.outcome = TrialOutcome::Pass;
+    promoted.counts.pass += 1;
+    promoted.counts.unserved -= 1;
+    assert!(
+        promoted
+            .validate(&unmarked_manifest_bytes, &unmarked_manifest)
+            .is_err()
+    );
     unmarked_receipt.rows[0].marker.clear();
     std::fs::write(
         &unmarked[2].2,
@@ -1843,10 +1882,23 @@ fn acceptance_group_rows(
                     candidate,
                     format!("receipt censored: {evidence}"),
                 ),
+                TrialOutcome::Unserved
+                    if row.case_id == "A36"
+                        && row.evidence == V2_MEASUREMENT_ORACLE
+                        && row.marker == "PACKAGE_SIZE_MEASUREMENT" =>
+                {
+                    FinalRow {
+                        case_id: row.case_id,
+                        candidate: candidate.to_string(),
+                        outcome: TrialOutcome::Censored,
+                        evidence: Some(evidence),
+                        cause: Some(V2_BUDGET_PREREQUISITE.to_string()),
+                    }
+                }
                 TrialOutcome::Unserved => censored(
                     row.case_id,
                     candidate,
-                    format!("acceptance rows are never unserved: {evidence}"),
+                    format!("unrecognized unserved acceptance evidence: {evidence}"),
                 ),
             }
         })
@@ -2344,15 +2396,8 @@ fn retained_legs_on_disk() -> BTreeSet<String> {
         .collect()
 }
 
-/// The closed platform-exclusive set the cross-host fold may rescue
-/// (DEC-027): the host-store legs and the Linux /proc measurement corpus,
-/// which no single host can both serve. Any other leg in the served
-/// evidence is dropped, never rescued.
-const CROSS_HOST_PLATFORM_LEGS: [&str; 3] = [
-    "auth.keychain",
-    "auth.secret_service",
-    "measurement.offline_corpus",
-];
+/// Only the two platform-exclusive credential stores can rescue one another's host gaps.
+const CROSS_HOST_PLATFORM_LEGS: [&str; 2] = ["auth.keychain", "auth.secret_service"];
 /// served.json names a handful of legs; anything larger is not this run's
 /// evidence and is never loaded.
 const CROSS_HOST_MAX_BYTES: u64 = 8 * 1024;
@@ -2595,14 +2640,10 @@ fn cross_host_served_returns_the_candidate_bound_platform_legs() {
             "measurement.offline_corpus"
         ]),
     );
-    let expected: BTreeSet<String> = [
-        "auth.keychain",
-        "auth.secret_service",
-        "measurement.offline_corpus",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    let expected: BTreeSet<String> = ["auth.keychain", "auth.secret_service"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     assert_eq!(
         cross_host_served_in(&path, CROSS_HOST_CANDIDATE),
         expected,
@@ -2645,12 +2686,12 @@ fn cross_host_served_drops_non_platform_legs() {
     let served = cross_host_served_in(&path, CROSS_HOST_CANDIDATE);
     assert_eq!(
         served.len(),
-        3,
+        2,
         "only the closed platform-exclusive set survives"
     );
     assert!(served.contains("auth.keychain"));
     assert!(served.contains("auth.secret_service"));
-    assert!(served.contains("measurement.offline_corpus"));
+    assert!(!served.contains("measurement.offline_corpus"));
     assert!(
         !served.contains("ingress.exec"),
         "a live leg is never rescued by the fold"
@@ -2730,7 +2771,7 @@ fn cross_host_rescue_removes_a_served_leg_from_the_offline_blockers() {
             "schema_version": 1,
             "leg": "measurement.offline_corpus",
             "status": "not_run",
-            "prerequisite": "no /proc process accounting on this host",
+            "prerequisite": V2_BUDGET_PREREQUISITE,
         }),
         json!({
             "schema_version": 1,
@@ -2760,7 +2801,10 @@ fn cross_host_rescue_removes_a_served_leg_from_the_offline_blockers() {
         &mut offline_legs,
         &cross_host_served_in(&path, CROSS_HOST_CANDIDATE),
     );
-    let remaining: BTreeSet<String> = ["ingress.exec"].into_iter().map(str::to_string).collect();
+    let remaining: BTreeSet<String> = ["ingress.exec", "measurement.offline_corpus"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     assert_eq!(
         offline_legs, remaining,
         "only the closed platform-exclusive set is rescued; a live leg stays a blocker even when claimed"
@@ -2771,9 +2815,9 @@ fn cross_host_rescue_removes_a_served_leg_from_the_offline_blockers() {
 fn cross_host_served_does_not_rescue_an_unclaimed_platform_leg() {
     let retained = vec![json!({
         "schema_version": 1,
-        "leg": "measurement.offline_corpus",
+        "leg": "auth.keychain",
         "status": "not_run",
-        "prerequisite": "no /proc process accounting on this host",
+        "prerequisite": "no keychain on this host",
     })];
     let (mut offline_legs, deferred_legs) = surface_retained_not_run(&retained);
     assert_eq!(offline_legs.len(), 1);
@@ -2789,7 +2833,7 @@ fn cross_host_served_does_not_rescue_an_unclaimed_platform_leg() {
         &cross_host_served_in(&path, CROSS_HOST_CANDIDATE),
     );
     assert!(
-        offline_legs.contains("measurement.offline_corpus"),
+        offline_legs.contains("auth.keychain"),
         "a platform leg the receipt does not claim stays an offline blocker"
     );
 }
@@ -3110,6 +3154,8 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
         + report.blockers.not_run.len()
         + report.blockers.unattributed.len();
     let offline_blockers = row_blockers + retained_legs_not_run;
+    let offline_full_pass = full_pass_with_retained(&report, retained_legs_not_run);
+    let release_ready = offline_full_pass && report.release_ready;
     println!(
         "FINAL required={} present={} current={} passed={} provider_rows={} alias_rows={} installed_rows={} ui_cells={}",
         report.required,
@@ -3135,12 +3181,12 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     );
     println!(
         "FINAL_ACCEPTANCE verdict={} release_ready={} offline_blockers={} deferred={}",
-        if report.release_ready {
+        if release_ready {
             "full-pass"
         } else {
             "not-full-pass"
         },
-        report.release_ready,
+        release_ready,
         offline_blockers,
         deferred_rows
     );
@@ -3174,12 +3220,13 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             "stale": report.blockers.stale.len(),
             "failed": report.blockers.failed.len(),
             "not_run": report.blockers.not_run.len(),
+            "not_run_cases": report.blockers.not_run,
             "unattributed": report.blockers.unattributed.len(),
             "retained_legs": retained_legs_not_run,
             "offline_total": offline_blockers,
         },
-        "offline_full_pass": report.offline_full_pass,
-        "release_ready": report.release_ready,
+        "offline_full_pass": offline_full_pass,
+        "release_ready": release_ready,
         "deferred_count": deferred_rows,
         "deferred": deferred_json,
         "carrier_verified": deferred.carrier_verified,
@@ -3251,16 +3298,33 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             "the in-scope deferred set is empty (DEC-032); the external legs are tracked follow-up"
         );
         assert!(
-            report.full_pass && report.offline_full_pass,
-            "the offline conjunction is a full pass: {report:?}"
+            !report.full_pass && !offline_full_pass && !release_ready,
+            "{report:?}"
+        );
+        let budget = rows.iter().find(|row| row.case_id == "A36").expect("A36");
+        assert_eq!(budget.outcome, TrialOutcome::Censored);
+        assert_eq!(budget.cause.as_deref(), Some(V2_BUDGET_PREREQUISITE));
+        assert!(
+            budget
+                .evidence
+                .as_deref()
+                .expect("measurement receipt")
+                .ends_with(V2_MEASUREMENT_ORACLE)
         );
         assert_eq!(report.required, 1784);
         assert_eq!(report.present, 1784);
         assert_eq!(report.current, 1784);
-        assert_eq!(report.passed, 1778);
+        assert_eq!(report.passed, 1777);
         assert_eq!(report.unserved, 6);
-        assert!(report.blockers.is_empty(), "{report:?}");
-        assert_eq!(retained_legs_not_run, 0, "no offline retained leg");
+        assert_eq!(report.blockers.not_run, ["A36"]);
+        assert_eq!(
+            offline_retained_legs,
+            BTreeSet::from(["measurement.offline_corpus".to_string()])
+        );
+        assert!(retained_not_run.iter().any(|row| {
+            row["leg"] == "measurement.offline_corpus"
+                && row["prerequisite"] == V2_BUDGET_PREREQUISITE
+        }));
         assert_eq!(ui_count, FINAL_UI_CELLS);
         assert_eq!(ui_missing, 0, "every 19xGxI cell is counted");
         assert_eq!(
@@ -3270,11 +3334,7 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
         assert_eq!(
             report.passed,
             expected_required_rows() - declared_not_run.len() - report.unserved,
-            "every current row and cell passes; unserved stays outside passed"
-        );
-        assert!(
-            report.release_ready,
-            "the reduced in-scope claim is ready (DEC-032); deferred obligations stay tracked follow-up, not performed"
+            "every other current row and cell passes; denials never count as passes"
         );
 
         let ordinary = rows

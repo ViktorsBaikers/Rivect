@@ -55,8 +55,26 @@ pub const EVENTS_AFTER: &str = "SELECT event_id, aggregate_id, aggregate_revisio
              FROM events WHERE session_id = ?1 AND cursor > ?2 ORDER BY cursor LIMIT ?3";
 pub const EVENTS_AFTER_FOR_TASK: &str = "SELECT event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin
              FROM events WHERE session_id = ?1 AND cursor > ?2 AND task_id = ?3 ORDER BY cursor LIMIT ?4";
+pub const RECENT_TASK_EVENTS: &str = "SELECT event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin
+             FROM events WHERE session_id = ?1 AND task_id = ?2 ORDER BY cursor DESC LIMIT 32";
 pub const EVENT_BY_AGGREGATE_REVISION: &str = "SELECT event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin
              FROM events WHERE aggregate_id = ?1 AND aggregate_revision = ?2";
+pub const TASK_ACTIVITY: &str =
+    "WITH owned AS (SELECT task_id FROM tasks WHERE session_id=?1 AND task_id=?2)
+ SELECT 'attempt:'||a.attempt_id, 'attempt.'||a.effect_class,
+ CASE a.effect_class WHEN 'exec' THEN 'process' WHEN 'model' THEN 'agent' ELSE 'tool' END, a.state
+ FROM attempts a JOIN owned USING(task_id)
+ UNION ALL SELECT 'stage:'||capability, 'stage.'||capability, 'stage', execution
+ FROM plan_obligations JOIN owned USING(task_id) WHERE stage=1
+ UNION ALL SELECT 'evidence:'||evidence_id, 'evidence.recorded', 'evidence', validity
+ FROM evidence JOIN owned USING(task_id)
+ UNION ALL SELECT 'change:'||question_id, 'diff.replacement_proposed', 'diff',
+ state||' SHA-256 '||substr(prompt,-64) FROM questions JOIN owned USING(task_id)
+ WHERE question_id GLOB 'write-file:*' AND prompt GLOB 'Write *? Replace with * bytes, SHA-256 *'
+ AND length(substr(prompt,-64))=64 AND substr(prompt,-64) NOT GLOB '*[^0-9a-f]*'
+ UNION ALL SELECT 'agent:'||task_id, 'agent.route', 'agent', connection
+ FROM tui_turn_routes JOIN owned USING(task_id)
+ ORDER BY 1 LIMIT 32";
 pub const EVENT_COUNT: &str = "SELECT COUNT(*) FROM events";
 pub const REPLAY_TODO_PROJECTION: &str =
     "INSERT OR REPLACE INTO todo_projection (task_id, revision, lifecycle)
@@ -163,6 +181,28 @@ pub const UNKNOWN_ATTEMPTS: &str =
 pub const SESSION_GENERATION: &str =
     "SELECT COALESCE(MAX(revision), 0) FROM tasks WHERE session_id = ?1";
 pub const TASKS_FOR_SESSION_PAGE: &str = "SELECT task_id, revision, intent_revision, lifecycle FROM tasks WHERE session_id = ?1 ORDER BY rowid LIMIT ?2 OFFSET ?3";
+pub const UI_TASK_PAGE: &str = "SELECT t.task_id, t.revision, t.lifecycle, t.event_cursor,
+                (SELECT COALESCE(MAX(cursor), 0) FROM events), CAST(t.goal_bytes AS TEXT),
+                r.reply, r.error_code, COALESCE(e.origin, 'unknown') FROM tasks t
+                LEFT JOIN events e ON e.aggregate_id=t.task_id AND e.aggregate_revision=1 AND e.event_type='task.created'
+                LEFT JOIN ui_message_replies r ON r.task_id=t.task_id
+                WHERE t.session_id=?1 AND (?2 IS NULL OR t.task_id=?2)
+                AND t.rowid <= ?4 ORDER BY t.rowid DESC LIMIT ?3";
+pub const LAST_STEP_OUTPUT: &str = "SELECT aggregate_revision,event_type FROM events
+    WHERE aggregate_id=?1 AND session_id=?2 AND task_id=?3 ORDER BY aggregate_revision DESC LIMIT 1";
+pub const UI_TASK_PAGE_ANCHOR: &str = "SELECT rowid FROM tasks WHERE session_id=?1 AND task_id=?2";
+pub const SETTLE_UI_MESSAGE: &str = "UPDATE tasks SET revision=revision+1,
+                lifecycle=?3, event_cursor=event_cursor+1
+                WHERE session_id=?1 AND task_id=?2 AND revision=?4 AND lifecycle='running'";
+pub const INSERT_UI_REPLY: &str =
+    "INSERT INTO ui_message_replies(task_id,reply,error_code) VALUES(?1,?2,?3)";
+pub const INTERRUPTED_UI_MESSAGE: &str = "SELECT t.session_id,t.task_id,t.revision FROM tasks t
+                JOIN events e ON e.aggregate_id=t.task_id AND e.aggregate_revision=1
+                WHERE t.lifecycle='running' AND e.origin='ui-message'
+                AND NOT EXISTS (SELECT 1 FROM ui_message_replies r WHERE r.task_id=t.task_id)
+                AND (t.revision=1 OR EXISTS (
+                    SELECT 1 FROM events a WHERE a.aggregate_id=t.task_id
+                    AND a.aggregate_revision=t.revision AND a.event_type='question.answered')) LIMIT 1";
 pub const TODO_FOR_SESSION_PAGE: &str = "SELECT tp.task_id, tp.revision, tp.lifecycle FROM todo_projection tp JOIN tasks t ON t.task_id = tp.task_id WHERE t.session_id = ?1 ORDER BY t.rowid LIMIT ?2 OFFSET ?3";
 /// The session listing's generation: the newest session row this data root
 /// recorded. `session_revision` counts attachments within one session, so it
@@ -404,6 +444,17 @@ pub const APPLIED_PUBLICATIONS: &str =
                  ORDER BY target, admission_seq, owner";
 pub const COMPLETE_PUBLICATION: &str = "UPDATE config_publications SET state = 'applied'
                  WHERE owner = ?1 AND target = ?2 AND admission_seq = ?3 AND state = 'pending'";
+pub const INSERT_PENDING_PERMISSION: &str =
+    "INSERT INTO pending_permissions(attempt_id,task_id,intent_revision,grant_id,scope,expires_at)
+    SELECT a.attempt_id,t.task_id,t.intent_revision,?2,?3,strftime('%Y-%m-%dT%H:%M:%SZ','now',?4)
+    FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id=?1";
+pub const LIVE_PERMISSION: &str = "SELECT p.attempt_id,p.task_id,a.effect_class,p.grant_id,p.scope,p.expires_at
+    FROM pending_permissions p JOIN tasks t ON t.task_id=p.task_id JOIN attempts a ON a.attempt_id=p.attempt_id AND a.task_id=t.task_id
+    WHERE t.session_id=?1 AND p.intent_revision=t.intent_revision AND t.lifecycle NOT IN ('completed','cancelled')
+    AND a.effect_class IN ('read','write','exec','egress') AND a.state='rejected' AND a.detail=?2 AND unixepoch(p.expires_at)>unixepoch()
+    ORDER BY p.rowid LIMIT 1";
+pub const REMOVE_PENDING_PERMISSION: &str =
+    "DELETE FROM pending_permissions WHERE attempt_id=?1 AND unixepoch(expires_at)>unixepoch()";
 pub const INSERT_PREAPPROVAL: &str =
     "INSERT OR REPLACE INTO preapprovals (scope, granted_by, expires_at)
                  VALUES (?1, ?2, datetime('now', ?3))";
@@ -1015,6 +1066,25 @@ pub fn prune_base_versions(keep: usize) -> String {
 
 // ----- verified procedure segments and their runs (AC-053) -----
 
+/// Keep one overflow row: a partial trace must never be mistaken for a short segment.
+pub const LINK_PROCEDURE_SOURCE: &str = "INSERT OR IGNORE INTO procedure_source_attempts
+    (attempt_id, task_id, plan_revision)
+    SELECT ?1, p.task_id, p.revision FROM plans p JOIN plan_selections s
+      ON s.task_id = p.task_id AND s.revision = p.selection_revision
+    WHERE p.task_id = ?2 AND p.revision = (SELECT MAX(revision) FROM plans WHERE task_id = ?2)
+      AND NOT EXISTS (SELECT 1 FROM procedure_segments WHERE task_id = ?2 AND plan_revision = p.revision)
+      AND (SELECT COUNT(*) FROM procedure_source_attempts
+           WHERE task_id = ?2 AND plan_revision = p.revision) <= ?3";
+pub const PROCEDURE_SOURCES: &str = "SELECT a.effect_class, a.state, a.detail, a.describe
+    FROM procedure_source_attempts s JOIN attempts a ON a.attempt_id = s.attempt_id
+    WHERE s.task_id = ?1 AND a.task_id = ?1 AND s.plan_revision = ?2 ORDER BY s.rowid LIMIT ?3";
+pub const RECEIPT_STOP_FOR_TASK: &str = "SELECT run_id FROM procedure_runs
+    WHERE task_id = ?1 AND stop_condition = 'receipt_mismatch' LIMIT 1";
+pub const LANDED_PROCEDURE_RUN_FOR_TASK: &str = "SELECT r.run_id FROM procedure_runs r
+    JOIN procedure_run_steps s ON s.run_id = r.run_id AND s.state = 'prepared'
+    JOIN attempts a ON a.attempt_id = s.attempt_id AND a.task_id = r.task_id
+    WHERE r.task_id = ?1 AND r.state != 'completed' AND a.state = 'confirmed' LIMIT 1";
+
 /// A derived segment lands once: `OR IGNORE` keeps its id stable, so
 /// deriving the same plan revision again returns the saved record instead of
 /// rewriting the steps a run may already be following.
@@ -1050,13 +1120,22 @@ pub const PROCEDURE_RUN_ROW: &str = "SELECT procedure_id, procedure_version, tas
 /// recorded, so a row never changes the attempt it belongs to.
 pub const PREPARE_PROCEDURE_STEP: &str = "INSERT OR IGNORE INTO procedure_run_steps
              (run_id, position, tool, state, attempt_id, result)
-             VALUES (?1, ?2, ?3, 'prepared', ?4, '')";
+             SELECT ?1, ?2, ?3, 'prepared', ?4, '' FROM procedure_runs r
+             JOIN procedure_segments t ON t.procedure_id = r.procedure_id AND t.version = r.procedure_version
+             JOIN attempts a ON a.attempt_id = ?4 AND a.task_id = r.task_id AND a.state = 'planned'
+             WHERE r.run_id = ?1 AND r.state = 'running' AND r.cursor + 1 = ?2 AND t.schema_version = ?5
+               AND ((?3 = 'read_file' AND a.effect_class = 'read') OR (?3 = 'write_file' AND a.effect_class = 'write'))
+               AND EXISTS (SELECT 1 FROM json_each(t.steps) WHERE value ->> '$.position' = ?2
+                  AND value ->> '$.tool' = ?3 AND value ->> '$.source_input' IS NOT NULL)";
 /// The settlement moves the prepared row and the run's cursor in one
 /// transaction, bound to the cursor the caller just settled: a step that would
 /// skip ahead, or a second settle of the same position, matches no row.
 pub const SETTLE_PROCEDURE_STEP: &str = "UPDATE procedure_run_steps
-             SET state = 'settled', attempt_id = ?3, result = ?4
-             WHERE run_id = ?1 AND position = ?2 AND state = 'prepared'";
+             SET state = 'settled', result = ?4
+             WHERE run_id = ?1 AND position = ?2 AND attempt_id = ?3 AND state = 'prepared'
+               AND EXISTS (SELECT 1 FROM attempts a JOIN procedure_runs r ON r.task_id = a.task_id
+                 WHERE a.attempt_id = ?3 AND r.run_id = ?1 AND a.state = 'confirmed'
+                   AND coalesce(a.detail, '') = ?4)";
 pub const ADVANCE_PROCEDURE_CURSOR: &str = "UPDATE procedure_runs SET cursor = ?3
              WHERE run_id = ?1 AND cursor = ?2 AND state = 'running'";
 /// The step a run prepared and never settled, with the state its own attempt
@@ -1078,13 +1157,13 @@ pub const COMPLETE_PROCEDURE_RUN: &str = "UPDATE procedure_runs SET state = 'com
              WHERE run_id = ?1 AND state = 'running' AND cursor = step_count";
 pub const STOP_PROCEDURE_RUN: &str = "UPDATE procedure_runs
              SET state = 'stopped', stop_condition = ?2, stop_detail = ?3
-             WHERE run_id = ?1 AND state != 'completed'";
+             WHERE run_id = ?1 AND state != 'completed' AND stop_condition IS NOT 'receipt_mismatch'";
 /// A resume re-opens a stopped run: the run is running while it runs, and the
 /// stop it cleared was the previous attempt's, not a fact the next attempt
 /// inherits.
 pub const RESUME_PROCEDURE_RUN: &str = "UPDATE procedure_runs
              SET state = 'running', stop_condition = NULL, stop_detail = NULL
-             WHERE run_id = ?1 AND state = 'stopped'";
+             WHERE run_id = ?1 AND state = 'stopped' AND stop_condition IS NOT 'receipt_mismatch'";
 /// Retention (INV-010): runs are derived records, so the terminal ones beyond
 /// the newest `keep` leave with their step rows; the runs that are still
 /// running — the ones a resume can continue — are never pruned.
@@ -1099,29 +1178,31 @@ pub const RESUME_PROCEDURE_RUN: &str = "UPDATE procedure_runs
 /// preserves the refusal itself, and it never touches a run that is still
 /// running.
 pub fn prune_procedure_runs(keep: usize) -> String {
+    let evicted = format!(
+        "SELECT run_id FROM procedure_runs WHERE state != 'running'
+         AND stop_condition IS NOT 'receipt_mismatch'
+         AND run_id NOT IN (SELECT run_id FROM procedure_run_steps WHERE state = 'prepared')
+         ORDER BY rowid DESC LIMIT -1 OFFSET {keep}"
+    );
     format!(
-        "DELETE FROM procedure_run_steps WHERE run_id IN (
-             SELECT run_id FROM procedure_runs WHERE state != 'running'
-             ORDER BY rowid DESC LIMIT -1 OFFSET {keep});
-         DELETE FROM procedure_runs WHERE run_id IN (
-             SELECT run_id FROM procedure_runs WHERE state != 'running'
-             ORDER BY rowid DESC LIMIT -1 OFFSET {keep})"
+        "DELETE FROM procedure_run_steps WHERE run_id IN ({evicted});
+         DELETE FROM procedure_runs WHERE run_id IN ({evicted})"
     )
 }
 /// Retention (INV-010) for the saved segments themselves: beyond the newest
 /// `keep`, a segment leaves with its runs and their step rows.
 pub fn prune_procedure_segments(keep: usize) -> String {
+    let evicted = format!(
+        "SELECT procedure_id FROM procedure_segments WHERE procedure_id NOT IN (
+             SELECT procedure_id FROM procedure_runs WHERE stop_condition = 'receipt_mismatch'
+             OR run_id IN (SELECT run_id FROM procedure_run_steps WHERE state = 'prepared'))
+         ORDER BY rowid DESC LIMIT -1 OFFSET {keep}"
+    );
     format!(
         "DELETE FROM procedure_run_steps WHERE run_id IN (
-             SELECT run_id FROM procedure_runs WHERE procedure_id IN (
-                 SELECT procedure_id FROM procedure_segments
-                 ORDER BY rowid DESC LIMIT -1 OFFSET {keep}));
-         DELETE FROM procedure_runs WHERE procedure_id IN (
-             SELECT procedure_id FROM procedure_segments
-             ORDER BY rowid DESC LIMIT -1 OFFSET {keep});
-         DELETE FROM procedure_segments WHERE procedure_id IN (
-             SELECT procedure_id FROM procedure_segments
-             ORDER BY rowid DESC LIMIT -1 OFFSET {keep})"
+             SELECT run_id FROM procedure_runs WHERE procedure_id IN ({evicted}));
+         DELETE FROM procedure_runs WHERE procedure_id IN ({evicted});
+         DELETE FROM procedure_segments WHERE procedure_id IN ({evicted})"
     )
 }
 

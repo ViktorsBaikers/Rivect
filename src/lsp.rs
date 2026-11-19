@@ -6,6 +6,10 @@
 //! and a document whose bytes moved under the index is stale: its rows
 //! are withheld, never served as a current answer (AC-039a).
 //!
+//! The runtime retains one bounded projection of this index. An isolated
+//! worker enumerates candidates again and reuses only matching file stamps.
+//! Resolution, pins, coverage and truncation are evaluated for each request.
+//!
 //! # Budgets
 //!
 //! One index is built per request. A file past [`MAX_SYMBOL_FILE_BYTES`]
@@ -19,11 +23,11 @@
 //! time and memory are unbounded in-process on hostile input — the
 //! wiring slice must run the parse in a resource-limited child process
 //! before any runtime caller reaches this index (DEC-028, NOTE-004).
-//! Each parsed file is walked once with a tree cursor — ancestor
-//! context rides a stack, so the walk is linear in the tree — and fails
-//! past [`MAX_TREE_DEPTH`], [`MAX_FILE_NODES`] or a scope path rendering
-//! past [`MAX_SCOPE_PATH_BYTES`]. Rows are charged as the walk records
-//! them against the index-wide [`MAX_SYMBOL_ROWS`], and every byte of
+//! A file's scope walk consumes the declaration query's ordered captures
+//! alongside its tree cursor. Ancestor context rides a stack; both scans
+//! are bounded by [`MAX_TREE_DEPTH`] and [`MAX_FILE_NODES`]. A scope path
+//! past [`MAX_SCOPE_PATH_BYTES`] fails the file. Rows are charged as the
+//! walk records them against the index-wide [`MAX_SYMBOL_ROWS`], and every byte of
 //! text and scope the index keeps against [`MAX_RETAINED_BYTES`]; the
 //! file whose parse or walk crosses a budget is a failed entry, never a
 //! silently partial one. Only a references request keeps use rows; a
@@ -164,10 +168,17 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, UNIX_EPOCH};
-use tree_sitter::{Node, ParseOptions, ParseState, Parser};
+use tree_sitter::{Node, ParseOptions, ParseState, Parser, Query, QueryCursor, StreamingIterator};
+
+mod reuse;
+pub use reuse::SymbolWork;
+use reuse::{CachedFile, FileRows, NameFilter};
+pub(crate) use reuse::{ProjectionMode, SymbolProjection};
 
 /// The largest file the index parses. Dense Rust (`a;` in a body)
 /// spends 1.5 parse-tree nodes per byte, so it crosses
@@ -322,17 +333,14 @@ pub struct CandidateFile {
 pub struct IndexCoverage {
     /// Files no admitted grammar claims — fallback-scan candidates.
     pub unsupported: u64,
-    /// Files that could not be read bounded, decoded, named, parsed
-    /// inside the parse budgets (or came once they were spent), or
-    /// walked inside the depth, node, row, scope and retained budgets.
+    /// Files that could not be read, decoded, named, parsed or indexed
+    /// under the grammar, declaration query and resource budgets.
     pub failed: u64,
     /// Indexed files whose tree carries error or missing nodes.
     pub damaged: u64,
-    /// Parse-tree nodes the walks visited, failed walks included, and
-    /// their lookup steps — each file's draw on [`MAX_FILE_NODES`]. A
-    /// verification counter (read
-    /// by the budget tests): the build's walk work stays auditable as
-    /// linear in what it parsed.
+    /// Scope-cursor visits and its lookup steps, failed walks included.
+    /// Does not count the independent declaration-query cursor; that
+    /// cursor runs once on a tree admitted under the same node bound.
     pub nodes_visited: u64,
     /// Progress checks the parses took, stopped parses included — each
     /// file's draw on [`MAX_PARSE_CHECKS`], all of them the build's draw
@@ -341,22 +349,23 @@ pub struct IndexCoverage {
     pub parse_checks: u64,
 }
 
-/// The `(len, mtime)` identity a document's freshness is checked
-/// against — re-stat at query time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
+/// Replacing a file or restoring its mtime must not validate old rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FileStamp {
     len: u64,
-    modified: Option<i128>,
+    modified: Option<u64>,
+    identity: (u64, u64, i64, i64),
 }
 
-fn file_stamp(meta: &std::fs::Metadata) -> FileStamp {
+pub(crate) fn file_stamp(meta: &std::fs::Metadata) -> FileStamp {
     FileStamp {
         len: meta.len(),
+        identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
         modified: meta
             .modified()
             .ok()
             .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-            .map(|since| since.as_nanos() as i128),
+            .and_then(|since| u64::try_from(since.as_nanos()).ok()),
     }
 }
 
@@ -390,6 +399,8 @@ pub struct IndexedDocument {
     relative: PathBuf,
     absolute: PathBuf,
     stamp: FileStamp,
+    checks: u64,
+    names: NameFilter,
     /// The module path the document's top level lives at, outermost
     /// first — empty at a crate root and for every TypeScript document
     /// (whose files share one root); `None` for a Rust file outside the
@@ -407,10 +418,7 @@ impl IndexedDocument {
     /// Is the file on disk still the indexed bytes? A document that
     /// cannot be re-stat'd, was replaced, grew/shrank, or whose mtime is
     /// unreadable is stale — its rows are withheld rather than served
-    /// under a dead version (AC-039a). `len`+`mtime` is the same
-    /// freshness signal the other legs' staleness notes record; a
-    /// content compare would cost a re-read of every document per
-    /// query.
+    /// under a dead version (AC-039a).
     pub fn is_stale(&self) -> bool {
         let Ok(meta) = std::fs::metadata(&self.absolute) else {
             return true;
@@ -421,7 +429,7 @@ impl IndexedDocument {
 
 /// A row's coordinates: the name node's LSP range plus the same span as
 /// document bytes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Span {
     range: Range,
     start_byte: u64,
@@ -445,7 +453,7 @@ impl Span {
 }
 
 /// Which kind of definition a use looks its name up among.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum Namespace {
     /// Locals, functions, constants, statics, unit/tuple structs,
     /// TypeScript classes, enums and namespaces.
@@ -455,7 +463,7 @@ enum Namespace {
 }
 
 /// How a use names its target.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum Spelling {
     /// An allowlisted position: a bare name, bound lexically, or the
     /// last segment of `q::name` — `q` as written (TypeScript `.` read
@@ -474,7 +482,7 @@ enum Spelling {
 
 /// A recorded row's role inside the index — the internal shape; served
 /// rows carry `SymbolRole` instead.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum RowRole {
     /// A definition site; `type_ref` is the named type its annotation
     /// spells — `fn f() -> T`/`const X: T`/`let x: T`/`field: T` —
@@ -490,7 +498,7 @@ enum RowRole {
 /// segment, its spelled qualifier, the spelling site's coordinates (so
 /// an unresolved type still reports where it was written) and the scope
 /// the annotation sits in, which is where its name resolves from.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TypeRef {
     name: Box<str>,
     qualifier: Option<Box<str>>,
@@ -500,13 +508,13 @@ struct TypeRef {
 
 /// One retained row — a definition or a use of a name — with the name
 /// node's coordinates, its interned scope and the role payload.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct IndexedSymbol {
     document: usize,
     /// The row's own text when it is not the requested name — the
     /// common row repeats the request and stores nothing.
     name: Option<Box<str>>,
-    symbol_kind: &'static str,
+    symbol_kind: std::borrow::Cow<'static, str>,
     scope: usize,
     span: Span,
     /// The document bytes `[from, until)` a local binding is visible
@@ -569,7 +577,7 @@ const HOISTS: u8 = 1 << 4;
 #[derive(Debug)]
 struct ScopeTable {
     nodes: Vec<ScopeNode>,
-    /// `(scope, document)` → the bearer categories that opened it there.
+    /// `(document, scope)` also groups one document's bearer records for reuse.
     bearers: BTreeMap<(usize, usize), u8>,
 }
 
@@ -649,7 +657,7 @@ impl ScopeTable {
 
     /// The bearer categories `document` opened scope `id` with.
     fn bearer(&self, id: usize, document: usize) -> u8 {
-        self.bearers.get(&(id, document)).copied().unwrap_or(0)
+        self.bearers.get(&(document, id)).copied().unwrap_or(0)
     }
 
     /// The `::`-joined named path, outermost first — `""` at a root;
@@ -821,11 +829,21 @@ pub struct SymbolIndex<'a> {
     pin_failed: bool,
     /// The build's honest coverage counters.
     pub coverage: IndexCoverage,
+    pub(crate) work: SymbolWork,
+    retain_names: bool,
     /// The pinned query root — the boundary the package search stops at.
     root: PathBuf,
     /// Resolved package roots, per file directory: a build reads many
     /// files from few directories, and each miss is a filesystem walk.
     packages: BTreeMap<PathBuf, PathBuf>,
+}
+
+struct DocumentVersion {
+    stamp: FileStamp,
+    version: i32,
+    damaged: bool,
+    checks: u64,
+    names: NameFilter,
 }
 
 /// A file's walk crossed one of its budgets.
@@ -856,6 +874,28 @@ impl<'a> SymbolIndex<'a> {
         request: SymbolRequest<'a>,
         deadline: Option<Instant>,
     ) -> Self {
+        Self::build_reusing(root, files, request, deadline, ProjectionMode::OneShot)
+    }
+
+    pub(crate) fn build_reusing(
+        root: &Path,
+        files: impl IntoIterator<Item = CandidateFile>,
+        request: SymbolRequest<'a>,
+        deadline: Option<Instant>,
+        mode: ProjectionMode,
+    ) -> Self {
+        let retain_names = matches!(mode, ProjectionMode::Retain(_));
+        let mut previous = match mode {
+            ProjectionMode::OneShot => None,
+            ProjectionMode::Retain(old) => old.filter(|old| old.for_root(root)),
+        };
+        let same_rows = previous
+            .as_ref()
+            .is_some_and(|old| old.name == request.name && old.op == request.op);
+        let other_name = previous
+            .as_ref()
+            .filter(|_| !same_rows && request.op != SymbolOp::Type)
+            .map(|_| NameFilter::bits(request.name));
         let root_uri = path_to_uri(root);
         let mut index = Self {
             request,
@@ -869,11 +909,26 @@ impl<'a> SymbolIndex<'a> {
             parse_deadline: deadline,
             pin_failed: false,
             coverage: IndexCoverage::default(),
+            work: SymbolWork::default(),
+            retain_names,
             root: root.to_path_buf(),
             packages: BTreeMap::new(),
         };
         for file in files {
-            index.index_file(root_uri.as_ref(), file);
+            let cached = previous.as_mut().and_then(|old| {
+                let mut entry = old.files.remove(&file.relative)?;
+                if !same_rows {
+                    // Definition and reference subjects are document-local.
+                    // Types can draw on another file even without a subject there.
+                    if !entry.names.excludes(other_name?) {
+                        return None;
+                    }
+                    entry.rows.clear();
+                    entry.bearers.clear();
+                }
+                Some((entry, old.scopes.as_slice()))
+            });
+            index.index_file(root_uri.as_ref(), file, cached);
         }
         index
     }
@@ -913,7 +968,12 @@ impl<'a> SymbolIndex<'a> {
         }
     }
 
-    fn index_file(&mut self, root_uri: Option<&Uri>, file: CandidateFile) {
+    fn index_file(
+        &mut self,
+        root_uri: Option<&Uri>,
+        file: CandidateFile,
+        cached: Option<CachedFile<'_>>,
+    ) {
         let Some(grammar) = Grammar::for_path(&file.relative) else {
             self.coverage.unsupported += 1;
             self.unclaimed.push(file);
@@ -925,11 +985,46 @@ impl<'a> SymbolIndex<'a> {
         // larger than the bytes left to parse: the read would buy nothing.
         let spent =
             self.checks_left == 0 || self.parse_deadline.is_none_or(|end| Instant::now() >= end);
-        let fits = std::fs::metadata(&file.absolute)
-            .is_ok_and(|meta| meta.len() <= self.parsed_left.min(MAX_SYMBOL_FILE_BYTES));
-        if spent || !fits {
+        let Ok(meta) = std::fs::symlink_metadata(&file.absolute) else {
+            return self.fail(&file);
+        };
+        if spent || !meta.is_file() || meta.len() > self.parsed_left.min(MAX_SYMBOL_FILE_BYTES) {
             return self.fail(&file);
         }
+        let (Some(uri), Some(root_uri)) = (path_to_uri(&file.absolute), root_uri) else {
+            return self.fail(&file);
+        };
+        if let Some((mut entry, scopes)) = cached
+            && entry.stamp.is_current(file_stamp(&meta))
+            && entry.checks < self.checks_left
+            && entry.rows.len() <= MAX_SYMBOL_ROWS - self.rows.len()
+            && entry.rebase(
+                scopes,
+                &mut self.scopes,
+                self.documents.len(),
+                &mut self.retained_left,
+            )
+        {
+            self.parsed_left -= meta.len();
+            self.checks_left -= entry.checks;
+            self.work.reused += 1;
+            self.rows.extend(entry.rows);
+            self.record_document(
+                file,
+                uri,
+                root_uri,
+                grammar,
+                DocumentVersion {
+                    stamp: entry.stamp,
+                    version: entry.version,
+                    damaged: entry.damaged,
+                    checks: entry.checks,
+                    names: entry.names,
+                },
+            );
+            return;
+        }
+        self.work.read += 1;
         let Some((bytes, meta)) = read_capped(&file.absolute, MAX_SYMBOL_FILE_BYTES) else {
             return self.fail(&file);
         };
@@ -941,15 +1036,11 @@ impl<'a> SymbolIndex<'a> {
         let Ok(source) = String::from_utf8(bytes) else {
             return self.fail(&file);
         };
-        let (Some(uri), Some(root_uri)) = (path_to_uri(&file.absolute), root_uri) else {
-            // A document that cannot be named cannot produce
-            // LSP-shaped rows — a failed entry, never an anonymous one.
-            return self.fail(&file);
-        };
         let Some(parsed_left) = self.parsed_left.checked_sub(source.len() as u64) else {
             return self.fail(&file);
         };
         self.parsed_left = parsed_left;
+        self.work.parsed += 1;
         let (tree, checks) = parse(
             grammar,
             &source,
@@ -960,6 +1051,13 @@ impl<'a> SymbolIndex<'a> {
         self.checks_left = self.checks_left.saturating_sub(checks);
         self.coverage.parse_checks += checks;
         let Some(tree) = tree else {
+            return self.fail(&file);
+        };
+        // Bound the query cursor even when it must scan to EOF for its first capture.
+        if tree.root_node().descendant_count() > MAX_FILE_NODES {
+            return self.fail(&file);
+        }
+        let Ok(declarations) = declaration_query(grammar) else {
             return self.fail(&file);
         };
         let mut walk = Walk {
@@ -976,12 +1074,18 @@ impl<'a> SymbolIndex<'a> {
             retained_left: &mut self.retained_left,
             rows: Vec::new(),
             subject_seen: false,
+            names: self.retain_names.then(NameFilter::default),
             heads: BTreeSet::new(),
             namespaces: BTreeSet::new(),
         };
-        let walked = walk.run(&tree);
-        let (visited, mut rows, subject_seen, heads) =
-            (walk.visited, walk.rows, walk.subject_seen, walk.heads);
+        let walked = walk.run(&tree, declarations);
+        let (visited, mut rows, subject_seen, heads, names) = (
+            walk.visited,
+            walk.rows,
+            walk.subject_seen,
+            walk.heads,
+            walk.names.unwrap_or_default(),
+        );
         self.coverage.nodes_visited += visited as u64;
         if walked.is_err() {
             return self.fail(&file);
@@ -998,7 +1102,7 @@ impl<'a> SymbolIndex<'a> {
             SymbolOp::Type => !subject_seen && row.symbol_kind == "type_parameter",
             SymbolOp::References => row.name.as_deref().is_some_and(|name| {
                 matches!(row.role, RowRole::Definition { .. })
-                    && TYPE_LEVEL_KINDS.contains(&row.symbol_kind)
+                    && TYPE_LEVEL_KINDS.contains(&row.symbol_kind.as_ref())
                     && !heads.contains(name)
             }),
             SymbolOp::Definition => false,
@@ -1014,11 +1118,33 @@ impl<'a> SymbolIndex<'a> {
         if self.rows.len() + rows.len() > MAX_SYMBOL_ROWS {
             return self.fail(&file);
         }
-        let damaged = tree.root_node().has_error();
-        if damaged {
+        self.rows.extend(rows);
+        self.record_document(
+            file,
+            uri,
+            root_uri,
+            grammar,
+            DocumentVersion {
+                stamp: file_stamp(&meta),
+                version: content_version(source.as_bytes()),
+                damaged: tree.root_node().has_error(),
+                checks,
+                names,
+            },
+        );
+    }
+
+    fn record_document(
+        &mut self,
+        file: CandidateFile,
+        uri: Uri,
+        root_uri: &Uri,
+        grammar: Grammar,
+        document: DocumentVersion,
+    ) {
+        if document.damaged {
             self.coverage.damaged += 1;
         }
-        self.rows.extend(rows);
         let module = match grammar {
             Grammar::Rust => module_path(&file.relative, &self.package_of(&file)),
             Grammar::TypeScript | Grammar::Tsx => Some(Vec::new()),
@@ -1026,20 +1152,70 @@ impl<'a> SymbolIndex<'a> {
         self.documents.push(IndexedDocument {
             uri,
             root: root_uri.clone(),
-            version: content_version(source.as_bytes()),
+            version: document.version,
             encoding: PositionEncodingKind::UTF8,
             ignored: file.ignored,
-            damaged,
+            damaged: document.damaged,
             grammar,
             relative: file.relative,
             absolute: file.absolute,
-            // The opened handle's own stat, taken before its read: the
-            // stamp names the bytes that were indexed, and a write that
-            // races the read moves the file past it — stale, never a
-            // newer stamp over older bytes.
-            stamp: file_stamp(&meta),
+            stamp: document.stamp,
+            checks: document.checks,
+            names: document.names,
             module,
         });
+    }
+
+    pub(crate) fn into_projection(self) -> Option<SymbolProjection> {
+        // A dense index still answers normally; it need not fit the
+        // bounded private pipe a second time as a cache.
+        if self.coverage.failed > 0
+            || self.documents.len() > 4096
+            || self.rows.len() > 4096
+            || self.scopes.nodes.len() > 4096
+            || MAX_RETAINED_BYTES - self.retained_left > 512 * 1024
+        {
+            return None;
+        }
+        let mut rows = self.rows.into_iter().peekable();
+        let mut flags = self.scopes.bearers.into_iter().peekable();
+        let mut files = BTreeMap::new();
+        for (i, doc) in self.documents.into_iter().enumerate() {
+            doc.relative.to_str()?;
+            let mut own = Vec::new();
+            while let Some(row) = rows.next_if(|row| row.document == i) {
+                own.push(row);
+            }
+            let mut bearers = Vec::new();
+            while let Some(((_, id), bits)) = flags.next_if(|((d, _), _)| *d == i) {
+                bearers.push((id, bits));
+            }
+            files.insert(
+                doc.relative,
+                FileRows {
+                    stamp: doc.stamp,
+                    version: doc.version,
+                    damaged: doc.damaged,
+                    checks: doc.checks,
+                    names: doc.names,
+                    rows: own,
+                    bearers,
+                },
+            );
+        }
+        Some(SymbolProjection {
+            name: self.request.name.into(),
+            op: self.request.op,
+            root: self.root,
+            files,
+            scopes: self
+                .scopes
+                .nodes
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| (n.parent.unwrap_or(i), n.name))
+                .collect(),
+        })
     }
 
     /// Answers the request. Freshness is re-checked per document: rows
@@ -1239,7 +1415,7 @@ impl<'a> SymbolIndex<'a> {
         let RowRole::Definition { type_ref } = &row.role else {
             return;
         };
-        let (bound, from, name, span) = if TYPE_LEVEL_KINDS.contains(&row.symbol_kind) {
+        let (bound, from, name, span) = if TYPE_LEVEL_KINDS.contains(&row.symbol_kind.as_ref()) {
             if seen.insert((row.document, row.span.start_byte)) {
                 picks.push(Pick::Row {
                     row: subject,
@@ -1323,7 +1499,7 @@ impl<'a> SymbolIndex<'a> {
                 self.served(
                     symbol,
                     symbol.name(self.request.name),
-                    symbol.symbol_kind,
+                    &symbol.symbol_kind,
                     symbol.span,
                     role,
                     resolved,
@@ -1611,7 +1787,10 @@ impl<'r, 'a> Binder<'r, 'a> {
                     && !row.member
                     && match &row.role {
                         RowRole::Definition { .. } => {
-                            matches!(row.symbol_kind, "const" | "static" | "struct" | "alias")
+                            matches!(
+                                row.symbol_kind.as_ref(),
+                                "const" | "static" | "struct" | "alias"
+                            )
                         }
                         RowRole::Reference { spelling } => matches!(spelling, Spelling::Import),
                     }
@@ -1636,7 +1815,7 @@ impl<'r, 'a> Binder<'r, 'a> {
                 RowRole::Reference { .. } => {}
                 RowRole::Definition { .. } => {
                     let set = entries.entry(key).or_default();
-                    let kind = row.symbol_kind;
+                    let kind = row.symbol_kind.as_ref();
                     let shadowed = is_local(kind)
                         && rust(row)
                         && (pattern_items.contains(&(row.document, name))
@@ -2182,6 +2361,7 @@ struct Walk<'s, 't> {
     rows: Vec<IndexedSymbol>,
     /// The walk recorded a definition of the requested name.
     subject_seen: bool,
+    names: Option<NameFilter>,
     /// The first segments of the retained uses' spelled qualifiers.
     heads: BTreeSet<&'s str>,
     /// The TypeScript namespace scopes the walk has entered.
@@ -2283,7 +2463,22 @@ enum UsePosition<'tree> {
 }
 
 impl<'s> Walk<'s, '_> {
-    fn run(&mut self, tree: &tree_sitter::Tree) -> Result<(), OverBudget> {
+    fn run(&mut self, tree: &tree_sitter::Tree, query: &'static Query) -> Result<(), OverBudget> {
+        let mut query_cursor = QueryCursor::new();
+        // Each pattern has one capture. Overflow withholds the whole
+        // file rather than letting a dropped match turn into a reference.
+        query_cursor.set_match_limit(MAX_SYMBOL_ROWS as u32);
+        query_cursor.set_max_start_depth(Some(MAX_TREE_DEPTH as u32));
+        let mut captures = query_cursor.captures(query, tree.root_node(), self.source.as_bytes());
+        // Both cursors see the same tree in source order. Match the exact
+        // name node, not its start byte (a wrapper can start there too).
+        let mut names = std::iter::from_fn(|| {
+            let (matched, at) = captures.next()?;
+            let capture = matched.captures()[*at];
+            Some((capture.node, query.capture_names()[capture.index as usize]))
+        })
+        .fuse()
+        .peekable();
         let mut cursor = tree.walk();
         let mut frames: Vec<Frame<'_>> = Vec::new();
         loop {
@@ -2291,7 +2486,10 @@ impl<'s> Walk<'s, '_> {
             let node = cursor.node();
             let field = cursor.field_name();
             let local = child_local(self.grammar, &frames, field, node);
-            self.visit(node, &frames, field, local)?;
+            let declared = names
+                .next_if(|(name, _)| *name == node)
+                .map(|(_, kind)| kind);
+            self.visit(node, &frames, field, local, declared)?;
             if cursor.goto_first_child() {
                 // The children sit one level below `node`, whose depth
                 // is `frames.len()`.
@@ -2317,7 +2515,15 @@ impl<'s> Walk<'s, '_> {
                     break;
                 }
                 if !cursor.goto_parent() {
-                    return Ok(());
+                    if names.peek().is_some() {
+                        return Err(OverBudget);
+                    }
+                    drop(captures);
+                    return if query_cursor.did_exceed_match_limit() {
+                        Err(OverBudget)
+                    } else {
+                        Ok(())
+                    };
                 }
                 if frames
                     .pop()
@@ -2351,8 +2557,9 @@ impl<'s> Walk<'s, '_> {
         frames: &[Frame<'tree>],
         field: Option<&str>,
         local: Option<Local>,
+        declared: Option<&'static str>,
     ) -> Result<(), OverBudget> {
-        if !node.is_named() {
+        if !node.is_named() || node.is_missing() {
             return Ok(());
         }
         if self.grammar == Grammar::Rust && node.kind() == "use_wildcard" {
@@ -2399,15 +2606,13 @@ impl<'s> Walk<'s, '_> {
         // A def node's own name field is its definition site; an
         // identifier in a binding pattern (params, let/match/if-let
         // destructuring) is a binding — neither is ever a use.
-        let declared = parent.and_then(|frame| {
-            def_kind(self.grammar, frame.node.kind(), field).map(|kind| Site::Definition {
-                // A `var` declarator's pattern context names it hoisted.
-                kind: match local {
-                    Some(Local { kind: "var", .. }) if kind == "variable" => "var",
-                    _ => kind,
-                },
-                declaring: Some(frame),
-            })
+        let declared = declared.zip(parent).map(|(kind, frame)| Site::Definition {
+            // A `var` declarator's pattern context names it hoisted.
+            kind: match local {
+                Some(Local { kind: "var", .. }) if kind == "variable" => "var",
+                _ => kind,
+            },
+            declaring: Some(frame),
         });
         let site = declared
             .or_else(|| {
@@ -2419,6 +2624,9 @@ impl<'s> Walk<'s, '_> {
                     })
             })
             .unwrap_or_else(|| Site::Use(self.use_position(frames, field, kind)));
+        if let Some(names) = &mut self.names {
+            names.insert(text);
+        }
         let requested = text == self.name;
         let import = matches!(
             site,
@@ -2523,7 +2731,7 @@ impl<'s> Walk<'s, '_> {
         self.rows.push(IndexedSymbol {
             document: self.document,
             name,
-            symbol_kind,
+            symbol_kind: symbol_kind.into(),
             scope,
             span,
             visible,
@@ -2547,7 +2755,7 @@ impl<'s> Walk<'s, '_> {
         self.rows.push(IndexedSymbol {
             document: self.document,
             name,
-            symbol_kind: "use_wildcard",
+            symbol_kind: "use_wildcard".into(),
             scope,
             span: Span::of(&node),
             visible: (0, u64::MAX),
@@ -2728,7 +2936,7 @@ impl<'s> Walk<'s, '_> {
         if self.grammar != Grammar::Rust && matches!(kind, "internal_module" | "module") {
             let id = self.scope_id(self.path.len())?;
             if !self.namespaces.insert(id) {
-                *self.scopes.bearers.entry((id, self.document)).or_insert(0) |= REOPENED;
+                *self.scopes.bearers.entry((self.document, id)).or_insert(0) |= REOPENED;
             }
         }
         Ok(Opened::Named)
@@ -2748,7 +2956,7 @@ impl<'s> Walk<'s, '_> {
             let (id, cost) = match entry.segment {
                 Segment::Named(name) => {
                     let (id, fresh) = self.scopes.intern_named(at, name);
-                    let key = (id, self.document);
+                    let key = (self.document, id);
                     let before = self.scopes.bearers.get(&key).copied();
                     // A module or namespace and a same-name function or
                     // type are one scope here, but neither block sees the
@@ -3245,31 +3453,22 @@ const TYPE_LEVEL_KINDS: &[&str] = &[
     "type_parameter",
 ];
 
-/// `(parent node kind, field, reported symbol kind)` for the Rust
-/// grammar (tree-sitter-rust 0.24.2 node types): an identifier-shaped
-/// child in that field of that node is a definition. `impl` carries no
-/// name field — it is a scope bearer only.
-const RUST_DEFS: &[(&str, &str, &str)] = &[
-    ("function_item", "name", "function"),
-    ("function_signature_item", "name", "method"),
-    ("struct_item", "name", "struct"),
-    ("union_item", "name", "union"),
-    ("enum_item", "name", "enum"),
-    ("enum_variant", "name", "member"),
-    ("trait_item", "name", "trait"),
-    ("type_item", "name", "type"),
-    ("associated_type", "name", "type"),
-    ("type_parameter", "name", "type_parameter"),
-    ("const_item", "name", "const"),
-    ("const_parameter", "name", "parameter"),
-    ("static_item", "name", "static"),
-    ("mod_item", "name", "module"),
-    ("field_declaration", "name", "field"),
-    ("let_declaration", "pattern", "variable"),
-    ("parameter", "pattern", "parameter"),
-    ("macro_definition", "name", "macro"),
-    ("use_as_clause", "alias", "alias"),
-];
+/// A compiled query belongs to one grammar, even when TS and TSX
+/// share declaration syntax. A bad bundle fails its files.
+fn declaration_query(grammar: Grammar) -> Result<&'static Query, &'static tree_sitter::QueryError> {
+    type Compiled = LazyLock<Result<Query, tree_sitter::QueryError>>;
+    const TS_SOURCE: &str = include_str!("lsp/typescript.scm");
+    static RUST: Compiled =
+        LazyLock::new(|| Query::new(&Grammar::Rust.ts_language(), include_str!("lsp/rust.scm")));
+    static TYPESCRIPT: Compiled =
+        LazyLock::new(|| Query::new(&Grammar::TypeScript.ts_language(), TS_SOURCE));
+    static TSX: Compiled = LazyLock::new(|| Query::new(&Grammar::Tsx.ts_language(), TS_SOURCE));
+    match grammar {
+        Grammar::Rust => RUST.as_ref(),
+        Grammar::TypeScript => TYPESCRIPT.as_ref(),
+        Grammar::Tsx => TSX.as_ref(),
+    }
+}
 
 /// Identifier-shaped node kinds in the Rust grammar — every occurrence
 /// that is neither a definition's name nor a binding is a use site.
@@ -3302,36 +3501,7 @@ const RUST_MEMBER_BEARERS: &[&str] = &[
     "union_item",
 ];
 
-/// The TypeScript/TSX definition table (tree-sitter-typescript 0.23.2)
-/// — same shape as the Rust table. `enum_body`'s `name` field repeats
-/// once per bare member, which the cursor walk sees child by child.
-const TS_DEFS: &[(&str, &str, &str)] = &[
-    ("function_declaration", "name", "function"),
-    ("generator_function_declaration", "name", "function"),
-    ("function_expression", "name", "function"),
-    ("generator_function", "name", "function"),
-    ("function_signature", "name", "function"),
-    ("method_definition", "name", "method"),
-    ("method_signature", "name", "method"),
-    ("abstract_method_signature", "name", "method"),
-    ("class_declaration", "name", "class"),
-    ("abstract_class_declaration", "name", "class"),
-    ("class", "name", "class"),
-    ("interface_declaration", "name", "interface"),
-    ("enum_declaration", "name", "enum"),
-    ("enum_body", "name", "member"),
-    ("enum_assignment", "name", "member"),
-    ("type_alias_declaration", "name", "type"),
-    ("type_parameter", "name", "type_parameter"),
-    ("variable_declarator", "name", "variable"),
-    ("required_parameter", "pattern", "parameter"),
-    ("optional_parameter", "pattern", "parameter"),
-    ("public_field_definition", "name", "field"),
-    ("property_signature", "name", "field"),
-    ("internal_module", "name", "namespace"),
-    ("module", "name", "namespace"),
-];
-
+/// Keys can be opaque uses; shorthand binding patterns can declare.
 const TS_IDENTIFIERS: &[&str] = &[
     "identifier",
     "type_identifier",
@@ -3365,18 +3535,7 @@ const TS_MEMBER_BEARERS: &[&str] = &[
     "object",
 ];
 
-fn def_kind(grammar: Grammar, parent: &str, field: Option<&str>) -> Option<&'static str> {
-    let field = field?;
-    let table = match grammar {
-        Grammar::Rust => RUST_DEFS,
-        Grammar::TypeScript | Grammar::Tsx => TS_DEFS,
-    };
-    table
-        .iter()
-        .find(|(kind, name_field, _)| *kind == parent && *name_field == field)
-        .map(|(_, _, symbol_kind)| *symbol_kind)
-}
-
+/// A name outside a declaration capture or binding pattern is a use.
 fn ident_kinds(grammar: Grammar) -> &'static [&'static str] {
     match grammar {
         Grammar::Rust => RUST_IDENTIFIERS,
@@ -3508,6 +3667,9 @@ fn child_local(
         "scoped_identifier"
             | "scoped_type_identifier"
             | "generic_type"
+            | "generic_pattern"
+            | "macro_invocation"
+            | "const_block"
             | "member_expression"
             | "subscript_expression"
     ) {
@@ -3871,20 +4033,18 @@ mod tests {
     fn unverifiable_mtime_is_never_current() {
         let unknown = FileStamp {
             len: 7,
+            identity: (1, 2, 3, 4),
             modified: None,
         };
         let known = FileStamp {
-            len: 7,
             modified: Some(1),
+            ..unknown
         };
         assert!(known.is_current(known));
         assert!(!unknown.is_current(unknown), "no mtime on either side");
         assert!(!known.is_current(unknown));
         assert!(!unknown.is_current(known));
-        assert!(!known.is_current(FileStamp {
-            len: 8,
-            modified: Some(1)
-        }));
+        assert!(!known.is_current(FileStamp { len: 8, ..known }));
     }
 
     #[test]

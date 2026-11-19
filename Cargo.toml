@@ -1,6 +1,6 @@
 [package]
 name = "rivect"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
@@ -93,7 +93,6 @@ private_intra_doc_links = "warn"
 
 [dependencies]
 crossterm = "0.29.0"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "std"] }
 rivect-sandbox-helper = { path = "crates/rivect-sandbox-helper", version = "0.1.0" }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -117,6 +116,8 @@ grep-regex = "0.1.14"
 grep-matcher = "0.1.9"
 ignore = "0.4.33"
 globset = "0.4.20"
+# No-follow filesystem walks and foreground-terminal identity/close monitoring.
+rustix = { version = "1.1.4", features = ["fs", "event", "process", "termios"] }
 # SRC-007: the shared syntax engine — tree-sitter parses each file with
 # the grammar matching its extension, ast-grep-core supplies the
 # meta-variable pattern language and structural matching. Grammar
@@ -140,15 +141,14 @@ notify = "8.2.0"
 # supplies the Entry/CredentialStore seam; the platform store crates are the
 # explicit backends (no `keyring` wrapper crate per its own guidance).
 keyring-core = "1.0.0"
-# SRC-003: synchronous HTTP for provider dialects — the Provider seam is
-# blocking, so `blocking` only; no product async code is authored —
-# tokio appears only inside reqwest's blocking client and the
-# dev-dependency harness. The platform
-# TLS provider (`native-tls`) is the license-clean choice — reqwest's
+# SRC-003: the provider seam stays synchronous. A foreground Messages POST
+# drives the async HTTP client on its owner thread to interrupt live I/O.
+# The platform TLS provider (`native-tls`) is the license-clean choice — reqwest's
 # `rustls` feature drags CDLA-2.0 `webpki-root-certs` into the resolved
 # graph, which deny.toml rejects; `json` is the wire codec. Redirects
 # stay off — egress is exactly the configured endpoint.
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "native-tls"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "time"] }
 # DEC-006/SRC-015 (SLICE-099 admission): the DWS workflow socket is the one
 # WebSocket client in the product, and this crate's blocking `accept` is the
 # same entry the loopback proof peer uses. `handshake` carries the HTTP
@@ -184,10 +184,7 @@ portable-pty = "0.9.0"
 # (tests/support/pty.rs); the crate is already in the tree via portable-pty.
 filedescriptor = "0.8.3"
 vt100 = "0.16.2"
-# Offline provider proof: wiremock serves the recorded Responses/SSE
-# fixtures on localhost; tokio supplies only the test runtime wiremock
-# needs — the product itself stays synchronous.
-tokio = { version = "1.53.1", features = ["macros", "rt"] }
+unicode-width = "0.2.2"
 # DEC-048 (EVID-478 §11 feature review): the `trace` feature only adds
 # rusqlite's additive `pub mod trace` (its `trace = []` gate at
 # rusqlite 0.41.1 lib.rs:149-150); the cfg(test) statement sink in

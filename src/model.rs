@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// One image media type the typed vision path admits (TD-20). The three
 /// variants are the only sniffed formats: a payload outside them is a
@@ -786,12 +787,17 @@ impl ModelOutcome {
     }
 }
 
-/// What one `complete_send` attempt ended with: the provider's own failure
-/// (which a fallback chain may answer) or a ledger refusal (which no chain
-/// entry can — the send never started or never settled).
-pub(crate) enum SendFailure {
+/// Only provider refusals may enter the fallback policy. Ledger errors and
+/// owner cancellation stop the dispatch, including any substitute chain.
+enum SendFailure {
     Provider(ProviderError),
-    Ledger(LedgerError),
+    Stop(ModelError),
+}
+
+impl From<LedgerError> for SendFailure {
+    fn from(source: LedgerError) -> Self {
+        Self::Stop(ledger_refusal(source))
+    }
 }
 
 /// Where one dispatched send begins, as the ledger records it (AC-057):
@@ -906,6 +912,7 @@ fn provider_outcome_unknown(error: &ProviderError) -> bool {
         // malformed stream or foreign artifact likewise follows a
         // partially applied request, so these stay unknown.
         Provider::ProviderFailed { .. }
+        | Provider::Interrupted { .. }
         | Provider::UnknownTerminal { .. }
         | Provider::StreamViolation { .. }
         | Provider::IncompatibleOutput { .. }
@@ -1560,6 +1567,32 @@ impl Broker {
         )
     }
 
+    /// A chat turn never exposes project tools, including when a witnessed answer carries an image.
+    pub(crate) fn prepare_ui_chat(
+        &mut self,
+        purpose: &str,
+        config: &Config,
+        world: &str,
+        inputs: &str,
+        image: Option<&PendingImage>,
+    ) -> Result<RequestManifest, ModelError> {
+        let instructions =
+            self.assemble_instructions(purpose, "Return a text reply. No tools are available.")?;
+        self.freeze_manifest(
+            config,
+            purpose,
+            &FreezeRequest {
+                world,
+                inputs,
+                origin: InputOrigin::Tool,
+                instructions: &instructions,
+                tools: &[],
+                image,
+            },
+            &RankingFacts::unknown(),
+        )
+    }
+
     /// Builds the immutable manifest for one call under `contract`: the
     /// caller's own instructions and declared tools ride the existing
     /// manifest fields, so their model-visible prefix opens its own
@@ -1733,8 +1766,9 @@ impl Broker {
                 actual: accounted,
             });
         }
+        let tool_prefix = providers::tool_prefix(&connection, request.tools)?;
         let (epoch_id, epoch_cost) =
-            self.context_epoch(purpose, &model, request.instructions, request.tools);
+            self.context_epoch(purpose, &model, request.instructions, &tool_prefix);
         let attempt_id = crate::contracts::AttemptId::generate().0;
         let manifest = RequestManifest {
             attempt_id,
@@ -1835,6 +1869,32 @@ impl Broker {
         world: &str,
         manifest: &RequestManifest,
     ) -> Result<ProviderReply, ModelError> {
+        self.dispatch_with_cancel(ledger, world, manifest, None)
+    }
+
+    /// Dispatches with the foreground owner's task-scoped stop signal.
+    ///
+    /// # Errors
+    /// As [`Self::dispatch`]. An interrupted POST settles with unknown usage
+    /// and cannot be replayed, even when a fallback is configured.
+    pub fn dispatch_with_cancel(
+        &mut self,
+        ledger: &mut dyn Ledger,
+        world: &str,
+        manifest: &RequestManifest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ProviderReply, ModelError> {
+        self.dispatch_with_preview(ledger, world, manifest, cancel, None)
+    }
+
+    pub(crate) fn dispatch_with_preview(
+        &mut self,
+        ledger: &mut dyn Ledger,
+        world: &str,
+        manifest: &RequestManifest,
+        cancel: Option<&AtomicBool>,
+        preview: Option<&dyn Fn(&str)>,
+    ) -> Result<ProviderReply, ModelError> {
         if manifest.world != world {
             return Err(ModelError::WorldMismatch {
                 frozen: manifest.world.clone(),
@@ -1912,13 +1972,20 @@ impl Broker {
                 connection: admission.connection.clone(),
             });
         }
-        match self.complete_send(ledger, manifest, &admission.connection, None) {
+        match self.complete_send(
+            ledger,
+            manifest,
+            &admission.connection,
+            None,
+            cancel,
+            preview,
+        ) {
             Ok(reply) => Ok(reply),
-            Err(SendFailure::Ledger(source)) => Err(ledger_refusal(source)),
+            Err(SendFailure::Stop(source)) => Err(source),
             Err(SendFailure::Provider(source)) => {
                 // The chain arm alone decides whether an unknown outcome may
                 // walk; a manual pause still lets the human answer it.
-                self.fallback_or_fail(ledger, manifest, &admission, source)
+                self.fallback_or_fail(ledger, manifest, &admission, source, cancel)
             }
         }
     }
@@ -1941,6 +2008,8 @@ impl Broker {
         manifest: &RequestManifest,
         connection: &str,
         parent_attempt_id: Option<&str>,
+        cancel: Option<&AtomicBool>,
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<ProviderReply, SendFailure> {
         // AC-009: the recorded external block precedes the adapter's
         // dialect claim and the ledger bracket, so neither an installed
@@ -2008,10 +2077,15 @@ impl Broker {
                 .get(&manifest.attempt_id)
                 .and_then(|admission| admission.ranking_basis.clone()),
         };
-        let ticket = ledger
-            .begin_send(&context, manifest)
-            .map_err(SendFailure::Ledger)?;
-        let reply = match self.provider.send(manifest) {
+        let root_attempt = parent_attempt_id.unwrap_or(&manifest.attempt_id);
+        if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+            self.cancel_attempt(root_attempt);
+            return Err(SendFailure::Stop(ModelError::AttemptCancelled {
+                attempt_id: root_attempt.to_owned(),
+            }));
+        }
+        let ticket = ledger.begin_send(&context, manifest)?;
+        let reply = match self.provider.send_with_cancel(manifest, cancel, preview) {
             Ok(reply) => reply,
             Err(source) => {
                 // The send was entered, so its usage is unknown: the
@@ -2022,9 +2096,14 @@ impl Broker {
                 // gate sees an unknown even when the last leg's class is a
                 // definitive denial.
                 let (wire_retries, source) = source.settle();
-                ledger
-                    .finish_send(&ticket, &SendOutcome::Failed { wire_retries })
-                    .map_err(SendFailure::Ledger)?;
+                let interrupted = matches!(source, ProviderError::Interrupted { .. });
+                if interrupted {
+                    self.cancel_attempt(root_attempt);
+                }
+                ledger.finish_send(&ticket, &SendOutcome::Failed { wire_retries })?;
+                if interrupted {
+                    return Err(SendFailure::Stop(ModelError::Provider(source)));
+                }
                 let source = if wire_retries > 0 {
                     ProviderError::Retried {
                         wire_retries,
@@ -2041,19 +2120,15 @@ impl Broker {
         // dispatched row open exactly like a refused settlement — fail
         // closed, never a silent loss.
         if reply.dropped_reasoning > 0 {
-            ledger
-                .record_reasoning_drop(&ticket, reply.dropped_reasoning)
-                .map_err(SendFailure::Ledger)?;
+            ledger.record_reasoning_drop(&ticket, reply.dropped_reasoning)?;
         }
-        ledger
-            .finish_send(
-                &ticket,
-                &SendOutcome::Settled {
-                    usage: reply.usage,
-                    wire_retries: reply.wire_retries,
-                },
-            )
-            .map_err(SendFailure::Ledger)?;
+        ledger.finish_send(
+            &ticket,
+            &SendOutcome::Settled {
+                usage: reply.usage,
+                wire_retries: reply.wire_retries,
+            },
+        )?;
         // The reply carries this send's physical usage report; the
         // outcome lifts it into the attempt's single accounting
         // record — the only place it charges.
@@ -2110,6 +2185,17 @@ impl Broker {
         world: &str,
         attempt_id: &str,
         connection: &str,
+    ) -> Result<ProviderReply, ModelError> {
+        self.dispatch_fallback_choice_with_cancel(ledger, world, attempt_id, connection, None)
+    }
+
+    pub(crate) fn dispatch_fallback_choice_with_cancel(
+        &mut self,
+        ledger: &mut dyn Ledger,
+        world: &str,
+        attempt_id: &str,
+        connection: &str,
+        cancel: Option<&AtomicBool>,
     ) -> Result<ProviderReply, ModelError> {
         let admission = self.admissions.get(attempt_id).cloned().ok_or_else(|| {
             if self.cancelled.contains(attempt_id) {
@@ -2206,8 +2292,15 @@ impl Broker {
             },
         };
         let (substitute, displaced) =
-            self.mint_substitute(&admission, model, connection, connection_entry, "manual");
-        match self.complete_send(ledger, &substitute, connection, Some(attempt_id)) {
+            self.mint_substitute(&admission, model, connection, connection_entry, "manual")?;
+        match self.complete_send(
+            ledger,
+            &substitute,
+            connection,
+            Some(attempt_id),
+            cancel,
+            None,
+        ) {
             Ok(reply) => {
                 // The substitute answered the intent: the paused
                 // primary's admission is spent with it, so neither id
@@ -2215,9 +2308,9 @@ impl Broker {
                 self.clear_attempt(attempt_id);
                 Ok(reply)
             }
-            Err(SendFailure::Ledger(source)) => {
+            Err(SendFailure::Stop(source)) => {
                 self.abandon_substitute(&substitute.attempt_id, &admission.purpose, displaced);
-                Err(ledger_refusal(source))
+                Err(source)
             }
             Err(SendFailure::Provider(source)) => {
                 self.abandon_substitute(&substitute.attempt_id, &admission.purpose, displaced);
@@ -2251,6 +2344,7 @@ impl Broker {
         manifest: &RequestManifest,
         admission: &AdmissionRecord,
         source: ProviderError,
+        cancel: Option<&AtomicBool>,
     ) -> Result<ProviderReply, ModelError> {
         match &admission.fallback {
             FallbackAssign::Off => {
@@ -2385,19 +2479,30 @@ impl Broker {
                         connection: entry.connection.clone(),
                         model_id: entry.model_id.clone(),
                     });
-                    let (fallback_manifest, displaced) = self.mint_substitute(
+                    let (fallback_manifest, displaced) = match self.mint_substitute(
                         admission,
                         model,
                         &entry.connection,
                         connection_entry,
                         "fallback",
-                    );
+                    ) {
+                        Ok(minted) => minted,
+                        Err(error) => {
+                            rejected.push(CandidateRejection {
+                                connection: entry.connection.clone(),
+                                cause: RejectionCause::SendFailed(error),
+                            });
+                            continue;
+                        }
+                    };
                     attempted.push(entry.connection.clone());
                     match self.complete_send(
                         ledger,
                         &fallback_manifest,
                         &entry.connection,
                         Some(&manifest.attempt_id),
+                        cancel,
+                        None,
                     ) {
                         Ok(reply) => {
                             // The substitute answered the intent: the
@@ -2409,13 +2514,13 @@ impl Broker {
                         // A ledger refusal ends the walk: the entry never
                         // entered a send, so the chain gains nothing by
                         // trying the next one.
-                        Err(SendFailure::Ledger(source)) => {
+                        Err(SendFailure::Stop(source)) => {
                             self.abandon_substitute(
                                 &fallback_manifest.attempt_id,
                                 &admission.purpose,
                                 displaced,
                             );
-                            return Err(ledger_refusal(source));
+                            return Err(source);
                         }
                         Err(SendFailure::Provider(send_error)) => {
                             self.abandon_substitute(
@@ -2466,13 +2571,14 @@ impl Broker {
         connection: &str,
         connection_entry: Connection,
         leg: &str,
-    ) -> (RequestManifest, Option<EpochState>) {
+    ) -> Result<(RequestManifest, Option<EpochState>), ProviderError> {
+        let tool_prefix = providers::tool_prefix(connection, &admission.manifest.tools)?;
         let displaced = self.epochs.get(&admission.purpose).cloned();
         let (epoch_id, epoch_cost) = self.context_epoch(
             &admission.purpose,
             &model,
             &admission.manifest.instructions,
-            &admission.manifest.tools,
+            &tool_prefix,
         );
         let model_id = match &model {
             ModelAssign::Fixed(fixed) => Some(fixed.model_id.clone()),
@@ -2510,7 +2616,7 @@ impl Broker {
                 fallback_source: admission.fallback_source.clone(),
             },
         );
-        (substitute, displaced)
+        Ok((substitute, displaced))
     }
 
     /// Rolls a provisional epoch mint back after a substitute's send
@@ -2645,25 +2751,23 @@ impl Broker {
         purpose: &str,
         model: &ModelAssign,
         instructions: &str,
-        tools: &[String],
+        tools: &str,
     ) -> (String, Option<EpochCost>) {
-        let prefix = format!(
-            "purpose:{purpose}\nmodel:{}\ninstructions:{instructions}\ntools:{}",
-            model_wire_id(model),
-            tools.join(", ")
-        );
+        let model = model_wire_id(model);
+        let prefix =
+            format!("purpose:{purpose}\nmodel:{model}\ninstructions:{instructions}\ntools:{tools}");
         let prefix_digest = hex(&Sha256::digest(prefix.as_bytes()));
         let epoch_id = format!("epoch-{}", &prefix_digest[..16]);
         let parts = EpochState {
-            prefix_digest: prefix_digest.clone(),
-            model_digest: hex(&Sha256::digest(model_wire_id(model).as_bytes())),
+            prefix_digest,
+            model_digest: hex(&Sha256::digest(model.as_bytes())),
             instructions_digest: hex(&Sha256::digest(instructions.as_bytes())),
-            tools_digest: hex(&Sha256::digest(tools.join(", ").as_bytes())),
+            tools_digest: hex(&Sha256::digest(tools.as_bytes())),
         };
         let epoch_cost = match self.epochs.get(purpose) {
-            Some(previous) if previous.prefix_digest == prefix_digest => None,
+            Some(previous) if previous.prefix_digest == parts.prefix_digest => None,
             Some(previous) => changed_part(previous, &parts)
-                .map(|reason| epoch_cost(reason, instructions, model, tools)),
+                .map(|reason| epoch_cost(reason, instructions, &model, tools)),
             None => None,
         };
         self.epochs.insert(purpose.to_string(), parts);
@@ -2695,12 +2799,12 @@ fn changed_part(previous: &EpochState, current: &EpochState) -> Option<EpochMuta
 fn epoch_cost(
     reason: EpochMutationReason,
     instructions: &str,
-    model: &ModelAssign,
-    tools: &[String],
+    model: &str,
+    tools: &str,
 ) -> EpochCost {
     let instructions_line = instructions.len() + 1;
-    let model_line = format!("model: {}\n", model_wire_id(model)).len();
-    let tools_line = format!("tools: {}\n", tools.join(", ")).len();
+    let model_line = "model: \n".len() + model.len();
+    let tools_line = "tools: \n".len() + tools.len();
     let reserve = format!("output-reserve: {OUTPUT_RESERVE_BYTES}").len();
     let (replaced_part, expected_rewrite_bytes) = match reason {
         EpochMutationReason::SystemChange => (
@@ -3331,6 +3435,49 @@ fn sent_cost_bound(inputs: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_argument_change_at_same_name_opens_one_epoch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config::parse_validated(
+            "config_version = 1\n\
+             [connections.custom-responses]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:9/v1\"\n\
+             [models.defaults]\n\
+             model = { mode = \"fixed\", connection = \"custom-responses\", model_id = \"fixture\" }\n\
+             effort = { mode = \"auto\" }\n\
+             fallback = { mode = \"auto\" }\n",
+        )?;
+        let mut broker = Broker::new(Box::new(providers::LoopbackProvider::new()));
+        let contract = CallContract {
+            instructions: "read a file",
+            tools: &["read_file"],
+        };
+        let current = broker.prepare_call("main", &config, "/world", "first", &contract)?;
+        let prior_schema = serde_json::json!([{
+            "name": "read_file",
+            "description": "one admitted file read in the current scope",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+                "required": [],
+                "additionalProperties": false
+            }
+        }]);
+        let (prior_epoch, _) = broker.context_epoch(
+            "main",
+            &current.model,
+            &current.instructions,
+            &prior_schema.to_string(),
+        );
+        let next = broker.prepare_call("main", &config, "/world", "second", &contract)?;
+        assert_ne!(next.epoch_id, prior_epoch);
+        assert_eq!(next.epoch_id, current.epoch_id);
+        assert_eq!(next.mutation_reason.as_deref(), Some("tools change"));
+        let replay = broker.prepare_call("main", &config, "/world", "third", &contract)?;
+        assert_eq!(replay.epoch_id, next.epoch_id);
+        assert_eq!(replay.epoch_cost, None);
+        Ok(())
+    }
 
     /// Defense-in-depth probe for the dispatch re-check (AC-044): the
     /// version bump on every rights movement is the primary guard and a

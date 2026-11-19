@@ -229,13 +229,33 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],
             "additionalProperties": false,
         } }])
     );
+    // Rebuild the epoch from the captured declaration, not from the tool registry.
+    let mut declaration = body["tools"][0].clone();
+    assert_eq!(
+        declaration
+            .as_object_mut()
+            .expect("function")
+            .remove("type"),
+        Some(json!("function"))
+    );
+    let epoch = |declaration: &Value| {
+        use sha2::{Digest, Sha256};
+        let prefix = format!(
+            "purpose:main\nmodel:fixed:openai/gpt-5.2\ninstructions:{}\ntools:[{declaration}]",
+            manifest.instructions
+        );
+        format!("epoch-{}", &format!("{:x}", Sha256::digest(prefix))[..16])
+    };
+    assert_eq!(manifest.epoch_id, epoch(&declaration));
+    declaration["parameters"]["required"] = json!([]);
+    assert_ne!(manifest.epoch_id, epoch(&declaration));
     assert_eq!(
         body["input"],
         json!([{
@@ -321,6 +341,28 @@ async fn dialect_is_keyed_on_the_literal_connection_id() {
     assert!(
         matches!(outcome, Err(ProviderError::UnpinnedModel { .. })),
         "an unpinned assignment names no model for the wire: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+#[tokio::test]
+async fn missing_argument_schema_refuses_before_inference() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    let mut manifest = prepared_manifest(&config);
+    manifest.tools = vec!["unknown_tool".to_owned()];
+    let (provider, _) = openai_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(matches!(
+        outcome,
+        Err(ProviderError::UnsendableRequest { .. })
+    ));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty()
     );
     drop_blocking(provider);
 }
@@ -432,6 +474,9 @@ async fn responses_catalogue_keeps_the_id_only_surface() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": [
                 {"id": "o3"},
+                {"id": "gpt-5.2-codex"},
+                {"id": "o4-mini"},
+                {"id": "gpt-5.1"},
                 {"id": "dall-e-3"},
                 {"id": "gpt-5.2"},
             ],
@@ -440,7 +485,10 @@ async fn responses_catalogue_keeps_the_id_only_surface() {
         .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let (provider, _store) = openai_provider(&config);
-    assert_id_only_surface(provider, &["gpt-5.2", "o3"]);
+    assert_id_only_surface(
+        provider,
+        &["gpt-5.1", "gpt-5.2", "gpt-5.2-codex", "o3", "o4-mini"],
+    );
 
     // abliteration: the authoritative listing merges the static seed.
     let server = MockServer::start().await;
@@ -1018,6 +1066,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::UnsendableRequest { .. }) => "UnsendableRequest",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
+        Some(ProviderError::Interrupted { .. }) => "Interrupted",
         Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
     };
@@ -1870,6 +1919,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         UnsupportedParameter,
         UnsendableRequest,
         ReasoningProvenance,
+        Interrupted,
         Retried,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
@@ -1908,6 +1958,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::UnsendableRequest { .. } => ProviderVariant::UnsendableRequest,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
+            ProviderError::Interrupted { .. } => ProviderVariant::Interrupted,
             ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
     }
@@ -4153,7 +4204,7 @@ async fn declared_write_preserves_text_and_refuses_invalid_arguments() {
                 "Edit the library.",
                 &rivect::model::CallContract {
                     instructions: "Use the declared tool.",
-                    tools: &["write_file"],
+                    tools: &["write_file", "run_check"],
                 },
             )
             .expect("prepare the declared write tool");
@@ -4161,9 +4212,33 @@ async fn declared_write_preserves_text_and_refuses_invalid_arguments() {
         let requests = server.received_requests().await.expect("requests recorded");
         let request: Value = serde_json::from_slice(&requests[0].body).expect("model request");
         assert_eq!(
-            request["tools"][0]["parameters"]["required"],
-            json!(["path", "text"]),
-            "the model sees both mandatory write arguments"
+            request["tools"],
+            json!([
+                {
+                    "type": "function", "name": "write_file",
+                    "description": "replace the contents of a project file",
+                    "parameters": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1, "description": "Project-relative file path"},
+                            "text": {"type": "string", "description": "Complete replacement text"}
+                        },
+                        "required": ["path", "text"]
+                    }
+                },
+                {
+                    "type": "function", "name": "run_check",
+                    "description": "run one exact Cargo library test",
+                    "parameters": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {"test": {
+                            "type": "string", "description": "Exact Cargo library test name, including the module path",
+                            "pattern": "^[A-Za-z0-9_:]+$", "maxLength": 200
+                        }},
+                        "required": ["test"]
+                    }
+                }
+            ])
         );
         if valid {
             let reply = outcome.expect("valid write request");
@@ -4738,7 +4813,7 @@ async fn meta_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],
@@ -5766,7 +5841,7 @@ async fn ollama_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],
@@ -7047,7 +7122,7 @@ async fn openrouter_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],
@@ -8043,7 +8118,7 @@ async fn sakana_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],
@@ -8859,7 +8934,7 @@ async fn custom_responses_valid_control_yields_one_outcome_and_one_physical_usag
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],
@@ -9068,7 +9143,7 @@ async fn custom_responses_sends_store_false_and_never_a_hosted_tool() {
     );
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],

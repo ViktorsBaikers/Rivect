@@ -302,7 +302,16 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
     }
     assert_eq!(
         body["tools"],
-        json!([{ "functionDeclarations": [{ "name": "read_file", "description": "" }] }]),
+        json!([{ "functionDeclarations": [{
+            "name": "read_file",
+            "description": "one admitted file read in the current scope",
+            "parametersJsonSchema": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }] }]),
         "the declared tool surface maps to functionDeclarations verbatim"
     );
     assert_eq!(
@@ -829,6 +838,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::UnsendableRequest { .. }) => "UnsendableRequest",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
+        Some(ProviderError::Interrupted { .. }) => "Interrupted",
         Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
     };
@@ -1723,6 +1733,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         UnsupportedParameter,
         UnsendableRequest,
         ReasoningProvenance,
+        Interrupted,
         Retried,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
@@ -1761,6 +1772,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::UnsendableRequest { .. } => ProviderVariant::UnsendableRequest,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
+            ProviderError::Interrupted { .. } => ProviderVariant::Interrupted,
             ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
     }
@@ -4110,6 +4122,30 @@ async fn provider_reported_failure_is_a_typed_denial() {
         "the peer reason is capped on a char boundary"
     );
     drop_blocking(broker);
+}
+
+#[tokio::test]
+async fn tool_arguments_survive_wire_decode() {
+    let server = MockServer::start().await;
+    mount_generate(
+        &server,
+        completed_stream("", vec![
+            json!({"functionCall": {"name": "write_file", "args": {"path": "a", "text": "two\nlines"}}}),
+            json!({"functionCall": {"name": "run_check", "args": {"test": "case::exact"}}}),
+        ], None),
+    ).await;
+    let config =
+        Config::parse_validated(&gemini_config(&server_uri_v1beta(&server))).expect("valid");
+    let (provider, _) = google_provider(&config);
+    let mut manifest = prepared_manifest(&config);
+    manifest.tools = vec!["write_file".into(), "run_check".into()];
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let calls = outcome.expect("typed tool calls").tool_calls;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].path.as_deref(), Some("a"));
+    assert_eq!(calls[0].text.as_deref(), Some("two\nlines"));
+    assert_eq!(calls[1].test.as_deref(), Some("case::exact"));
+    drop_blocking(provider);
 }
 
 /// Thought text is model-internal: a part marked `thought` never joins

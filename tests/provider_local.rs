@@ -49,6 +49,46 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
 
+fn expected_chat_read_tool() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "one admitted file read in the current scope",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }
+    }])
+}
+
+fn project_tool_stream() -> String {
+    let calls = json!({"tool_calls": [
+        {"index": 0, "id": "c1", "type": "function", "function": {"name": "write_file", "arguments": json!({"path": "a", "text": "two\nlines"}).to_string()}},
+        {"index": 1, "id": "c2", "type": "function", "function": {"name": "run_check", "arguments": json!({"test": "case::exact"}).to_string()}}
+    ]});
+    format!(
+        "{}{}{DONE_BLOCK}",
+        data_block(&delta_chunk(calls)),
+        data_block(&finish_chunk("tool_calls"))
+    )
+}
+
+fn assert_project_tool_reply(provider: impl Provider + 'static, config: &Config) {
+    let mut manifest = prepared_manifest(config);
+    manifest.tools = vec!["write_file".into(), "run_check".into()];
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let calls = outcome.expect("typed tool calls").tool_calls;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].path.as_deref(), Some("a"));
+    assert_eq!(calls[0].text.as_deref(), Some("two\nlines"));
+    assert_eq!(calls[1].test.as_deref(), Some("case::exact"));
+    drop_blocking(provider);
+}
+
 /// Print one offline receipt marker for a provider trial. The producer
 /// requires the exact line and the test proves the leg before it prints.
 fn emit_provider_row(trial: &str, provider: &str) {
@@ -338,15 +378,7 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
     );
     assert_eq!(
         body["tools"],
-        json!([{
-            "type": "function",
-            "function": {"name": "read_file", "description": "", "parameters": {
-            "type": "object",
-            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
-            "required": ["path"],
-            "additionalProperties": false,
-        }},
-        }]),
+        expected_chat_read_tool(),
         "the declared tool surface maps to function tools verbatim"
     );
     assert_eq!(
@@ -926,6 +958,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::UnsendableRequest { .. }) => "UnsendableRequest",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
+        Some(ProviderError::Interrupted { .. }) => "Interrupted",
         Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
     };
@@ -1784,6 +1817,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         UnsupportedParameter,
         UnsendableRequest,
         ReasoningProvenance,
+        Interrupted,
         Retried,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
@@ -1822,6 +1856,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::UnsendableRequest { .. } => ProviderVariant::UnsendableRequest,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
+            ProviderError::Interrupted { .. } => ProviderVariant::Interrupted,
             ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
     }
@@ -4812,7 +4847,7 @@ async fn abliteration_valid_control_yields_one_outcome_and_one_physical_usage() 
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file", "parameters": {
+        json!([{ "type": "function", "name": "read_file", "description": "one admitted file read in the current scope", "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
             "required": ["path"],
@@ -6915,15 +6950,7 @@ async fn aimlapi_valid_control_yields_one_outcome_and_one_physical_usage() {
     );
     assert_eq!(
         body["tools"],
-        json!([{
-            "type": "function",
-            "function": {"name": "read_file", "description": "", "parameters": {
-            "type": "object",
-            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
-            "required": ["path"],
-            "additionalProperties": false,
-        }},
-        }]),
+        expected_chat_read_tool(),
         "the declared tool surface maps to function tools verbatim"
     );
     assert_eq!(
@@ -24353,6 +24380,22 @@ mod kimi_contract {
         ))
     }
 
+    #[test]
+    fn tool_arguments_survive_wire_decode() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => Reply::sse(project_tool_stream()),
+            _ => Reply {
+                status: 404,
+                body: "{}".into(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let provider = KimiProvider::new(&config, "kimi-code", kimi_store()).expect("build");
+        assert_project_tool_reply(provider, &config);
+    }
+
     fn send(
         config: &Config,
         model: &str,
@@ -24523,6 +24566,7 @@ mod kimi_contract {
             .expect("the chat request");
         let body: Value = serde_json::from_str(&chat_request.3).expect("the chat body is json");
         assert_eq!(body["model"], "kimi-k2.7-code");
+        assert_eq!(body["tools"], expected_chat_read_tool());
         assert_eq!(body["stream_options"]["include_usage"], true);
         // The identity is Rivect's own; no foreign client name or install id
         // rides the request.
@@ -26086,6 +26130,17 @@ mod zai_contract {
         ))
     }
 
+    #[test]
+    fn tool_arguments_survive_wire_decode() {
+        let peer = ZaiPeer::start(|method, path, _body| match (method, path) {
+            ("POST", "/chat/completions") => Reply::sse(project_tool_stream()),
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_CHAT_MODEL);
+        let provider = ZaiProvider::new(&config, "zai", zai_store(ZAI_PROFILE)).expect("build");
+        assert_project_tool_reply(provider, &config);
+    }
+
     fn try_build(
         config: Config,
         alias: &str,
@@ -26284,6 +26339,7 @@ mod zai_contract {
                 );
             } else {
                 assert_eq!(body["model"], ZAI_CHAT_MODEL);
+                assert_eq!(body["tools"], expected_chat_read_tool());
                 assert_eq!(body["stream"], json!(true));
                 assert_eq!(
                     body["stream_options"],

@@ -1274,8 +1274,7 @@ fn binding_positions_are_never_reference_rows() {
     assert_eq!(lines_at(&inner, "src/shapes.ts"), vec![5]);
 }
 
-/// One definition per row of the Rust definition table, each under a
-/// unique name.
+/// One uniquely named declaration per admitted Rust form.
 const DEF_KINDS_RS: &str = "fn k_fn() {}
 trait KTrait { type KAssoc; fn k_sig(); }
 struct KStruct;
@@ -1292,7 +1291,7 @@ fn k_gen<KParam, const K_CPARAM: usize>() {}
 use std::fmt as k_alias;
 ";
 
-/// One definition per row of the TypeScript definition table.
+/// The TypeScript and TSX grammars share this declaration corpus.
 const DEF_KINDS_TS: &str = "function tFn() {}
 function* tGen() {}
 declare function tSig(): void;
@@ -1313,15 +1312,14 @@ const tCe = class TCeName {};
 
 #[test]
 fn every_admitted_definition_kind_is_a_definition_row() {
-    let tree = tree_of(
-        "def-kinds",
-        &[
-            ("src/kinds.rs", DEF_KINDS_RS),
-            ("src/kinds.ts", DEF_KINDS_TS),
-        ],
-    );
+    let fixtures = [
+        ("src/kinds.rs", DEF_KINDS_RS),
+        ("src/kinds.ts", DEF_KINDS_TS),
+        ("src/kinds.tsx", DEF_KINDS_TS),
+    ];
+    let tree = tree_of("def-kinds", &fixtures);
     for (name, kind, scope) in [
-        // rust: every definition-table row
+        // Rust declaration captures.
         ("k_fn", "function", ""),
         ("k_sig", "method", "KTrait"),
         ("KStruct", "struct", ""),
@@ -1342,7 +1340,7 @@ fn every_admitted_definition_kind_is_a_definition_row() {
         ("KParam", "type_parameter", "k_gen"),
         ("K_CPARAM", "parameter", "k_gen"),
         ("k_alias", "alias", ""),
-        // typescript: every definition-table row
+        // TypeScript and TSX declaration captures.
         ("tFn", "function", ""),
         ("tGen", "function", ""),
         ("tSig", "function", ""),
@@ -1372,14 +1370,88 @@ fn every_admitted_definition_kind_is_a_definition_row() {
     ] {
         let result = query(&symbol_query(&tree.path, name, SymbolOp::Definition))
             .expect("definition query resolves");
-        let rows = symbol_rows(&result);
-        assert_eq!(rows.len(), 1, "{name}: {rows:?}");
-        assert_eq!(
-            (rows[0].symbol_kind.as_str(), rows[0].scope.as_str()),
-            (kind, scope),
-            "{name}"
-        );
+        let files = if DEF_KINDS_RS.contains(name) {
+            &fixtures[..1]
+        } else {
+            &fixtures[1..]
+        };
+        assert_eq!(result.completeness, Completeness::Complete, "{name}");
+        assert_eq!(result.matches.len(), files.len(), "{name}");
+        for (hit, &(path, source)) in result.matches.iter().zip(files) {
+            assert_eq!(hit.source.path, Path::new(path));
+            let row = symbol_hit(hit);
+            assert_eq!(
+                (row.symbol_kind.as_str(), row.scope.as_str()),
+                (kind, scope)
+            );
+            let start = source.find(name).expect("fixture declaration") as u64;
+            assert_eq!(
+                (row.start_byte, row.end_byte),
+                (start, start + name.len() as u64)
+            );
+        }
     }
+}
+
+#[test]
+#[ignore = "measure alone in a fresh process with --ignored --exact --nocapture"]
+fn measure_first_and_repeated_declaration_query() {
+    let tree = tree_of(
+        "declaration-timing",
+        &[
+            ("kinds.rs", DEF_KINDS_RS),
+            ("kinds.ts", DEF_KINDS_TS),
+            ("kinds.tsx", DEF_KINDS_TS),
+        ],
+    );
+    let req = symbol_query(&tree.path, "tMethod", SymbolOp::Definition);
+    // File creation warms the page cache. Only compiled declaration
+    // queries survive between calls; both runs enumerate and parse.
+    for trial in 0..=20 {
+        let start = Instant::now();
+        let answer = query(&req).expect("definition query");
+        let elapsed = start.elapsed();
+        assert_eq!(answer.completeness, Completeness::Complete);
+        assert_eq!(answer.matches.len(), 2);
+        eprintln!("trial={trial} wall_us={}", elapsed.as_micros());
+    }
+}
+
+#[test]
+fn destructured_declarations_use_only_the_bound_name_range() {
+    let files = [
+        (
+            "a.rs",
+            "fn f((_, /* 🦀 */ target, skip!(not_bound)): (u8, u8, u8)) { let _ = target; }",
+        ),
+        (
+            "b.ts",
+            "const f = function ({ target: [/* 🦀 */ target = not_bound] }: T) { return target; };",
+        ),
+        (
+            "c.tsx",
+            "const f = ({ target: [/* 🦀 */ target = not_bound] }: T) => <View v={target} />;",
+        ),
+    ];
+    let tree = tree_of("destructured-ranges", &files);
+    let defs =
+        query(&symbol_query(&tree.path, "target", SymbolOp::Definition)).expect("definitions");
+    assert_eq!(defs.completeness, Completeness::Complete);
+    assert_eq!(defs.matches.len(), files.len());
+    for (hit, (path, source)) in defs.matches.iter().zip(files) {
+        assert_eq!(hit.source.path, Path::new(path));
+        let row = symbol_hit(hit);
+        let start = source.find("*/ target").expect("marked binding") + 3;
+        let end = start + "target".len();
+        assert_eq!(row.symbol_kind, "parameter");
+        assert_eq!((row.start_byte, row.end_byte), (start as u64, end as u64));
+        assert_eq!(row.range.start, lsp_types::Position::new(0, start as u32));
+        assert_eq!(row.range.end, lsp_types::Position::new(0, end as u32));
+    }
+    let absent = query(&symbol_query(&tree.path, "not_bound", SymbolOp::Definition))
+        .expect("nonbinding macro token and default expressions");
+    assert_eq!(absent.completeness, Completeness::Complete);
+    assert!(absent.matches.is_empty(), "{:?}", absent.matches);
 }
 
 const TYPES_TS: &str = "type User = { n: number };

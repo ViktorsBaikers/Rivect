@@ -833,11 +833,16 @@ impl OutputStream {
     /// stream ignores the chunk: terminal states are final and the
     /// retained head is the whole display.
     pub fn push_chunk(&mut self, bytes: &[u8]) {
-        if self.truncated || !matches!(self.status, OutputStatus::Streaming) {
+        if !matches!(self.status, OutputStatus::Streaming) {
             return;
         }
-        self.pending.extend_from_slice(bytes);
-        self.decode_pending(false);
+        for chunk in bytes.chunks(4096) {
+            if self.truncated {
+                break;
+            }
+            self.pending.extend_from_slice(chunk);
+            self.decode_pending(false);
+        }
     }
 
     /// Settles the stream: an incomplete UTF-8 tail flushes as one
@@ -855,6 +860,32 @@ impl OutputStream {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Operator-visible producer state; hide the paging hint when a modal owns those keys.
+    #[must_use]
+    pub fn status_line(&self, modal_open: bool) -> String {
+        let mut line = String::new();
+        if !modal_open {
+            line.push_str("PgUp/PgDn scroll · ");
+        }
+        line.push_str("output · ");
+        match &self.status {
+            OutputStatus::Streaming => line.push_str("streaming"),
+            OutputStatus::Complete => line.push_str("complete"),
+            OutputStatus::Partial { cause } | OutputStatus::Failed { cause } => {
+                line.push_str(if matches!(self.status, OutputStatus::Partial { .. }) {
+                    "partial: "
+                } else {
+                    "error: "
+                });
+                line.push_str(&sanitize_status_cause(cause));
+            }
+        }
+        if self.head_truncated() {
+            line.push_str(" · first 64 KiB retained");
+        }
+        line
     }
 
     /// The stream's typed display state.
@@ -912,10 +943,11 @@ impl OutputStream {
                 }
             }
         }
-        self.pending = pending.split_off(consumed);
+        pending.drain(..consumed);
         if self.truncated {
-            self.pending.clear();
+            pending.clear();
         }
+        self.pending = pending;
     }
 
     /// Appends sanitized characters and stops at the retention cap.
@@ -928,7 +960,13 @@ impl OutputStream {
                 self.truncated = true;
                 break;
             }
+            let start = self.text.len();
             push_sanitized(&mut self.text, ch);
+            if self.text.len() > OUTPUT_RETAIN_BYTES {
+                self.text.truncate(start);
+                self.truncated = true;
+                break;
+            }
         }
     }
 }

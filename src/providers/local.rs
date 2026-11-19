@@ -358,13 +358,13 @@ use crate::config::{
 };
 use crate::model::RequestManifest;
 use crate::policy::canonical_egress_target;
+use crate::providers::anthropic::{ForegroundPost, MessagesBody};
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    TransportCause, WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
-    payload_reason, positive_count, read_catalog_body, read_chunk, resolve_credential,
-    resolve_optional_credential_in, route_for, routes_for, sse, transport, transport_status,
-    violation, wire_body, wire_effort,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, TransportCause, WireAuth,
+    bounded_reason, check_deadline, dialect_for, forwarded_header_map, payload_reason,
+    positive_count, read_catalog_body, resolve_credential, resolve_optional_credential_in,
+    route_for, routes_for, sse, transport, transport_status, violation, wire_body, wire_effort,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -4025,7 +4025,11 @@ impl ChatCompletionsProvider {
     /// request rides every arm but `venice`
     /// ([`Self::requests_usage_report`]), whose body names no
     /// `stream_options` member at all.
-    fn request_body(&self, manifest: &RequestManifest, model_id: &str) -> Value {
+    fn request_body(
+        &self,
+        manifest: &RequestManifest,
+        model_id: &str,
+    ) -> Result<Value, ProviderError> {
         let mut messages = Vec::with_capacity(2);
         if !manifest.instructions.is_empty() {
             messages.push(json!({ "role": "system", "content": manifest.instructions }));
@@ -4043,26 +4047,9 @@ impl ChatCompletionsProvider {
             body["reasoning_effort"] = json!(value.name());
         }
         if !manifest.tools.is_empty() {
-            body["tools"] = Value::Array(
-                manifest
-                    .tools
-                    .iter()
-                    .map(|name| {
-                        let parameters = super::project_tool_parameters(name)
-                            .unwrap_or_else(|| json!({ "type": "object" }));
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "description": "",
-                                "parameters": parameters,
-                            },
-                        })
-                    })
-                    .collect(),
-            );
+            body["tools"] = super::ToolFormat::Chat.tools(&self.connection, &manifest.tools)?;
         }
-        body
+        Ok(body)
     }
 
     /// The recorded route guard of an arm whose dialect is one of two
@@ -4177,35 +4164,41 @@ impl ChatCompletionsProvider {
     fn read_stream(
         &mut self,
         manifest: &RequestManifest,
-        mut response: reqwest::blocking::Response,
+        mut response: impl MessagesBody,
         started: Instant,
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<ProviderReply, ProviderError> {
         let mut parser = SseParser::new();
         let mut state = StreamState::default();
-        let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
-        loop {
-            let read = read_chunk(
-                &self.connection,
-                self.deadline,
-                &mut response,
-                &mut chunk,
-                started,
-            )?;
-            if read == 0 {
-                break;
+        let mut ingest = |event| -> Result<(), ProviderError> {
+            let before = state.text.len();
+            self.on_chunk(&mut state, event)?;
+            if let Some(publish) = preview.filter(|_| state.text.len() != before) {
+                publish(&state.text);
+            }
+            Ok(())
+        };
+        let mut total = 0usize;
+        response.chunks(&self.connection, self.deadline, started, |chunk| {
+            if preview.is_some() {
+                total = total.saturating_add(chunk.len());
+                if total > sse::MAX_STREAM_BYTES {
+                    return Err(violation(&self.connection, "stream exceeds the byte bound"));
+                }
             }
             for event in parser
-                .feed(&chunk[..read])
+                .feed(chunk)
                 .map_err(|err| sse(&self.connection, err))?
             {
-                self.on_chunk(&mut state, event)?;
+                ingest(event)?;
             }
-        }
+            Ok(())
+        })?;
         // Finalization shares the budget — the stream's total cost is
         // bounded even when its last byte lands just inside it.
         check_deadline(&self.connection, self.deadline, started)?;
         for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
-            self.on_chunk(&mut state, event)?;
+            ingest(event)?;
         }
         match state.terminal {
             Some(Terminal::Completed) => self.complete(manifest, state),
@@ -4681,32 +4674,12 @@ impl ChatCompletionsProvider {
         let usage = self.usage_of(&state)?;
         let mut tool_calls = Vec::with_capacity(state.blocks.len());
         for block in state.blocks {
-            let Some(name) = block.name.filter(|name| !name.is_empty()) else {
-                return Err(violation(
-                    &self.connection,
-                    "a tool_call block never carried a function name",
-                ));
-            };
-            if !manifest.tools.iter().any(|declared| declared == &name) {
-                return Err(ProviderError::IncompatibleOutput {
-                    connection: self.connection.clone(),
-                    reason: bounded_reason(format!("tool_call names undeclared tool {name}")),
-                });
-            }
-            let args = if block.args.is_empty() {
-                Value::Object(serde_json::Map::new())
-            } else {
-                serde_json::from_str(&block.args).map_err(|_parse| {
-                    violation(&self.connection, "a tool_call's arguments did not parse")
-                })?
-            };
-            let Some(arguments) = args.as_object() else {
-                return Err(violation(
-                    &self.connection,
-                    "a tool_call's arguments are not an object",
-                ));
-            };
-            tool_calls.push(super::decode_file_call(&self.connection, name, arguments)?);
+            tool_calls.push(super::decode_chat_tool(
+                manifest,
+                &self.connection,
+                block.name,
+                &block.args,
+            )?);
         }
         Ok(ProviderReply {
             text: state.text,
@@ -5896,6 +5869,15 @@ impl Provider for ChatCompletionsProvider {
     /// pins a parameter the connection's recorded contract rejects for
     /// the pinned model.
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        self.send_with_cancel(manifest, None, None)
+    }
+
+    fn send_with_cancel(
+        &mut self,
+        manifest: &RequestManifest,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        preview: Option<&dyn Fn(&str)>,
+    ) -> Result<ProviderReply, ProviderError> {
         // The whole call spends one budget: credential resolution, the
         // auto-pool catalogue leg, and the streamed response all count
         // against the same clock — no leg starts past the deadline the
@@ -5959,7 +5941,7 @@ impl Provider for ChatCompletionsProvider {
         // a value silently omitted from the request.
         self.check_model(&fixed.model_id)?;
         self.check_parameters(manifest, &fixed.model_id)?;
-        let body = self.request_body(manifest, &wire_model_id);
+        let body = self.request_body(manifest, &wire_model_id)?;
         let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
         // catalogue leg that spent the clock fails the send typed
@@ -5971,17 +5953,38 @@ impl Provider for ChatCompletionsProvider {
             self.client
                 .post(format!("{}/chat/completions", self.endpoint))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header(reqwest::header::ACCEPT, "text/event-stream")
-                .body(body_bytes),
+                .header(reqwest::header::ACCEPT, "text/event-stream"),
             secret.as_ref(),
         )
         .headers(forwarded_header_map(self.auth.forwarded()));
+        if let Some(cancel) = cancel {
+            // Preserve the unattended vLLM route's proxy bypass. Other configured
+            // adapters retain the same proxy policy as their blocking client.
+            let client = reqwest::Client::builder();
+            let client = if self.connection == "vllm" {
+                client.no_proxy()
+            } else {
+                client
+            };
+            let post = ForegroundPost::new(&self.connection, cancel, client)?;
+            let response = post.send(
+                &self.connection,
+                request,
+                body_bytes,
+                self.deadline.saturating_sub(started.elapsed()),
+            )?;
+            if !response.status().is_success() {
+                return Err(transport_status(&self.connection, response.status()));
+            }
+            return self.read_stream(manifest, response, started, preview);
+        }
         let response = request
+            .body(body_bytes)
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
             return Err(transport_status(&self.connection, response.status()));
         }
-        self.read_stream(manifest, response, started)
+        self.read_stream(manifest, response, started, None)
     }
 }

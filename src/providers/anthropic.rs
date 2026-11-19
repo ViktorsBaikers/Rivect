@@ -60,6 +60,7 @@ use crate::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The whole-request budget every Messages send shares.
@@ -375,7 +376,7 @@ pub(crate) struct RequestBinding {
 
 /// One refused Messages leg: the frozen request the peer turned down and
 /// the replay decision that travelled with it.
-pub(crate) struct RefusedMessages<'a> {
+pub(crate) struct RefusedMessages<'a, R> {
     /// The frozen manifest the leg sent.
     pub(crate) manifest: &'a RequestManifest,
     /// The model the manifest resolved to.
@@ -383,7 +384,160 @@ pub(crate) struct RefusedMessages<'a> {
     /// The replay decision the request carried.
     pub(crate) binding: &'a RequestBinding,
     /// The refused response whose body decides the retry.
-    pub(crate) response: reqwest::blocking::Response,
+    pub(crate) response: R,
+}
+
+/// Both HTTP clients feed the same bounded Messages reducer.
+pub(crate) trait MessagesBody {
+    fn status(&self) -> reqwest::StatusCode;
+
+    fn chunks(
+        &mut self,
+        connection: &str,
+        deadline: Duration,
+        started: Instant,
+        visit: impl FnMut(&[u8]) -> Result<(), ProviderError>,
+    ) -> Result<(), ProviderError>;
+}
+
+impl MessagesBody for reqwest::blocking::Response {
+    fn status(&self) -> reqwest::StatusCode {
+        self.status()
+    }
+
+    fn chunks(
+        &mut self,
+        connection: &str,
+        deadline: Duration,
+        started: Instant,
+        mut visit: impl FnMut(&[u8]) -> Result<(), ProviderError>,
+    ) -> Result<(), ProviderError> {
+        let mut chunk = vec![0; super::STREAM_CHUNK_BYTES];
+        loop {
+            let n = read_chunk(connection, deadline, self, &mut chunk, started)?;
+            if n == 0 {
+                return Ok(());
+            }
+            visit(&chunk[..n])?;
+        }
+    }
+}
+
+// The foreground owner already signals other effects with this atomic flag.
+// Drive only HTTP here; the ledger and controller remain on their own stack.
+pub(super) struct ForegroundPost<'a> {
+    cancel: &'a AtomicBool,
+    client: reqwest::Client,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl<'a> ForegroundPost<'a> {
+    pub(super) fn new(
+        connection: &str,
+        cancel: &'a AtomicBool,
+        client: reqwest::ClientBuilder,
+    ) -> Result<Self, ProviderError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| super::transport_io(connection, err))?;
+        let client = client
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|err| transport(connection, err))?;
+        Ok(Self {
+            cancel,
+            client,
+            runtime,
+        })
+    }
+
+    pub(super) fn send(
+        &self,
+        connection: &str,
+        head: reqwest::blocking::RequestBuilder,
+        bytes: Vec<u8>,
+        remaining: Duration,
+    ) -> Result<ForegroundBody<'_>, ProviderError> {
+        let mut head = head.build().map_err(|err| transport(connection, err))?;
+        let request = self
+            .client
+            .post(head.url().clone())
+            .headers(std::mem::take(head.headers_mut()))
+            .timeout(remaining)
+            .body(bytes);
+        let response = self.drive(connection, async {
+            request
+                .send()
+                .await
+                .map_err(|err| transport(connection, err))
+        })?;
+        Ok(ForegroundBody {
+            response,
+            post: self,
+        })
+    }
+
+    fn check_cancel(&self, connection: &str) -> Result<(), ProviderError> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(ProviderError::Interrupted {
+                connection: connection.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn drive<T>(
+        &self,
+        connection: &str,
+        io: impl Future<Output = Result<T, ProviderError>>,
+    ) -> Result<T, ProviderError> {
+        self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = async {
+                    while !self.cancel.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => Err(ProviderError::Interrupted { connection: connection.to_owned() }),
+                result = io => {
+                    self.check_cancel(connection)?;
+                    result
+                }
+            }
+        })
+    }
+}
+
+pub(super) struct ForegroundBody<'a> {
+    response: reqwest::Response,
+    post: &'a ForegroundPost<'a>,
+}
+
+impl MessagesBody for ForegroundBody<'_> {
+    fn status(&self) -> reqwest::StatusCode {
+        self.response.status()
+    }
+
+    fn chunks(
+        &mut self,
+        connection: &str,
+        deadline: Duration,
+        started: Instant,
+        mut visit: impl FnMut(&[u8]) -> Result<(), ProviderError>,
+    ) -> Result<(), ProviderError> {
+        self.post.drive(connection, async {
+            while let Some(chunk) = self.response.chunk().await.map_err(|err| {
+                super::transport_io(connection, std::io::Error::other(err.without_url()))
+            })? {
+                self.post.check_cancel(connection)?;
+                check_deadline(connection, deadline, started)?;
+                visit(&chunk)?;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// The replay block state of one content block while it streams.
@@ -914,7 +1068,7 @@ impl MessagesCodec {
         manifest: &RequestManifest,
         fixed: &FixedModel,
         binding: &RequestBinding,
-    ) -> Value {
+    ) -> Result<Value, ProviderError> {
         let mut messages = Vec::with_capacity(2);
         if !binding.replay.is_empty() {
             messages.push(json!({
@@ -931,25 +1085,13 @@ impl MessagesCodec {
             "messages": messages,
         });
         if !manifest.tools.is_empty() {
-            body["tools"] = Value::Array(
-                manifest
-                    .tools
-                    .iter()
-                    .map(|name| {
-                        json!({
-                            "name": name,
-                            "description": "",
-                            "input_schema": { "type": "object" },
-                        })
-                    })
-                    .collect(),
-            );
+            body["tools"] = super::ToolFormat::Messages.tools(&self.connection, &manifest.tools)?;
         }
         if binding.drop_block {
             body["thinking"] =
                 json!({ "block_binding": { "prefix_mismatch_behavior": "drop_block" } });
         }
-        body
+        Ok(body)
     }
 
     /// The replay decision for this manifest: an unchanged lineage and
@@ -989,15 +1131,15 @@ impl MessagesCodec {
     /// clears the lineage so the same epoch never replays that body again,
     /// and settles the retry count; every other refusal keeps the transport
     /// class. `post` is the caller's own leg identity and authentication.
-    pub(crate) fn retry_invalid_signature<F>(
+    pub(crate) fn retry_invalid_signature<R: MessagesBody, F>(
         &mut self,
-        refused: RefusedMessages<'_>,
+        refused: RefusedMessages<'_, R>,
         deadline: Duration,
         started: Instant,
         mut post: F,
     ) -> Result<ProviderReply, ProviderError>
     where
-        F: FnMut(Vec<u8>, bool) -> Result<reqwest::blocking::Response, ProviderError>,
+        F: FnMut(Vec<u8>, bool) -> Result<R, ProviderError>,
     {
         let RefusedMessages {
             manifest,
@@ -1007,7 +1149,17 @@ impl MessagesCodec {
         } = refused;
         let status = response.status();
         if status == reqwest::StatusCode::BAD_REQUEST && !binding.replay.is_empty() {
-            let failed = read_catalog_body(&self.connection, deadline, &mut response, started)?;
+            let mut failed = Vec::new();
+            response.chunks(&self.connection, deadline, started, |chunk| {
+                if failed.len().saturating_add(chunk.len()) > super::CATALOG_MAX_BYTES {
+                    return Err(violation(
+                        &self.connection,
+                        "models payload exceeds the byte bound",
+                    ));
+                }
+                failed.extend_from_slice(chunk);
+                Ok(())
+            })?;
             if names_invalid_signature(&failed) {
                 // The body is permanently invalid; never replay its blocks
                 // on a later send even when the stripped retry also fails.
@@ -1016,7 +1168,7 @@ impl MessagesCodec {
                     replay: Vec::new(),
                     drop_block: binding.drop_block,
                 };
-                let retry_body = self.request_body(manifest, fixed, &stripped);
+                let retry_body = self.request_body(manifest, fixed, &stripped)?;
                 // Defensive: the HTTP seam cannot reach these two checks — the
                 // first leg's refusable body read already enforces the shared
                 // clock — so neither failure may ever be counted as a retry.
@@ -1203,25 +1355,6 @@ impl MessagesProvider {
         }
     }
 
-    fn post(
-        &self,
-        token: Option<&str>,
-        body: Vec<u8>,
-        drop_block: bool,
-    ) -> Result<reqwest::blocking::Response, ProviderError> {
-        messages_request(
-            &self.client,
-            &self.endpoint,
-            self.credential_rule(),
-            self.auth.forwarded(),
-            token,
-            body,
-            drop_block,
-        )
-        .send()
-        .map_err(|err| transport(&self.connection, err))
-    }
-
     /// Sends the frozen manifest as one physical Messages request.
     ///
     /// # Errors
@@ -1239,6 +1372,7 @@ impl MessagesProvider {
     fn send_manifest(
         &mut self,
         manifest: &RequestManifest,
+        cancel: Option<&AtomicBool>,
     ) -> Result<ProviderReply, ProviderError> {
         let started = Instant::now();
         check_deadline(&self.connection, self.deadline, started)?;
@@ -1272,91 +1406,116 @@ impl MessagesProvider {
         };
         self.check_model(&fixed.model_id, offered.as_deref())?;
         let binding = self.codec.binding(manifest, &fixed.model_id);
-        let body = self.codec.request_body(manifest, &fixed, &binding);
-        let body_bytes = wire_body(&self.connection, &body)?;
-        check_deadline(&self.connection, self.deadline, started)?;
-        let response = self.post(token.as_deref(), body_bytes, binding.drop_block)?;
-        if response.status().is_success() {
-            return self.codec.read_stream(
-                manifest,
-                &fixed.model_id,
-                response,
-                self.deadline,
-                started,
-            );
-        }
         let deadline = self.deadline;
         let rule = self.credential_rule();
         let client = &self.client;
         let endpoint = self.endpoint.as_str();
         let forwarded = self.auth.forwarded();
         let connection = self.connection.as_str();
-        let codec = &mut self.codec;
-        codec.retry_invalid_signature(
-            RefusedMessages {
+        let head = |drop_block| {
+            messages_request(
+                client,
+                endpoint,
+                rule,
+                forwarded,
+                token.as_deref(),
+                drop_block,
+            )
+        };
+        if let Some(cancel) = cancel.filter(|_| connection == "anthropic") {
+            let post = ForegroundPost::new(connection, cancel, reqwest::Client::builder())?;
+            return self.codec.exchange(
                 manifest,
-                fixed: &fixed,
-                binding: &binding,
-                response,
-            },
+                &fixed,
+                &binding,
+                deadline,
+                started,
+                |bytes, drop_block| {
+                    post.send(
+                        connection,
+                        head(drop_block),
+                        bytes,
+                        deadline.saturating_sub(started.elapsed()),
+                    )
+                },
+            );
+        }
+        self.codec.exchange(
+            manifest,
+            &fixed,
+            &binding,
             deadline,
             started,
-            |body, drop_block| {
-                messages_request(
-                    client,
-                    endpoint,
-                    rule,
-                    forwarded,
-                    token.as_deref(),
-                    body,
-                    drop_block,
-                )
-                .send()
-                .map_err(|err| transport(connection, err))
+            |bytes, drop_block| {
+                head(drop_block)
+                    .body(bytes)
+                    .send()
+                    .map_err(|err| transport(connection, err))
             },
         )
     }
 }
 
 impl MessagesCodec {
+    fn exchange<R: MessagesBody>(
+        &mut self,
+        manifest: &RequestManifest,
+        fixed: &FixedModel,
+        binding: &RequestBinding,
+        deadline: Duration,
+        started: Instant,
+        mut post: impl FnMut(Vec<u8>, bool) -> Result<R, ProviderError>,
+    ) -> Result<ProviderReply, ProviderError> {
+        let bytes = wire_body(
+            &self.connection,
+            &self.request_body(manifest, fixed, binding)?,
+        )?;
+        check_deadline(&self.connection, deadline, started)?;
+        let response = post(bytes, binding.drop_block)?;
+        if response.status().is_success() {
+            return self.read_stream(manifest, &fixed.model_id, response, deadline, started);
+        }
+        self.retry_invalid_signature(
+            RefusedMessages {
+                manifest,
+                fixed,
+                binding,
+                response,
+            },
+            deadline,
+            started,
+            post,
+        )
+    }
+
     /// Reads the SSE body through the shared bounded parser and reduces
     /// it to the one terminal the dialect can classify.
     pub(crate) fn read_stream(
         &mut self,
         manifest: &RequestManifest,
         model: &str,
-        mut response: reqwest::blocking::Response,
+        mut response: impl MessagesBody,
         deadline: Duration,
         started: Instant,
     ) -> Result<ProviderReply, ProviderError> {
         let mut parser = SseParser::new();
         let mut state = StreamState::default();
-        let mut chunk = vec![0u8; super::STREAM_CHUNK_BYTES];
         let mut total = 0usize;
-        loop {
-            let read = read_chunk(
-                &self.connection,
-                deadline,
-                &mut response,
-                &mut chunk,
-                started,
-            )?;
-            if read == 0 {
-                break;
-            }
+        response.chunks(&self.connection, deadline, started, |chunk| {
             // The whole stream is bounded, not only one event: a peer that
             // keeps emitting frames never grows this reply past the cap.
-            total = total.saturating_add(read);
+            total = total.saturating_add(chunk.len());
             if total > MAX_STREAM_BYTES {
                 return Err(violation(&self.connection, "stream exceeds the byte bound"));
             }
             for event in parser
-                .feed(&chunk[..read])
+                .feed(chunk)
                 .map_err(|err| sse(&self.connection, err))?
             {
                 self.on_event(manifest, &mut state, event)?;
             }
-        }
+            Ok(())
+        })?;
         check_deadline(&self.connection, deadline, started)?;
         for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
             self.on_event(manifest, &mut state, event)?;
@@ -1703,12 +1862,9 @@ impl MessagesCodec {
                         )),
                     });
                 }
-                state.tool_calls.push(ToolCall {
-                    tool: block.name,
-                    path: args.get("path").and_then(Value::as_str).map(str::to_string),
-                    text: None,
-                    test: None,
-                });
+                state
+                    .tool_calls
+                    .push(super::decode_file_call(&self.connection, block.name, args)?);
             }
             BlockKind::Thinking => {
                 if block.signature.is_empty() {
@@ -1804,7 +1960,16 @@ impl Provider for MessagesProvider {
     }
 
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
-        Self::send_manifest(self, manifest)
+        self.send_manifest(manifest, None)
+    }
+
+    fn send_with_cancel(
+        &mut self,
+        manifest: &RequestManifest,
+        cancel: Option<&AtomicBool>,
+        _preview: Option<&dyn Fn(&str)>,
+    ) -> Result<ProviderReply, ProviderError> {
+        self.send_manifest(manifest, cancel)
     }
 }
 
@@ -1957,14 +2122,12 @@ fn messages_request(
     rule: CredentialRule,
     forwarded: &BTreeMap<String, String>,
     token: Option<&str>,
-    body: Vec<u8>,
     drop_block: bool,
 ) -> reqwest::blocking::RequestBuilder {
     let mut request = client
         .post(messages_url(endpoint))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(reqwest::header::ACCEPT, "text/event-stream")
-        .body(body);
+        .header(reqwest::header::ACCEPT, "text/event-stream");
     if drop_block {
         request = request.header("anthropic-beta", THINKING_BINDING_BETA);
     }

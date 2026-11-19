@@ -1,12 +1,6 @@
-//! AC-001/AC-028/AC-080 (TD-03): one installed bundle outside the checkout
-//! activates only its exact authentic candidate. The bundle carries exactly
-//! `rivect`, `rivect-sandbox-helper` beside it and `rivect.manifest.json`; the
-//! manifest's own byte digest is the binding installed producers consume, and
-//! the two artifact digests are the activation identity. A changed, missing or
-//! malformed candidate is refused before activation and the previous release
-//! stays usable, while helper or manifest omission is the discriminating
-//! control that a checkout success cannot satisfy. The sessionless doctor
-//! answers ready/degraded on the packaged artifact with zero writes.
+//! AC-001/AC-028/AC-080 (TD-03): verify the installed v2 bundle, whose external
+//! receipt binds the manifest and all four artifacts. Refusal leaves the
+//! previous release usable; packaged doctor answers ready/degraded without writing.
 //!
 //! No data-resource artifact is asserted because none is shipped. Installed TP
 //! rows and the UI matrix are SLICE-011/012's and are not claimed here;
@@ -25,12 +19,13 @@
 mod support;
 
 use rivect::contracts::{
-    RELEASE_EXECUTABLE_NAME, RELEASE_HELPER_NAME, RELEASE_MANIFEST_NAME, RELEASE_MANIFEST_SCHEMA,
-    ReleaseManifest,
+    ErrorCode, RELEASE_EXECUTABLE_NAME, RELEASE_HELPER_NAME, RELEASE_MANIFEST_NAME,
+    RELEASE_MANIFEST_SCHEMA_V2, ReleaseManifest,
 };
 use rivect::executor::{ReleaseError, verify_release_bundle};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use support::release::baseline_bundle;
 
 /// The build identity the packaged executable prints; the manifest must name
 /// it exactly rather than a substituted or remembered value.
@@ -42,7 +37,7 @@ fn expected_build() -> String {
     )
 }
 
-/// The three bundle names in sorted order.
+/// Names at one inventory level, sorted.
 fn inventory(bundle: &Path) -> Vec<String> {
     let mut names = std::fs::read_dir(bundle)
         .expect("bundle inventory")
@@ -61,17 +56,69 @@ fn inventory(bundle: &Path) -> Vec<String> {
 /// Copies the authentic baseline bundle into a fresh nested path.
 fn copied_bundle(root: &Path, relative: &str) -> PathBuf {
     let destination = root.join(relative);
-    support::release::copy_bundle(support::release::baseline_bundle(), &destination);
+    support::release::copy_bundle(baseline_bundle(), &destination);
     destination
+}
+
+#[cfg(unix)]
+fn schema_one_bundle(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bundle = root.join("schema one");
+    std::fs::create_dir(&bundle).expect("schema-one fixture");
+    let mut manifest = json!({"schema_version": 1, "build": "fixture"});
+    for (key, name) in [
+        ("executable", RELEASE_EXECUTABLE_NAME),
+        ("helper", RELEASE_HELPER_NAME),
+    ] {
+        let path = bundle.join(name);
+        std::fs::write(&path, name).expect("schema-one artifact");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        manifest[key] = json!({"name": name, "sha256": support::sha256_hex(name.as_bytes())});
+    }
+    std::fs::write(bundle.join(RELEASE_MANIFEST_NAME), manifest.to_string()).expect("manifest");
+    bundle
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_one_is_unsupported_with_or_without_a_valid_receipt() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let bundle = schema_one_bundle(root.path());
+    for with_receipt in [false, true] {
+        if with_receipt {
+            refresh_private_receipt(&bundle);
+        }
+        let error = refusal(&bundle);
+        assert_eq!(error.code(), ErrorCode::UnsupportedVersion);
+        assert!(matches!(
+            error,
+            ReleaseError::Schema {
+                found: 1,
+                expected: RELEASE_MANIFEST_SCHEMA_V2
+            }
+        ));
+    }
+}
+
+fn bundle_snapshot(bundle: &Path) -> Vec<(PathBuf, u64, String)> {
+    let mut snapshot = support::release::snapshot(bundle);
+    let receipt = bundle.with_added_extension("manifest.sha256");
+    if receipt.try_exists().expect("receipt metadata") {
+        let length = std::fs::metadata(&receipt).expect("receipt metadata").len();
+        let digest = support::release::sha256_file(&receipt);
+        snapshot.push((receipt, length, digest));
+    }
+    snapshot
 }
 
 /// Verifies a bundle that must be refused and proves the refusal wrote
 /// nothing into the candidate.
 fn refusal(bundle: &Path) -> ReleaseError {
-    let before = support::release::snapshot(bundle);
+    let before = bundle_snapshot(bundle);
     let error = verify_release_bundle(bundle).expect_err("the candidate must be refused");
     assert_eq!(
-        support::release::snapshot(bundle),
+        bundle_snapshot(bundle),
         before,
         "an activation refusal writes nothing: {}",
         bundle.display()
@@ -99,7 +146,7 @@ fn nested_cwd(root: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn probe_supplied_bundle(source: &Path, root: &Path, expectation: &str) {
+fn probe_supplied_bundle(root: &Path, selectors: &[(&str, &Path)], expectation: &str) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let tools = root.join("packaging tools");
@@ -125,7 +172,7 @@ fn probe_supplied_bundle(source: &Path, root: &Path, expectation: &str) {
         .env("PATH", &tools)
         .env("HOME", root)
         .env("TMPDIR", root)
-        .env("RIVECT_TEST_BUNDLE", source)
+        .envs(selectors.iter().copied())
         .env("RIVECT_TEST_BUNDLE_PROBE", expectation)
         .current_dir(root)
         .output()
@@ -148,6 +195,83 @@ fn probe_supplied_bundle(source: &Path, root: &Path, expectation: &str) {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn v2_inventory_binds_all_artifacts_to_an_external_receipt() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("fixture");
+    let bundle = root.path().join("release");
+    std::fs::create_dir_all(bundle.join("libexec")).expect("libexec");
+    let library = if cfg!(target_os = "macos") {
+        "libexec/libopentui.dylib"
+    } else {
+        "libexec/libopentui.so"
+    };
+    let mut manifest = json!({"schema_version": RELEASE_MANIFEST_SCHEMA_V2, "build": "fixture"});
+    for (key, name) in [
+        ("executable", "rivect"),
+        ("helper", RELEASE_HELPER_NAME),
+        ("ui", "libexec/rivect-tui"),
+        ("library", library),
+    ] {
+        let path = bundle.join(name);
+        std::fs::write(&path, name).expect("artifact");
+        if key != "library" {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        }
+        manifest[key] = json!({"name": name, "sha256": support::sha256_hex(name.as_bytes())});
+    }
+    let bytes = serde_json::to_vec(&manifest).expect("manifest");
+    std::fs::write(bundle.join(RELEASE_MANIFEST_NAME), &bytes).expect("manifest");
+    assert!(matches!(
+        refusal(&bundle),
+        ReleaseError::Artifact { name: "manifest receipt", source }
+            if source.kind() == std::io::ErrorKind::NotFound
+    ));
+    let receipt = bundle.with_added_extension("manifest.sha256");
+    std::fs::write(&receipt, format!("{}\n", support::sha256_hex(&bytes))).expect("receipt");
+    verify_release_bundle(&bundle).expect("v2 inventory");
+    for name in ["libexec/rivect-tui", library] {
+        std::fs::write(bundle.join(name), "changed").expect("tamper");
+        assert!(matches!(
+            verify_release_bundle(&bundle),
+            Err(ReleaseError::Digest { name: refused }) if refused == name
+        ));
+        std::fs::write(bundle.join(name), name).expect("restore");
+    }
+    let libexec = bundle.join("libexec");
+    let moved = root.path().join("outside");
+    std::fs::rename(&libexec, &moved).expect("move");
+    std::os::unix::fs::symlink(&moved, &libexec).expect("link");
+    assert!(matches!(
+        verify_release_bundle(&bundle),
+        Err(ReleaseError::NotDirectory { .. })
+    ));
+    std::fs::remove_file(&libexec).expect("unlink");
+    std::fs::rename(moved, libexec).expect("restore");
+    manifest["build"] = json!("substituted");
+    std::fs::write(bundle.join(RELEASE_MANIFEST_NAME), manifest.to_string()).expect("replace");
+    assert!(matches!(
+        refusal(&bundle),
+        ReleaseError::Digest {
+            name: "manifest receipt"
+        }
+    ));
+
+    assert!(
+        manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("ui")
+            .is_some()
+    );
+    std::fs::write(bundle.join(RELEASE_MANIFEST_NAME), manifest.to_string())
+        .expect("omit UI entry");
+    refresh_private_receipt(&bundle);
+    assert!(matches!(refusal(&bundle), ReleaseError::ManifestInventory));
+}
+
 #[test]
 fn packaged_bundle_outside_the_checkout_has_the_exact_inventory_and_manifest_digest() {
     let root = tempfile::TempDir::with_prefix("rivect-release-inventory-").expect("fixture root");
@@ -161,18 +285,42 @@ fn packaged_bundle_outside_the_checkout_has_the_exact_inventory_and_manifest_dig
     let activation = verify_release_bundle(&bundle).expect("the authentic bundle activates");
     assert_eq!(
         inventory(&bundle),
-        vec![
-            RELEASE_EXECUTABLE_NAME.to_string(),
-            RELEASE_HELPER_NAME.to_string(),
-            RELEASE_MANIFEST_NAME.to_string(),
-        ],
-        "the bundle carries exactly the executable, the helper beside it and the manifest"
+        [
+            "libexec",
+            RELEASE_EXECUTABLE_NAME,
+            RELEASE_HELPER_NAME,
+            RELEASE_MANIFEST_NAME,
+        ]
     );
 
     let manifest_bytes = std::fs::read(bundle.join(RELEASE_MANIFEST_NAME)).expect("manifest");
     let manifest: ReleaseManifest =
         serde_json::from_slice(&manifest_bytes).expect("manifest schema");
-    assert_eq!(manifest.schema_version, RELEASE_MANIFEST_SCHEMA);
+    assert_eq!(manifest.schema_version, RELEASE_MANIFEST_SCHEMA_V2);
+    let library = if cfg!(target_os = "macos") {
+        "libopentui.dylib"
+    } else {
+        "libopentui.so"
+    };
+    assert_eq!(inventory(&bundle.join("libexec")), [library, "rivect-tui"]);
+    for (artifact, name) in [
+        (manifest.ui.as_ref().expect("installed UI"), "rivect-tui"),
+        (
+            manifest.library.as_ref().expect("installed library"),
+            library,
+        ),
+    ] {
+        assert_eq!(artifact.name, format!("libexec/{name}"));
+        assert_eq!(
+            artifact.sha256,
+            support::release::sha256_file(&bundle.join(&artifact.name))
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(bundle.with_added_extension("manifest.sha256"))
+            .expect("installer receipt"),
+        format!("{}\n", activation.manifest_sha256)
+    );
     assert_eq!(manifest.build, expected_build());
     assert_eq!(manifest.executable.name, RELEASE_EXECUTABLE_NAME);
     assert_eq!(manifest.helper.name, RELEASE_HELPER_NAME);
@@ -199,7 +347,6 @@ fn packaged_bundle_outside_the_checkout_has_the_exact_inventory_and_manifest_dig
     );
     assert_eq!(activation.executable_sha256, manifest.executable.sha256);
     assert_eq!(activation.helper_sha256, manifest.helper.sha256);
-    println!("release manifest sha256: {}", activation.manifest_sha256);
 }
 
 #[test]
@@ -227,7 +374,7 @@ fn a_changed_candidate_is_refused_and_the_previous_release_stays_usable() {
     // authentic bytes still verify and still run their own doctor.
     let data = opened_data_root();
     let cwd = nested_cwd(root.path());
-    let before = support::release::snapshot(&previous);
+    let before = bundle_snapshot(&previous);
     let activated = verify_release_bundle(&previous).expect("the previous release still activates");
     let output = support::release::run_packaged(
         &previous,
@@ -246,7 +393,7 @@ fn a_changed_candidate_is_refused_and_the_previous_release_stays_usable() {
     let report: Value =
         serde_json::from_str(support::release::stdout_of(&output).trim()).expect("doctor JSON");
     assert_eq!(report["ready"], true, "{report}");
-    assert_eq!(support::release::snapshot(&previous), before);
+    assert_eq!(bundle_snapshot(&previous), before);
 
     // Packaging never replaces a destination: the refused candidate attempt
     // cannot overwrite a previous release.
@@ -259,10 +406,6 @@ fn a_changed_candidate_is_refused_and_the_previous_release_stays_usable() {
         verify_release_bundle(&previous)
             .expect("the previous release is still authentic")
             .manifest_sha256,
-        activated.manifest_sha256
-    );
-    println!(
-        "previous release manifest sha256: {}",
         activated.manifest_sha256
     );
 }
@@ -317,21 +460,21 @@ fn helper_and_manifest_omission_are_discriminating_activation_refusals() {
     let path = incompatible.join(RELEASE_MANIFEST_NAME);
     let mut document: Value =
         serde_json::from_slice(&std::fs::read(&path).expect("manifest bytes")).expect("manifest");
-    document["schema_version"] = json!(RELEASE_MANIFEST_SCHEMA + 1);
+    document["schema_version"] = json!(RELEASE_MANIFEST_SCHEMA_V2 + 1);
     std::fs::write(&path, document.to_string()).expect("incompatible manifest");
     let refused = refusal(&incompatible);
     assert!(
         matches!(
             &refused,
             ReleaseError::Schema { found, expected }
-                if *found == RELEASE_MANIFEST_SCHEMA + 1 && *expected == RELEASE_MANIFEST_SCHEMA
+                if *found == RELEASE_MANIFEST_SCHEMA_V2 + 1 && *expected == RELEASE_MANIFEST_SCHEMA_V2
         ),
         "{refused}"
     );
 
     // The control: the untouched bundle still activates, so each refusal
     // above is the omission or mutation, not a baseline that never worked.
-    assert!(verify_release_bundle(support::release::baseline_bundle()).is_ok());
+    assert!(verify_release_bundle(baseline_bundle()).is_ok());
 }
 
 #[test]
@@ -343,7 +486,7 @@ fn sessionless_doctor_answers_ready_and_degraded_on_the_packaged_artifact_with_z
     let data_argument = data.path().to_str().expect("utf-8 data root");
 
     let activation = verify_release_bundle(&bundle).expect("the packaged bundle activates");
-    let before_bundle = support::release::snapshot(&bundle);
+    let before_bundle = bundle_snapshot(&bundle);
     let before_data = support::release::snapshot(data.path());
     let ready =
         support::release::run_packaged(&bundle, &["doctor", "--data-root", data_argument], &cwd);
@@ -371,7 +514,7 @@ fn sessionless_doctor_answers_ready_and_degraded_on_the_packaged_artifact_with_z
         "the doctor names the packaged manifest digest: {release}"
     );
     assert_eq!(
-        support::release::snapshot(&bundle),
+        bundle_snapshot(&bundle),
         before_bundle,
         "doctor wrote nothing into the packaged bundle"
     );
@@ -384,7 +527,7 @@ fn sessionless_doctor_answers_ready_and_degraded_on_the_packaged_artifact_with_z
     // Degraded: the same packaged artifact after its helper disappears.
     let broken = copied_bundle(root.path(), "broken bundle/юникод release");
     std::fs::remove_file(broken.join(RELEASE_HELPER_NAME)).expect("omit the helper");
-    let before_broken = support::release::snapshot(&broken);
+    let before_broken = bundle_snapshot(&broken);
     let before_data = support::release::snapshot(data.path());
     let degraded =
         support::release::run_packaged(&broken, &["doctor", "--data-root", data_argument], &cwd);
@@ -412,7 +555,7 @@ fn sessionless_doctor_answers_ready_and_degraded_on_the_packaged_artifact_with_z
         "the degraded release check names the refusal: {release}"
     );
     assert_eq!(
-        support::release::snapshot(&broken),
+        bundle_snapshot(&broken),
         before_broken,
         "the degraded doctor wrote nothing into the bundle"
     );
@@ -427,19 +570,23 @@ fn sessionless_doctor_answers_ready_and_degraded_on_the_packaged_artifact_with_z
 #[test]
 fn supplied_bundle_is_reused_without_packaging_or_mutating_source() {
     if let Some(expectation) = std::env::var_os("RIVECT_TEST_BUNDLE_PROBE") {
+        let selector = if std::env::var_os("RIVECT_V2_TEST_BUNDLE").is_some() {
+            "RIVECT_V2_TEST_BUNDLE"
+        } else {
+            "RIVECT_TEST_BUNDLE"
+        };
         if expectation == "refused" {
             assert!(
-                std::panic::catch_unwind(support::release::baseline_bundle).is_err(),
+                std::panic::catch_unwind(baseline_bundle).is_err(),
                 "an invalid supplied bundle must be refused"
             );
             return;
         }
         assert_eq!(expectation, "valid");
-        let source = std::fs::canonicalize(
-            std::env::var_os("RIVECT_TEST_BUNDLE").expect("supplied bundle path"),
-        )
-        .expect("canonical supplied bundle");
-        let bundle = support::release::baseline_bundle();
+        let source =
+            std::fs::canonicalize(std::env::var_os(selector).expect("supplied bundle path"))
+                .expect("canonical supplied bundle");
+        let bundle = baseline_bundle();
         assert_ne!(bundle, source);
         let checkout =
             std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("canonical checkout");
@@ -459,6 +606,14 @@ fn supplied_bundle_is_reused_without_packaging_or_mutating_source() {
             verify_release_bundle(bundle).expect("copied bundle activates"),
             verify_release_bundle(&source).expect("supplied bundle activates")
         );
+        let receipt = bundle.with_added_extension("manifest.sha256");
+        assert_eq!(
+            std::fs::read(&receipt).expect("copied receipt"),
+            std::fs::read(source.with_added_extension("manifest.sha256")).expect("source receipt")
+        );
+        std::fs::write(receipt, b"private receipt mutation").expect("mutate copied receipt");
+        std::fs::write(bundle.join("libexec/rivect-tui"), b"private UI mutation")
+            .expect("mutate copied UI");
         std::fs::write(
             bundle.join(RELEASE_HELPER_NAME),
             b"private fixture mutation",
@@ -467,32 +622,85 @@ fn supplied_bundle_is_reused_without_packaging_or_mutating_source() {
         return;
     }
 
+    for selector in ["RIVECT_TEST_BUNDLE", "RIVECT_V2_TEST_BUNDLE"] {
+        assert_supplied_copy(selector);
+    }
+}
+
+#[cfg(unix)]
+fn assert_supplied_copy(selector: &str) {
     let root = tempfile::TempDir::with_prefix("rivect-supplied-release-").expect("fixture root");
     let source = copied_bundle(root.path(), "supplied release/юникод");
     let manifest = source.join(RELEASE_MANIFEST_NAME);
     let mut bytes = std::fs::read(&manifest).expect("supplied manifest");
     bytes.extend_from_slice(b"\n \t\n");
-    std::fs::write(manifest, bytes).expect("distinct valid manifest bytes");
+    std::fs::write(&manifest, bytes).expect("distinct valid manifest bytes");
+    refresh_private_receipt(&source);
     assert!(verify_release_bundle(&source).is_ok());
-    let before = support::release::snapshot(&source);
+    let before = bundle_snapshot(&source);
     let alias = root.path().join("supplied bundle alias");
     std::os::unix::fs::symlink(&source, &alias).expect("external bundle alias");
-    probe_supplied_bundle(&alias, root.path(), "valid");
+    probe_supplied_bundle(root.path(), &[(selector, &alias)], "valid");
+    if selector == "RIVECT_V2_TEST_BUNDLE" {
+        probe_supplied_bundle(
+            root.path(),
+            &[(selector, &source), ("RIVECT_TEST_BUNDLE", &alias)],
+            "valid",
+        );
+        probe_supplied_bundle(
+            root.path(),
+            &[
+                (selector, &source),
+                ("RIVECT_TEST_BUNDLE", baseline_bundle()),
+            ],
+            "refused",
+        );
+    }
     assert_eq!(
-        support::release::snapshot(&source),
+        bundle_snapshot(&source),
         before,
         "consumption and private-copy mutation leave the supplied source untouched"
     );
 }
 
+// Identity controls need valid digests; never refresh a supplied candidate’s receipt.
+#[cfg(unix)]
+fn refresh_private_receipt(bundle: &Path) {
+    let receipt = bundle.with_added_extension("manifest.sha256");
+    let digest = support::release::sha256_file(&bundle.join(RELEASE_MANIFEST_NAME));
+    std::fs::write(receipt, format!("{digest}\n")).expect("private fixture receipt");
+}
+
 #[cfg(unix)]
 #[test]
 fn invalid_supplied_bundles_fail_closed_without_packaging_or_source_writes() {
+    for selector in ["RIVECT_TEST_BUNDLE", "RIVECT_V2_TEST_BUNDLE"] {
+        assert_invalid_supplied(selector);
+    }
+}
+
+#[cfg(unix)]
+fn assert_invalid_supplied(selector: &str) {
     let root = tempfile::TempDir::with_prefix("rivect-invalid-supplied-").expect("fixture root");
     let missing = root.path().join("missing bundle");
-    probe_supplied_bundle(&missing, root.path(), "refused");
+    probe_supplied_bundle(root.path(), &[(selector, &missing)], "refused");
     assert!(!missing.exists());
-    probe_supplied_bundle(Path::new(""), root.path(), "refused");
+    probe_supplied_bundle(root.path(), &[(selector, Path::new(""))], "refused");
+    let wrong_format = schema_one_bundle(root.path());
+    let before = bundle_snapshot(&wrong_format);
+    probe_supplied_bundle(root.path(), &[(selector, &wrong_format)], "refused");
+    assert_eq!(bundle_snapshot(&wrong_format), before);
+
+    let bundle = copied_bundle(root.path(), "receipt controls");
+    let receipt = bundle.with_added_extension("manifest.sha256");
+    std::fs::remove_file(&receipt).expect("omit receipt");
+    let before = bundle_snapshot(&bundle);
+    probe_supplied_bundle(root.path(), &[(selector, &bundle)], "refused");
+    assert_eq!(bundle_snapshot(&bundle), before);
+    std::fs::write(&receipt, b"wrong receipt\n").expect("mismatched receipt");
+    let before = bundle_snapshot(&bundle);
+    probe_supplied_bundle(root.path(), &[(selector, &bundle)], "refused");
+    assert_eq!(bundle_snapshot(&bundle), before);
 
     for (relative, name, bytes) in [
         ("missing manifest", RELEASE_MANIFEST_NAME, None),
@@ -514,9 +722,9 @@ fn invalid_supplied_bundles_fail_closed_without_packaging_or_source_writes() {
         } else {
             std::fs::remove_file(artifact).expect("omit supplied artifact");
         }
-        let before = support::release::snapshot(&bundle);
-        probe_supplied_bundle(&bundle, root.path(), "refused");
-        assert_eq!(support::release::snapshot(&bundle), before);
+        let before = bundle_snapshot(&bundle);
+        probe_supplied_bundle(root.path(), &[(selector, &bundle)], "refused");
+        assert_eq!(bundle_snapshot(&bundle), before);
     }
 
     for wrong_identity in ["manifest build", "executable build"] {
@@ -538,13 +746,14 @@ fn invalid_supplied_bundles_fail_closed_without_packaging_or_source_writes() {
         }
         std::fs::write(&path, serde_json::to_vec(&manifest).expect("manifest JSON"))
             .expect("wrong-build manifest");
+        refresh_private_receipt(&bundle);
         assert!(
             verify_release_bundle(&bundle).is_ok(),
             "valid artifact digests alone do not bind the bundle to the test build"
         );
-        let before = support::release::snapshot(&bundle);
-        probe_supplied_bundle(&bundle, root.path(), "refused");
-        assert_eq!(support::release::snapshot(&bundle), before);
+        let before = bundle_snapshot(&bundle);
+        probe_supplied_bundle(root.path(), &[(selector, &bundle)], "refused");
+        assert_eq!(bundle_snapshot(&bundle), before);
     }
 
     let checkout = tempfile::Builder::new()
@@ -553,9 +762,9 @@ fn invalid_supplied_bundles_fail_closed_without_packaging_or_source_writes() {
         .expect("checkout fixture root");
     let inside = copied_bundle(checkout.path(), "authentic bundle inside checkout");
     assert!(verify_release_bundle(&inside).is_ok());
-    let before = support::release::snapshot(&inside);
+    let before = bundle_snapshot(&inside);
     let alias = root.path().join("checkout bundle alias");
     std::os::unix::fs::symlink(&inside, &alias).expect("checkout bundle alias");
-    probe_supplied_bundle(&alias, root.path(), "refused");
-    assert_eq!(support::release::snapshot(&inside), before);
+    probe_supplied_bundle(root.path(), &[(selector, &alias)], "refused");
+    assert_eq!(bundle_snapshot(&inside), before);
 }

@@ -28,4 +28,8 @@ pub mod ui;
 pub mod update;
 pub mod verification;
 
+#[cfg(test)]
+#[path = "../tests/support/packaging.rs"]
+mod test_packaging;
+
 pub const BUILD_ATTEMPT_ID: &str = "slice001-20260909T180108Z-retry";

@@ -2024,15 +2024,16 @@ fn inspect_system(
         None => {
             let never = || false;
             let run = ctx.index.worker.run(deadline, &never);
-            crate::context::query_isolated(&query, &run)
+            ctx.index.worker.symbols.run(&query, &run)
         }
         Some(task_id) => {
             let store: &TaskStore = ctx.store;
             let poll = || !matches!(store.task_cancelled(task_id), Ok(false));
             let run = ctx.index.worker.run(deadline, &poll);
-            crate::context::query_isolated(&query, &run)
+            ctx.index.worker.symbols.run(&query, &run)
         }
-    };
+    }
+    .map(|(result, _work)| result);
     // The declared set is the mechanical table, read once: the probe says
     // whether one leg answered, never what the table should be.
     let probe = match &outcome {
@@ -5232,6 +5233,7 @@ mod tests {
             watch_refusal: None,
             worker: crate::commands::IndexWorker {
                 helper,
+                symbols: Default::default(),
                 program: root.path().join("unused-program"),
             },
         };

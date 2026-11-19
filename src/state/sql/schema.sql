@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     event_cursor INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks (session_id);
+-- Reply bytes belong to the private projection, not the shared event outbox.
+CREATE TABLE IF NOT EXISTS ui_message_replies (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
+    reply TEXT,
+    error_code TEXT,
+    CHECK ((reply IS NULL) != (error_code IS NULL))
+) STRICT;
 -- Additive routing metadata for prior human turns. Task text stays owned by tasks.
 CREATE TABLE IF NOT EXISTS tui_turn_routes (
     task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
@@ -140,6 +147,15 @@ CREATE TABLE IF NOT EXISTS attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_task_state
     ON attempts (task_id, state);
+CREATE TABLE IF NOT EXISTS pending_permissions (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+    task_id TEXT NOT NULL REFERENCES tasks(task_id),
+    intent_revision INTEGER NOT NULL,
+    grant_id TEXT NOT NULL,
+    scope TEXT,
+    expires_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_pending_permissions_task ON pending_permissions(task_id);
 CREATE TABLE IF NOT EXISTS retained (
     boundary_id TEXT PRIMARY KEY,
     record_json TEXT NOT NULL

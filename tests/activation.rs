@@ -216,10 +216,8 @@ fn headless_entry_reports_the_refused_row_its_production_factory_recorded()
     Ok(())
 }
 
-/// The TUI entry consumes the same production factory: its eager open runs
-/// the configured build, so the refused row's diagnostic lands in the
-/// transcript the first frame paints — the fixture carrier would open
-/// silently.
+/// Reopening an existing store must paint the production factory's refusal.
+/// A never-opened project stays lazy until its first command.
 #[test]
 fn tui_entry_reports_the_refused_row_its_production_factory_recorded()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -229,8 +227,12 @@ fn tui_entry_reports_the_refused_row_its_production_factory_recorded()
         config_for("http://127.0.0.1:11434", Some("eu-west-1")),
     )?;
     let data_root = root.path().to_path_buf();
+    drop(open_runtime(&data_root)?);
     let mut pty = support::spawn_pty_with_args(
-        &support::rivect_binary(),
+        support::release::baseline_bundle()
+            .join("rivect")
+            .to_str()
+            .ok_or("non-UTF-8 fixture bundle path")?,
         40,
         120,
         root,
@@ -2356,6 +2358,10 @@ impl LocalPeer {
             while !running.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets may inherit the listener's nonblocking mode on BSD.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking fixture stream");
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .expect("a request read is bounded");

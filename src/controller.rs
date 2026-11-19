@@ -4,7 +4,9 @@
 //! revocation/cancellation block the next dispatch before any provider
 //! effect.
 
-use crate::commands::{PausedAttempt, Runtime};
+mod preview;
+
+use crate::commands::{ForegroundWork, PausedAttempt, Runtime};
 use crate::contracts::Lifecycle;
 use crate::contracts::{
     AnswerSelection, Availability, EffectClass, ErrorCode, OptionId, Question, QuestionId,
@@ -22,6 +24,14 @@ use crate::state::{ConflictCause, InvalidCause, StoreError, WorkBudgetState};
 use crate::supervisor::{Observation, OperationClass};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+fn foreground_signal<'a>(
+    work: Option<&'a ForegroundWork>,
+    task: &TaskId,
+) -> Option<&'a std::sync::atomic::AtomicBool> {
+    work.filter(|work| &work.task_id == task)
+        .map(|work| work.cancel.as_ref())
+}
 
 /// One bounded scheduler pass over the task tree.
 #[derive(Debug, Clone, PartialEq)]
@@ -166,8 +176,11 @@ fn stopped_outcome(cause: crate::procedure::StopCause, snapshot: TaskSnapshot) -
                 snapshot,
             }
         }
-        // The effect-time re-check refused the step, so nothing ran and the
-        // control path's own denial is the answer.
+        StopCause::ReceiptMismatch { .. } => StepOutcome::WorkStopped {
+            reason: stop.detail,
+            snapshot,
+        },
+        // Revocation at admission prevented the effect.
         StopCause::RevokedRight { .. } => StepOutcome::EffectDenied {
             reason: stop.detail,
             snapshot,
@@ -261,6 +274,9 @@ impl ControllerError {
             // one that never entered a send, every other is the store's.
             Self::Model(ModelError::BudgetExhausted { .. }) => ErrorCode::BudgetExhausted,
             Self::Model(ModelError::Ledger(error)) => error.code(),
+            Self::Model(ModelError::Provider(ProviderError::Interrupted { .. })) => {
+                ErrorCode::OutcomeUnknown
+            }
             Self::Model(_) => ErrorCode::Denied,
             Self::Executor(error) => error.error_code(),
             Self::Scheduler(SchedulerError::UnitsExceedCap { .. }) => ErrorCode::BudgetExhausted,
@@ -447,13 +463,28 @@ pub(crate) const PROJECT_CHECK_QUESTION: &str = "run-check:";
 const ALLOW_WRITE: &str = "allow-write-once";
 const ALLOW_CHECK: &str = "allow-check-once";
 
+impl Question {
+    /// Scoped effect questions accept only the owner's enumerated choices.
+    #[must_use]
+    pub fn accepts_custom(&self) -> bool {
+        !self.question_id.0.starts_with(FILE_SHARE_QUESTION) && !self.is_permission()
+    }
+
+    /// Whether this decision guards a write or project-check effect.
+    #[must_use]
+    pub fn is_permission(&self) -> bool {
+        self.question_id.0.starts_with(FILE_WRITE_QUESTION)
+            || self.question_id.0.starts_with(PROJECT_CHECK_QUESTION)
+    }
+}
+
 pub(crate) struct PendingFileShare {
     question: QuestionId,
     pub(crate) task: TaskId,
     path: PathBuf,
     digest: String,
     recipient: ApprovedRecipient,
-    inputs: String,
+    inputs: serde_json::Value,
 }
 
 struct ApprovedRecipient {
@@ -465,6 +496,9 @@ struct ApprovedRecipient {
 
 pub(crate) struct PendingFileWrite {
     question: QuestionId,
+    session: SessionId,
+    summary: String,
+    preview: Option<String>,
     pub(crate) task: TaskId,
     path: PathBuf,
     edit: crate::executor::ProjectEdit,
@@ -529,6 +563,67 @@ fn local_check_toolchain() -> Option<(PathBuf, PathBuf)> {
 }
 
 impl Runtime {
+    /// Projects an in-memory write offer only while its session and question are current.
+    ///
+    /// # Errors
+    /// Returns a storage error if the current question cannot be checked.
+    pub fn proposed_diff(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+    ) -> Result<Option<(&str, bool)>, StoreError> {
+        Ok(self
+            .current_write(session, task, None)?
+            .map(|write| (write.summary.as_str(), write.preview.is_some())))
+    }
+
+    /// The paired terminal's explicit reveal checks the complete current consent pin.
+    pub fn reveal_proposed_diff(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+        question: &str,
+        revision: u64,
+        intent: u64,
+    ) -> Result<Option<&str>, StoreError> {
+        Ok(self
+            .current_write(session, task, Some((question, revision, intent)))?
+            .and_then(|write| write.preview.as_deref()))
+    }
+
+    fn current_write(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+        pin: Option<(&str, u64, u64)>,
+    ) -> Result<Option<&PendingFileWrite>, StoreError> {
+        let Some(write) = self
+            .file_write
+            .as_ref()
+            .filter(|w| &w.session == session && &w.task == task)
+        else {
+            return Ok(None);
+        };
+        if self.policy.covers(&write.path)
+            || self.effective().sources_digest != write.recipient.config_revision
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .owner
+            .store
+            .current_question(task)?
+            .filter(|(q, _)| {
+                q.question_id == write.question
+                    && pin.is_none_or(|(id, revision, intent)| {
+                        q.question_id.0 == id
+                            && q.question_revision == revision
+                            && q.intent_revision == intent
+                    })
+            })
+            .map(|_| write))
+    }
+
     pub fn drain_scheduler(&mut self, session_id: &SessionId) -> Result<(), ControllerError> {
         for _ in 0..SCHEDULER_DRAIN_LIMIT {
             match self.scheduler_step(session_id)? {
@@ -554,6 +649,45 @@ impl Runtime {
         grant_id: &str,
         crash_after_dispatch: bool,
     ) -> Result<StepOutcome, ControllerError> {
+        let outcome = self.run_decision_step_inner(
+            session_id,
+            task_id,
+            answer,
+            grant_id,
+            crash_after_dispatch,
+        )?;
+        let settled = match &outcome {
+            StepOutcome::Completed { snapshot } => Some((snapshot, "output.complete")),
+            StepOutcome::OutcomeUnknown { snapshot, .. } => Some((snapshot, "output.partial")),
+            StepOutcome::WorkStopped { snapshot, .. } => Some((snapshot, "output.stopped")),
+            StepOutcome::EffectDenied { snapshot, reason } => Some((
+                snapshot,
+                match reason.as_str() {
+                    crate::executor::MODE_ASK_REASON => "output.mode_ask",
+                    crate::executor::MODE_DENY_REASON => "output.mode_deny",
+                    _ => "output.denied",
+                },
+            )),
+            StepOutcome::Waiting { .. }
+            | StepOutcome::Paused { .. }
+            | StepOutcome::NoAction { .. } => None,
+        };
+        if let Some((pin, kind)) = settled {
+            self.owner
+                .store
+                .record_step_output(session_id, task_id, pin.revision, kind)?;
+        }
+        Ok(outcome)
+    }
+
+    fn run_decision_step_inner(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        answer: &AnswerSelection,
+        grant_id: &str,
+        crash_after_dispatch: bool,
+    ) -> Result<StepOutcome, ControllerError> {
         if let Some(cancelled) = self.foreground_cancellation(session_id, task_id)? {
             return Ok(cancelled);
         }
@@ -567,12 +701,39 @@ impl Runtime {
         ) {
             self.fail_applicability(task_id)?;
         }
-        // A saved procedure segment starts here, before the single-step path
-        // (AC-053): the steps the plan already executed run again through the
-        // executor's own admission and settlement, so a shipped run reaches the
-        // segment's stop decision instead of stepping on blindly.
-        if let Some(segment) = self.saved_segment(task_id)? {
-            return self.run_saved_segment(session_id, task_id, grant_id, &segment);
+        self.owner.store.recover_procedure_receipt(task_id)?;
+        let names_input = match answer {
+            AnswerSelection::Custom { text } => {
+                text.strip_prefix("read ").map(std::path::Path::new)
+                    == Some(self.scoped_file.as_path())
+            }
+            AnswerSelection::Option { option_id } => {
+                option_id.0 == crate::contracts::KNOWN_READY_OPTION
+            }
+        };
+        if names_input
+            && !self.paused_attempts.contains_key(&task_id.0)
+            && !self
+                .foreground
+                .as_ref()
+                .is_some_and(|work| &work.task_id == task_id && work.share_reads)
+            && let Some(segment) = self.saved_segment(task_id)?
+            && let Some(binding) = self.segment_binding(&segment, grant_id)
+            && !self
+                .owner
+                .store
+                .latest_applied_answer_question(task_id)?
+                .is_some_and(|question| {
+                    [
+                        FILE_SHARE_QUESTION,
+                        FILE_WRITE_QUESTION,
+                        PROJECT_CHECK_QUESTION,
+                    ]
+                    .iter()
+                    .any(|prefix| question.0.starts_with(prefix))
+                })
+        {
+            return self.run_saved_segment(session_id, task_id, &binding, &segment);
         }
         let resolved = self.resolve_read_target(session_id, task_id, answer);
         if let Some(cancelled) = self.foreground_cancellation(session_id, task_id)? {
@@ -640,9 +801,9 @@ impl Runtime {
         session_id: &SessionId,
         task_id: &TaskId,
     ) -> Result<Option<StepOutcome>, ControllerError> {
-        if !self.foreground.as_ref().is_some_and(|work| {
-            &work.task_id == task_id && work.cancel.load(std::sync::atomic::Ordering::Acquire)
-        }) {
+        if !foreground_signal(self.foreground.as_ref(), task_id)
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
             return Ok(None);
         }
         let snapshot = self.owner.store.snapshot(task_id)?;
@@ -994,10 +1155,19 @@ impl Runtime {
             let scopes = self.budget_scopes(task_id)?;
             let sent = {
                 let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
-                self.broker
-                    .dispatch_fallback_choice(&mut ledger, &world, &attempt_id, &connection)
+                self.broker.dispatch_fallback_choice_with_cancel(
+                    &mut ledger,
+                    &world,
+                    &attempt_id,
+                    &connection,
+                    foreground_signal(self.foreground.as_ref(), task_id),
+                )
             };
-            self.note_send_outcome(session_id, task_id, &sent, Some(&paused_manifest));
+            if let Some(stopped) =
+                self.note_send_outcome(session_id, task_id, &sent, Some(&paused_manifest))?
+            {
+                return Ok(Err(stopped));
+            }
             let reply = match sent {
                 Ok(reply) => reply,
                 // The substitute never entered a send: a worker's own scope
@@ -1119,7 +1289,12 @@ impl Runtime {
         let scopes = self.budget_scopes(task_id)?;
         let sent = {
             let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
-            self.broker.dispatch(&mut ledger, &world, &manifest)
+            self.broker.dispatch_with_cancel(
+                &mut ledger,
+                &world,
+                &manifest,
+                foreground_signal(self.foreground.as_ref(), task_id),
+            )
         };
         // The refusal is known here, so the admission and its frozen inputs
         // are dropped before the fallible projection refresh can return early.
@@ -1132,7 +1307,11 @@ impl Runtime {
         if refused_attempt {
             self.broker.cancel_attempt(&manifest.attempt_id);
         }
-        self.note_send_outcome(session_id, task_id, &sent, Some(&manifest));
+        if let Some(stopped) =
+            self.note_send_outcome(session_id, task_id, &sent, Some(&manifest))?
+        {
+            return Ok(Err(stopped));
+        }
         match sent {
             Ok(reply) => {
                 self.provider_calls += 1;
@@ -1240,7 +1419,7 @@ impl Runtime {
         task_id: &TaskId,
         sent: &Result<ProviderReply, ModelError>,
         manifest: Option<&RequestManifest>,
-    ) {
+    ) -> Result<Option<StepOutcome>, ControllerError> {
         match sent {
             Err(ModelError::BudgetExhausted { scope }) => self.record_budget_wait(
                 session_id,
@@ -1257,6 +1436,14 @@ impl Runtime {
             self.boot_diagnostics
                 .push(format!("economy projection refresh failed: {error}"));
         }
+        if matches!(
+            sent,
+            Err(ModelError::AttemptCancelled { .. }
+                | ModelError::Provider(ProviderError::Interrupted { .. }))
+        ) {
+            return self.foreground_cancellation(session_id, task_id);
+        }
+        Ok(None)
     }
 
     /// Remembers the broker attempt this task is paused on so a later
@@ -1573,8 +1760,7 @@ impl Runtime {
         let inputs = serde_json::json!({
             "goal": String::from_utf8_lossy(&self.owner.store.goal_bytes(task)?),
             "tool_result": { "tool": "read_file", "path": display_path.to_string(), "text": text },
-        })
-        .to_string();
+        });
         let question = Question {
             question_id: QuestionId(format!(
                 "{FILE_SHARE_QUESTION}{}",
@@ -1661,7 +1847,7 @@ impl Runtime {
             session,
             task,
             &share.recipient,
-            &share.inputs,
+            &share.inputs.to_string(),
             &["read_file", crate::providers::WRITE_FILE_TOOL],
         )?;
         let (reply, attempt_id) = match result {
@@ -1742,9 +1928,16 @@ impl Runtime {
         let scopes = self.budget_scopes(task)?;
         let sent = {
             let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
-            self.broker.dispatch(&mut ledger, &world, &manifest)
+            self.broker.dispatch_with_cancel(
+                &mut ledger,
+                &world,
+                &manifest,
+                foreground_signal(self.foreground.as_ref(), task),
+            )
         };
-        self.note_send_outcome(session, task, &sent, Some(&manifest));
+        if let Some(stopped) = self.note_send_outcome(session, task, &sent, Some(&manifest))? {
+            return Ok(Err(stopped));
+        }
         let reply = sent?;
         self.provider_calls += 1;
         if let Some(cancelled) = self.foreground_cancellation(session, task)? {
@@ -1809,8 +2002,28 @@ impl Runtime {
             recommendation_basis: "A replacement requires explicit authorization.".to_string(),
         };
         let snapshot = self.owner.store.publish_question(session, &question)?;
+        let original = share
+            .inputs
+            .pointer("/tool_result/text")
+            .and_then(serde_json::Value::as_str);
+        let mut summary = format!(
+            "Original SHA-256 {}; {} proposed bytes (SHA-256 {digest}).",
+            share.digest,
+            text.len()
+        );
+        let preview = match preview::replacement(path, original, text) {
+            Ok(diff) => Some(diff),
+            Err(reason) => {
+                summary.push(' ');
+                summary.push_str(reason);
+                None
+            }
+        };
         self.file_write = Some(PendingFileWrite {
             question: question.question_id,
+            session: session.clone(),
+            summary,
+            preview,
             task: task.clone(),
             edit: crate::executor::ProjectEdit {
                 identity,
@@ -2067,8 +2280,7 @@ impl Runtime {
         if self.recipient_current(&pending.recipient) {
             let inputs = serde_json::json!({
                 "goal": String::from_utf8_lossy(&self.owner.store.goal_bytes(task)?),
-                "tool_result": { "tool": "run_check", "test": pending.selector, "exit_code": run.exit_code,
-                    "signal": run.signal, "summary": run.summary, "project_digest": run.project_digest },
+                "tool_result": { "tool": "run_check", "exit_code": run.exit_code, "signal": run.signal },
             }).to_string();
             match self.dispatch_tool_observation(session, task, &pending.recipient, &inputs, &[]) {
                 Ok(Ok((reply, _))) if !reply.text.trim().is_empty() => {
@@ -2526,9 +2738,8 @@ impl Runtime {
         })
     }
 
-    /// Derives the task's procedure segment from the plan that already ran and
-    /// saves it (AC-053). The segment is never authored here: the plan owner's
-    /// revision and the rows its handlers closed are the only inputs.
+    /// Saves the executed plan and its confirmed executor trace (AC-053).
+    /// Semantic plan rows remain readable but cannot authorize replay.
     ///
     /// # Errors
     /// The [`crate::procedure::ProcedureError`] refusals of a plan that never
@@ -2567,6 +2778,12 @@ impl Runtime {
     ) -> Result<SegmentStepOutcome, ControllerError> {
         use crate::procedure::{ProcedureError, SettledStep, StepOutcome, StepStanding, StopCause};
         let segment = self.owner.store.procedure_segment(procedure_id)?;
+        if segment.task_id != task_id.0 {
+            return Err(ProcedureError::SegmentMissing {
+                procedure_id: procedure_id.to_string(),
+            }
+            .into());
+        }
         let live = self.live_segment_snapshot(task_id)?;
         let mut run = self
             .owner
@@ -2589,6 +2806,9 @@ impl Runtime {
                         .owner
                         .store
                         .settle_procedure_step(&run.run_id, &prepared.settlement())?;
+                    if run.state == crate::procedure::RunState::Stopped {
+                        return self.receipt_mismatch_outcome(task_id, run);
+                    }
                 }
                 StepStanding::Unresolved => {
                     return self.stop_segment(
@@ -2622,18 +2842,36 @@ impl Runtime {
         if let Some(attempt_id) = self.owner.store.latest_unresolved_attempt(task_id)? {
             return self.stop_segment(task_id, &run, StopCause::UnknownEffect { attempt_id });
         }
-        if run.remainder(&segment).is_empty() {
+        if run.cursor == segment.steps.len() as u64 {
             let run = self.owner.store.complete_procedure_run(&run.run_id)?;
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(SegmentStepOutcome::Completed { run, snapshot });
         }
-        let step = segment.step(run.cursor + 1).cloned().ok_or({
-            ProcedureError::CursorPastSteps {
+        for candidate in segment
+            .steps
+            .iter()
+            .filter(|step| step.position > run.cursor)
+        {
+            let request =
+                binding
+                    .request(candidate.position)
+                    .ok_or(ProcedureError::UnboundParameter {
+                        position: candidate.position,
+                    })?;
+            if !candidate.accepts(request) {
+                return Err(ProcedureError::IncompatibleOperation {
+                    position: candidate.position,
+                }
+                .into());
+            }
+        }
+        let step = segment
+            .step(run.cursor + 1)
+            .ok_or_else(|| ProcedureError::CursorPastSteps {
                 procedure_id: segment.procedure_id.clone(),
                 cursor: run.cursor,
                 steps: u64::try_from(segment.steps.len()).unwrap_or(u64::MAX),
-            }
-        })?;
+            })?;
         let outcome = {
             let mut executor = self.executor();
             executor.run_segment_step(task_id, &segment, &run, binding, mode)
@@ -2663,7 +2901,7 @@ impl Runtime {
         };
         let settled = SettledStep {
             position: step.position,
-            tool: step.tool,
+            tool: step.tool.clone(),
             attempt_id,
             result,
         };
@@ -2671,12 +2909,29 @@ impl Runtime {
             .owner
             .store
             .settle_procedure_step(&run.run_id, &settled)?;
-        if run.remainder(&segment).is_empty() {
+        if run.state == crate::procedure::RunState::Stopped {
+            return self.receipt_mismatch_outcome(task_id, run);
+        }
+        if run.cursor == segment.steps.len() as u64 {
             let run = self.owner.store.complete_procedure_run(&run.run_id)?;
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(SegmentStepOutcome::Completed { run, snapshot });
         }
         Ok(SegmentStepOutcome::Stepped { run, step: settled })
+    }
+
+    fn receipt_mismatch_outcome(
+        &self,
+        task: &TaskId,
+        run: crate::procedure::ProcedureRun,
+    ) -> Result<SegmentStepOutcome, ControllerError> {
+        Ok(SegmentStepOutcome::Stopped {
+            cause: crate::procedure::StopCause::ReceiptMismatch {
+                position: run.cursor,
+            },
+            run,
+            snapshot: self.owner.store.snapshot(task)?,
+        })
     }
 
     /// The saved segment a task's executed plan names, when this run can start
@@ -2721,19 +2976,30 @@ impl Runtime {
         &self,
         segment: &crate::procedure::SegmentTemplate,
         grant_id: &str,
-    ) -> crate::procedure::SegmentBinding {
-        segment
+    ) -> Option<crate::procedure::SegmentBinding> {
+        // This entry point has one live input. Do not collapse distinct source
+        // parameters onto it, or substitute a read for another operation.
+        if segment
             .steps
             .iter()
-            .fold(crate::procedure::SegmentBinding::new(), |binding, step| {
-                binding.bind(
-                    step.position,
-                    EffectRequest::Read {
-                        grant_id: grant_id.to_string(),
-                        path: self.scoped_file.clone(),
-                    },
-                )
-            })
+            .any(|step| step.operation() != Some(EffectClass::Read) || step.source_input != Some(1))
+        {
+            return None;
+        }
+        Some(
+            segment
+                .steps
+                .iter()
+                .fold(crate::procedure::SegmentBinding::new(), |binding, step| {
+                    binding.bind(
+                        step.position,
+                        EffectRequest::Read {
+                            grant_id: grant_id.to_string(),
+                            path: self.scoped_file.clone(),
+                        },
+                    )
+                }),
+        )
     }
 
     /// Runs the remaining steps of a saved segment on this step path (AC-053):
@@ -2744,18 +3010,18 @@ impl Runtime {
         &mut self,
         session_id: &SessionId,
         task_id: &TaskId,
-        grant_id: &str,
+        binding: &crate::procedure::SegmentBinding,
         segment: &crate::procedure::SegmentTemplate,
     ) -> Result<StepOutcome, ControllerError> {
         use crate::procedure::{ProcedureError, RunStart};
-        let binding = self.segment_binding(segment, grant_id);
+        let procedure_id = &segment.procedure_id;
         loop {
             // The production step driver still inlines the interim `manual`
             // default (DEC-015) until the Settings surface lands.
             let step = self.run_procedure_step(
                 task_id,
-                &segment.procedure_id,
-                &binding,
+                procedure_id,
+                binding,
                 crate::policy::PermissionMode::Manual,
                 RunStart::Resume,
             );

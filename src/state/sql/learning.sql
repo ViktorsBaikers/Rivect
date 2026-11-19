@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS procedure_segments (
     steps TEXT NOT NULL
 ) STRICT;
 
+-- Only the executor attaches an attempt to a plan. Class and receipt remain in attempts.
+CREATE TABLE IF NOT EXISTS procedure_source_attempts (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL,
+    plan_revision INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_procedure_sources_plan
+    ON procedure_source_attempts(task_id, plan_revision);
+
 -- One row per run: `cursor` is the count of steps that settled, so a resume
 -- continues after the last settled step and never re-issues it (PROH-003).
 -- `snapshot_json` pins the state the segment was started under and `state`
@@ -76,6 +85,8 @@ CREATE TABLE IF NOT EXISTS procedure_runs (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_procedure_runs_procedure
     ON procedure_runs (procedure_id, procedure_version);
+CREATE INDEX IF NOT EXISTS idx_procedure_runs_task
+    ON procedure_runs (task_id, stop_condition);
 
 -- Routing feedback (AC-052, REQ-042, DEC-014): one append-only row per
 -- recorded attempt outcome. The cause class is closed (`sdk`, `docs`, `setup`,

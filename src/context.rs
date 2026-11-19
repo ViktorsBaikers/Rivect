@@ -15,8 +15,9 @@ use crate::index::{
     impact_traversal,
 };
 use crate::lsp::{
-    CandidateFile, DocumentPin, MAX_INDEX_PARSE_TIME, MAX_SYMBOL_FILE_BYTES, MAX_SYMBOL_ROWS,
-    SymbolIndex, SymbolOp, SymbolRequest, path_to_uri,
+    CandidateFile, DocumentPin, FileStamp, MAX_INDEX_PARSE_TIME, MAX_SYMBOL_FILE_BYTES,
+    MAX_SYMBOL_ROWS, ProjectionMode, SymbolIndex, SymbolOp, SymbolProjection, SymbolRequest,
+    SymbolWork, file_stamp, path_to_uri,
 };
 use ast_grep_core::matcher::{PatternBuilder, PatternNode, kind_utils};
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
@@ -509,13 +510,21 @@ pub fn query(request: &Query) -> Result<QueryResult, ContextError> {
 /// checks it (in its parse progress callback); the other legs run to
 /// completion, so the isolated run's wall-kill is what bounds them.
 pub fn query_until(request: &Query, deadline: Instant) -> Result<QueryResult, ContextError> {
+    query_using(request, deadline, None)
+}
+
+fn query_using(
+    request: &Query,
+    deadline: Instant,
+    projection: Option<&mut ProjectionExchange>,
+) -> Result<QueryResult, ContextError> {
     let root = validate(request)?;
     match backend_for(request.kind) {
         Some(SearchBackend::Text) => text_query(request, &root),
         Some(SearchBackend::Path) => path_query(request, &root),
         Some(SearchBackend::Source) => source_query(request, &root),
         Some(SearchBackend::Ast) => ast_query(request, &root),
-        Some(SearchBackend::Symbol) => symbol_query(request, &root, deadline),
+        Some(SearchBackend::Symbol) => symbol_query(request, &root, deadline, projection),
         Some(SearchBackend::Graph) => graph_query(request, &root, deadline),
         None => Err(ContextError::UnsupportedKind {
             kind: request.kind.as_str(),
@@ -610,14 +619,23 @@ fn observe_worker(
     run: &IsolatedRun<'_>,
     deadline: Instant,
     answer_cap: usize,
-    wire: &WorkerRequest,
+    mut wire: WorkerRequest,
 ) -> Result<WorkerBody, ContextError> {
     // JSON carries no non-UTF-8 path, and a request past the worker's
     // read bound is one it could only reject.
-    let payload = match serde_json::to_vec(wire) {
-        Ok(payload) if payload.len() <= WORKER_REQUEST_MAX => payload,
-        Ok(_) | Err(_) => return isolated_failure(IsolatedCause::RequestUnencodable),
-    };
+    let mut payload = Vec::new();
+    if serde_json::to_writer(&mut payload, &wire).is_err() {
+        return isolated_failure(IsolatedCause::RequestUnencodable);
+    }
+    if payload.len() > WORKER_REQUEST_MAX && wire.symbol_index.take().is_some() {
+        payload.clear();
+        if serde_json::to_writer(&mut payload, &wire).is_err() {
+            return isolated_failure(IsolatedCause::RequestUnencodable);
+        }
+    }
+    if payload.len() > WORKER_REQUEST_MAX {
+        return isolated_failure(IsolatedCause::RequestUnencodable);
+    }
     let mut observed_stop = None;
     let bounds = ObserveBounds {
         deadline: deadline.checked_add(WORKER_KILL_GRACE).unwrap_or(deadline),
@@ -703,12 +721,85 @@ fn observe_worker(
 /// exceeds what an answer can carry; [`ContextError::IsolatedRun`] with
 /// the classification branch that ended the run otherwise.
 pub fn query_isolated(request: &Query, run: &IsolatedRun<'_>) -> Result<QueryResult, ContextError> {
+    isolated_query(request, run, None).map(|(result, _work)| result)
+}
+
+type Producer = (FileStamp, FileStamp);
+type RetainedProjection = Option<(Producer, SymbolProjection)>;
+
+/// One runtime's disposable native symbol projection; never loaded from project files or RPC.
+#[derive(Default, Clone)]
+pub struct SymbolSession(std::sync::Arc<std::sync::Mutex<RetainedProjection>>);
+
+impl std::fmt::Debug for SymbolSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SymbolSession").finish_non_exhaustive()
+    }
+}
+
+impl SymbolSession {
+    /// Run an isolated query and report source bodies read and parsed by this worker.
+    ///
+    /// # Errors
+    /// Returns the same validation, worker and deadline errors as [`query_isolated`].
+    pub fn run(
+        &self,
+        request: &Query,
+        run: &IsolatedRun<'_>,
+    ) -> Result<(QueryResult, Option<SymbolWork>), ContextError> {
+        isolated_query(request, run, Some(self))
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, RetainedProjection> {
+        // The optional slot is transferred in one move; a lost cache is never source evidence.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn isolated_query(
+    request: &Query,
+    run: &IsolatedRun<'_>,
+    session: Option<&SymbolSession>,
+) -> Result<(QueryResult, Option<SymbolWork>), ContextError> {
     let deadline = effective_deadline(run)?;
     let answer_cap = run.answer_cap.min(WORKER_ANSWER_MAX);
     refuse_uncarriable_limit(request, answer_cap)?;
-    let wire = query_request(request, deadline, answer_cap);
-    match observe_worker(run, deadline, answer_cap, &wire)? {
-        WorkerBody::Answer { result } => Ok(result),
+    let mut wire = query_request(request, deadline, answer_cap);
+    let producer = session
+        .filter(|_| request.kind == QueryKind::Symbol)
+        .and_then(|_| {
+            Some((
+                file_stamp(&run.program.metadata().ok()?),
+                file_stamp(&run.helper.metadata().ok()?),
+            ))
+        });
+    if let (Some(session), Some(producer)) = (session, producer) {
+        wire.retain_symbols = true;
+        let previous = session.slot().take();
+        if let Some((old, index)) = previous
+            && old == producer
+            && request
+                .root
+                .canonicalize()
+                .is_ok_and(|root| index.for_root(&root))
+        {
+            wire.symbol_index = Some(index);
+        }
+    }
+    match observe_worker(run, deadline, answer_cap, wire)? {
+        WorkerBody::Answer {
+            result,
+            symbol_index,
+            symbol_work,
+        } => {
+            if let (Some(session), Some(producer), Some(index)) = (session, producer, symbol_index)
+            {
+                *session.slot() = Some((producer, index));
+            }
+            Ok((result, symbol_work))
+        }
         // A body this call did not ask for is a protocol mismatch, not
         // an answer: the worker cannot answer one request with another.
         WorkerBody::Project { .. } | WorkerBody::Refused { .. } => {
@@ -750,10 +841,12 @@ pub fn project_index_isolated(
         crate_version: env!("CARGO_PKG_VERSION").to_string(),
         query: None,
         project: Some(request.clone()),
+        retain_symbols: false,
+        symbol_index: None,
         deadline_ms: wire_millis(deadline),
         answer_cap,
     };
-    match observe_worker(run, deadline, answer_cap, &wire)? {
+    match observe_worker(run, deadline, answer_cap, wire)? {
         WorkerBody::Project { graph } => Ok(graph),
         WorkerBody::Answer { .. } | WorkerBody::Refused { .. } => {
             isolated_failure(IsolatedCause::WorkerProtocol)
@@ -773,6 +866,8 @@ fn query_request(request: &Query, deadline: Instant, answer_cap: usize) -> Worke
         crate_version: env!("CARGO_PKG_VERSION").to_string(),
         query: Some(request.clone()),
         project: None,
+        retain_symbols: false,
+        symbol_index: None,
         deadline_ms: wire_millis(deadline),
         answer_cap,
     }
@@ -936,6 +1031,10 @@ struct WorkerRequest {
     crate_version: String,
     query: Option<Query>,
     project: Option<ProjectRequest>,
+    #[serde(default)]
+    retain_symbols: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symbol_index: Option<SymbolProjection>,
     deadline_ms: u64,
     answer_cap: usize,
 }
@@ -1003,12 +1102,14 @@ struct WorkerEnvelope {
 enum WorkerBody {
     Answer {
         result: QueryResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol_index: Option<SymbolProjection>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol_work: Option<SymbolWork>,
     },
     /// One derived project generation (SLICE-032): the edges it
     /// observed, its coverage, and the specifiers it could not place.
-    Project {
-        graph: ProjectGraph,
-    },
+    Project { graph: ProjectGraph },
     /// The engine's own typed refusal.
     Failed {
         code: ErrorCode,
@@ -1016,9 +1117,7 @@ enum WorkerBody {
         message: String,
     },
     /// The worker would not serve the request at all.
-    Refused {
-        reason: WorkerRefusal,
-    },
+    Refused { reason: WorkerRefusal },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1050,11 +1149,26 @@ pub fn serve_index_worker(mut input: impl Read, mut output: impl Write) -> io::R
         io::copy(&mut input, &mut io::sink())?;
     }
     let (body, answer_cap) = worker_answer(&bytes);
-    let mut encoded = serde_json::to_vec(&WorkerEnvelope {
+    let mut envelope = WorkerEnvelope {
         protocol: WORKER_PROTOCOL,
         crate_version: env!("CARGO_PKG_VERSION").to_string(),
         body,
-    })?;
+    };
+    let mut encoded = serde_json::to_vec(&envelope)?;
+    if let WorkerBody::Answer {
+        symbol_index,
+        symbol_work,
+        ..
+    } = &mut envelope.body
+        && (encoded.len() > answer_cap || encoded.len() > WORKER_REQUEST_MAX / 2)
+        && (symbol_index.take().is_some() || symbol_work.is_some())
+    {
+        if encoded.len() > answer_cap {
+            *symbol_work = None;
+        }
+        encoded.clear();
+        serde_json::to_writer(&mut encoded, &envelope)?;
+    }
     encoded.truncate(answer_cap.saturating_add(1));
     output.write_all(&encoded)?;
     output.flush()
@@ -1315,7 +1429,7 @@ fn worker_answer(request: &[u8]) -> (WorkerBody, usize) {
     if !memory_capped() {
         return refused(WorkerRefusal::Uncapped);
     }
-    let Some(request) = serde_json::from_slice::<WireHeader>(request)
+    let Some(mut request) = serde_json::from_slice::<WireHeader>(request)
         .ok()
         .filter(|header| {
             header.protocol == WORKER_PROTOCOL && header.crate_version == env!("CARGO_PKG_VERSION")
@@ -1331,10 +1445,20 @@ fn worker_answer(request: &[u8]) -> (WorkerBody, usize) {
     // Exactly one request kind, or the message is not one this worker
     // serves: a run that asks for both, or for neither, is refused
     // rather than answered with whichever half parsed.
+    let mut exchange = ProjectionExchange {
+        index: request.symbol_index.take(),
+        work: None,
+    };
     let body = match (request.query.as_ref(), request.project.as_ref()) {
-        (Some(query), None) => match query_until(query, deadline) {
+        (Some(query), None) => match if request.retain_symbols && query.kind == QueryKind::Symbol {
+            query_using(query, deadline, Some(&mut exchange))
+        } else {
+            query_until(query, deadline)
+        } {
             Ok(result) => WorkerBody::Answer {
                 result: without_unencodable_paths(result),
+                symbol_index: exchange.index,
+                symbol_work: exchange.work,
             },
             Err(error) => WorkerBody::Failed {
                 code: error.error_code(),
@@ -2404,9 +2528,8 @@ const MAX_SYMBOL_PATTERN_BYTES: usize = 1024;
 /// walk is the same ignore/scope-filtered pass the other legs run; a
 /// file no grammar claims is counted `UnsupportedLanguage` and joins
 /// the literal-hint fallback (labelled `MatchKind::Text`, non-exact by
-/// construction — never a reference). The index is rebuilt from a live
-/// scan per query, so the result is stamped `Live`; document identity
-/// rides each row's `version`. A pinned document resolves like
+/// construction — never a reference). The worker enumerates live paths;
+/// a retained document must match its current file identity. A pinned document resolves like
 /// `source.slice` — escapes are denied — and must name an indexed
 /// document: otherwise it is reported `unresolved` (or `EntriesFailed`
 /// when it was claimed but failed), or refused when a version was
@@ -2417,6 +2540,7 @@ fn symbol_query(
     request: &Query,
     root: &Path,
     deadline: Instant,
+    mut projection: Option<&mut ProjectionExchange>,
 ) -> Result<QueryResult, ContextError> {
     let Some(op) = request.symbol_op else {
         return Err(ContextError::SymbolOpRequired);
@@ -2478,18 +2602,23 @@ fn symbol_query(
     }
 
     let mut files = Candidates::new(root, request.ignore, scope);
-    let index = SymbolIndex::build(
-        root,
-        files.by_ref(),
-        SymbolRequest {
-            name,
-            scope: qualified_scope,
-            op,
-            document: document_uri.as_ref(),
-            limit: request.limit,
-        },
-        Some(deadline),
-    );
+    let symbol = SymbolRequest {
+        name,
+        scope: qualified_scope,
+        op,
+        document: document_uri.as_ref(),
+        limit: request.limit,
+    };
+    let index = match projection.as_deref_mut() {
+        Some(exchange) => SymbolIndex::build_reusing(
+            root,
+            files.by_ref(),
+            symbol,
+            Some(deadline),
+            ProjectionMode::Retain(exchange.index.take()),
+        ),
+        None => SymbolIndex::build(root, files.by_ref(), symbol, Some(deadline)),
+    };
 
     // A pin must name an indexed document, and a version pin binds only
     // when it equals the indexed version — serving another version's
@@ -2569,7 +2698,16 @@ fn symbol_query(
         });
     }
     result.completeness = Completeness::from_reasons(reasons);
+    if let Some(exchange) = projection {
+        exchange.work = Some(index.work);
+        exchange.index = index.into_projection();
+    }
     Ok(result)
+}
+
+struct ProjectionExchange {
+    index: Option<SymbolProjection>,
+    work: Option<SymbolWork>,
 }
 
 /// A version pinned on a document the index does not hold cannot be

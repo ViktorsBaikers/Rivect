@@ -27,7 +27,7 @@
 
 mod support;
 
-use rivect::contracts::{RELEASE_MANIFEST_NAME, ReleaseManifest};
+use rivect::contracts::{RELEASE_MANIFEST_NAME, RELEASE_MANIFEST_SCHEMA_V2, ReleaseManifest};
 use rivect::executor::verify_release_bundle;
 use rivect::verification::{
     FINAL_PROVIDER_ROWS, PROVIDER_ROWS as CANONICAL_PROVIDER_ROWS, SEARCH_SERVICES,
@@ -37,6 +37,108 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
+
+#[test]
+fn managed_install_refuses_external_helper_and_reports_missing_metadata() {
+    const TEST: &str = "managed_install_refuses_external_helper_and_reports_missing_metadata";
+    if std::env::var_os("RIVECT_MANAGED_PROBE").is_some() {
+        assert!(rivect_sandbox_helper::helper_binary().is_err());
+        assert!(rivect_sandbox_helper::owned_helper_binary().is_err());
+        let exe = std::env::current_exe().expect("probe executable");
+        let bundle = exe.parent().expect("bundle");
+        let helper = bundle.join("rivect-sandbox-helper");
+        std::fs::copy("/usr/bin/true", &helper).expect("initial helper");
+        assert_eq!(
+            rivect_sandbox_helper::helper_binary().expect("sibling"),
+            helper
+        );
+        let manifest = bundle.join(RELEASE_MANIFEST_NAME);
+        let libexec = bundle.join("libexec");
+        std::fs::create_dir(&libexec).expect("fixture libexec");
+        let ui = "libexec/rivect-tui";
+        let library = if cfg!(target_os = "macos") {
+            "libexec/libopentui.dylib"
+        } else {
+            "libexec/libopentui.so"
+        };
+        // Verification hashes these fixture files; the probe never launches the UI.
+        std::fs::copy("/usr/bin/true", bundle.join(ui)).expect("fixture UI");
+        std::fs::write(bundle.join(library), b"fixture library").expect("fixture library");
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": RELEASE_MANIFEST_SCHEMA_V2, "build": "probe",
+            "executable": {"name": "rivect", "sha256": support::release::sha256_file(&exe)},
+            "helper": {"name": "rivect-sandbox-helper", "sha256": support::release::sha256_file(&helper)},
+            "ui": {"name": ui, "sha256": support::release::sha256_file(&bundle.join(ui))},
+            "library": {"name": library, "sha256": support::release::sha256_file(&bundle.join(library))}
+        }))
+        .expect("manifest bytes");
+        std::fs::write(&manifest, bytes).expect("manifest");
+        assert!(matches!(
+            verify_release_bundle(bundle),
+            Err(rivect::executor::ReleaseError::Artifact {
+                name: "manifest receipt",
+                ..
+            })
+        ));
+        let receipt = bundle.with_added_extension("manifest.sha256");
+        std::fs::write(
+            &receipt,
+            format!("{}\n", support::release::sha256_file(&manifest)),
+        )
+        .expect("install receipt");
+        verify_release_bundle(bundle).expect("the unmodified probe bundle verifies");
+        let launch = rivect::executor::helper_confined_command(std::env::consts::OS, "read", "")
+            .expect("prepare helper launch");
+        std::fs::copy("/usr/bin/false", &helper).expect("change helper after preparation");
+        assert!(matches!(
+            launch.run(&[]),
+            Err(rivect::executor::WorkerError::SandboxSpawnFailed { source })
+                if matches!(source.get_ref().and_then(|error| error.downcast_ref()),
+                    Some(rivect::executor::ReleaseError::Digest { name: "rivect-sandbox-helper" }))
+        ));
+        std::fs::remove_file(receipt).expect("remove receipt");
+        std::fs::remove_file(manifest).expect("remove manifest");
+        std::fs::remove_dir_all(libexec).expect("remove fixture libexec");
+        return;
+    }
+    let temp = tempfile::tempdir().expect("fixture root");
+    let releases = temp.path().join(".local/share/rivect/releases");
+    let bundle = releases.join("a".repeat(64));
+    std::fs::create_dir_all(&bundle).expect("managed layout");
+    let exe = bundle.join("rivect");
+    let external = releases.join("rivect-sandbox-helper");
+    std::fs::write(&external, b"outside package").expect("parent candidate");
+    std::fs::copy(std::env::current_exe().expect("test executable"), &exe).expect("copy probe");
+    let probe = Command::new(&exe)
+        .args(["--exact", TEST])
+        .env_clear()
+        .env("RIVECT_MANAGED_PROBE", "1")
+        .env("RIVECT_SANDBOX_HELPER", external)
+        .output()
+        .expect("run probe");
+    assert!(
+        probe.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    std::fs::remove_file(&exe).expect("remove probe");
+    std::fs::copy(env!("CARGO_BIN_EXE_rivect"), &exe).expect("copy doctor");
+    let report = Command::new(exe)
+        .args(["doctor", "--data-root"])
+        .arg(temp.path().join("fresh"))
+        .env_clear()
+        .output()
+        .expect("run doctor");
+    let report: Value = serde_json::from_slice(&report.stdout).expect("doctor JSON");
+    assert!(
+        report["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .any(|check| check["name"] == "release" && check["state"] == "degraded")
+    );
+}
 
 /// The 78 recorded provider rows, in canonical provider-table order, with the
 /// dialect the installed build must answer for each.
@@ -182,6 +284,14 @@ fn run_packaged_frames(bundle: &Path, cwd: &Path, args: &[&str], frames: &[Value
             command.env(name, value);
         }
     }
+    // Without an explicit address zbus probes the host user bus, not the CI fixture.
+    // Local offline runs must not query a developer's login keyring either.
+    #[cfg(target_os = "linux")]
+    command.env(
+        "DBUS_SESSION_BUS_ADDRESS",
+        std::env::var_os("RIVECT_TEST_DBUS_ADDRESS")
+            .unwrap_or_else(|| "unix:path=/dev/null".into()),
+    );
     let mut child = command.spawn().expect("spawn the packaged rivect");
     {
         let mut stdin = child.stdin.take().expect("packaged stdin");
@@ -273,6 +383,14 @@ fn installed_artifact_answers_80_provider_and_alias_rows() {
         "the manifest digest is the bytes on disk"
     );
     assert_eq!(manifest.executable.sha256, activation.executable_sha256);
+    assert_eq!(manifest.schema_version, RELEASE_MANIFEST_SCHEMA_V2);
+    for artifact in [&manifest.ui, &manifest.library] {
+        let artifact = artifact.as_ref().expect("required v2 component");
+        assert_eq!(
+            artifact.sha256,
+            support::release::sha256_file(&bundle.join(&artifact.name))
+        );
+    }
     println!("installed manifest sha256: {}", activation.manifest_sha256);
 
     let data = root.path().join("data root юникод");
@@ -1055,6 +1173,9 @@ fn installed_ordinary_request_reports_a_shared_read_with_two_settlements() {
     command.arg("--data-root");
     command.arg(&data);
     command.cwd(&cwd);
+    command.env("HOME", root.path());
+    command.env("TMPDIR", root.path());
+    command.env("TERM", "xterm-256color");
     let mut pty = support::PtySession::spawn(command, 24, 80, root, data.clone())
         .expect("spawn the packaged TUI");
     assert!(
@@ -1062,38 +1183,35 @@ fn installed_ordinary_request_reports_a_shared_read_with_two_settlements() {
             .expect("pty read"),
         "the packaged TUI enters the alternate screen"
     );
-    pty.send("run the installed task\r".as_bytes())
-        .expect("pty send");
-    let card =
-        support::wait_for_screen_text(&pty, 24, 80, "awaiting decision", Duration::from_secs(10))
-            .expect("start card");
-    assert!(card.contains("awaiting decision"), "{card}");
+    support::visible_text(&pty, 24, 80, "Message", Duration::from_secs(10));
+    pty.send(b"/task run the installed task\r")
+        .expect("submit installed project task");
+    support::visible_text(
+        &pty,
+        24,
+        80,
+        "Begin the first step",
+        Duration::from_secs(10),
+    );
     // The card's first frame flushes only while the harness drains the PTY;
     // the consent floor runs from that completed paint. A bare sleep stalls
     // the flush and lands the Enter inside the floor, so pump past it.
     pty.pump_for(Duration::from_secs(2))
         .expect("pump past the decision consent floor");
-    pty.send(b"\r").expect("pty send enter");
-    let share =
-        support::wait_for_screen_text(&pty, 24, 80, "Share inventory.txt", Duration::from_secs(10))
-            .expect("sharing card");
-    assert!(share.contains("Share inventory.txt"), "{share}");
+    support::confirm_witness(&mut pty);
+    support::visible_text(&pty, 24, 80, "Share inventory.txt", Duration::from_secs(10));
     assert_eq!(peer.requests(), 1, "the content has not been sent yet");
     pty.pump_for(Duration::from_secs(2)).expect("consent floor");
-    pty.send(b"\x1b[B\r").expect("share once");
+    pty.send(b"j").expect("focus share once");
+    support::visible_text(&pty, 24, 80, "focus 2/", Duration::from_secs(10));
+    pty.pump_for(rivect::ui::DECISION_CONSENT_DELAY)
+        .expect("the newly selected disclosure row is readable");
+    support::confirm_witness(&mut pty);
     let response = "I read the installed project sample.";
-    let screen = support::wait_for_screen_text(&pty, 24, 80, response, Duration::from_secs(10))
-        .expect("model report");
-    assert!(screen.contains(response), "{screen}");
+    support::visible_text(&pty, 24, 80, response, Duration::from_secs(10));
     pty.send(b"\x1b").expect("pty send exit");
-    // The packaged TUI queries the cursor position while restoring; the
-    // deaf live waits never answered, so the exit wait plays terminal.
-    let mut cursor_at = 0usize;
     assert_eq!(
-        pty.wait_exit_answering(Duration::from_secs(10), |bytes| {
-            support::cursor_query_reply(&mut cursor_at, bytes)
-        })
-        .expect("pty wait"),
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
         Some(0)
     );
     let db = data.join("runtime").join("rivect.db");

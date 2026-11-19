@@ -767,9 +767,8 @@ pub struct DeliveryReceipt {
 /// The manifest's own schema: the bundle format the activation check reads.
 /// It is versioned separately from the runtime [`SCHEMA_VERSION`] so a wire
 /// addition cannot silently re-mean an installed artifact.
-pub const RELEASE_MANIFEST_SCHEMA: u32 = 1;
-/// The exact installed inventory: the executable, the confined helper beside
-/// it, and this manifest. No data-resource artifact is shipped.
+pub const RELEASE_MANIFEST_SCHEMA_V2: u32 = 2;
+/// File name of the installed core executable.
 pub const RELEASE_EXECUTABLE_NAME: &str = "rivect";
 pub const RELEASE_HELPER_NAME: &str = "rivect-sandbox-helper";
 pub const RELEASE_MANIFEST_NAME: &str = "rivect.manifest.json";
@@ -786,7 +785,7 @@ pub struct ReleaseArtifact {
 }
 
 /// The release receipt one authentic bundle carries: the build it was cut
-/// from and the two shipped artifacts' digests. The manifest's own byte
+/// from and the four shipped artifacts' digests. The manifest's own byte
 /// digest, not a field here, is the activation identity installed producers
 /// bind to — a manifest cannot name itself without an unverifiable fixed
 /// point.
@@ -798,6 +797,12 @@ pub struct ReleaseManifest {
     pub build: String,
     pub executable: ReleaseArtifact,
     pub helper: ReleaseArtifact,
+    // Decode omissions so the verifier can distinguish an unsupported schema
+    // from an incomplete v2 inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<ReleaseArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<ReleaseArtifact>,
 }
 
 /// What one authentic bundle activates: the manifest digest that binds

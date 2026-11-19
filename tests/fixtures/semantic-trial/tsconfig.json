@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "strict": true, "target": "esnext", "module": "esnext", "moduleResolution": "bundler", "jsx": "preserve", "noEmit": true, "types": [] },
+  "files": ["model.ts", "barrel.ts", "app.tsx"]
+}

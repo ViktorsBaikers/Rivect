@@ -2030,7 +2030,9 @@ mod tests {
             unreachable!("a loopback peer is required");
         };
         let sources = metadata_sources(&peer.base);
-        let budget = ResolutionBudget::at(Instant::now() + Duration::from_secs(10));
+        // Parallel resolutions share a lock; this test measures the real HTTP leg, not its queue.
+        let paused = Instant::now();
+        let budget = ResolutionBudget::with_clock(paused + Duration::from_secs(10), move || paused);
 
         let result = resolve_within("vertex", &sources, &budget);
 

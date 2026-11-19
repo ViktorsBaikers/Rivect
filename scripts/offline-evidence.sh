@@ -195,8 +195,9 @@ while IFS='	' read -r case_id provider marker expected oracles observation; do
         unserved)
             case $case_id in
                 TP-PROVIDER-AUTH::cursor | TP-PROVIDER-WIRE::cursor | TP-PROVIDER-RECOVERY::cursor | TP-PROVIDER-AUTH::devin | TP-PROVIDER-WIRE::devin | TP-PROVIDER-RECOVERY::devin) ;;
+                A36) [ "$marker" = 'PACKAGE_SIZE_MEASUREMENT' ] || exit 2 ;;
                 *)
-                    printf 'unserved is recorded only for the six cursor/devin rows: %s\n' "$case_id" >&2
+                    printf 'unsupported unserved row: %s\n' "$case_id" >&2
                     exit 2
                     ;;
             esac
@@ -302,6 +303,15 @@ while IFS= read -r target; do
         if [ "$first" = 1 ] && ! grep -Fq -- "$marker" "$output"; then
             printf 'marker is absent from target %s output: %s\n' "$target" "$marker" >&2
             exit 1
+        fi
+        if [ "$case_id" = A36 ] && [ "$first" = 1 ]; then
+            [ "$expected" = unserved ] && [ "$oracle" = 'measurement::v2_installed_package_measurement' ] || exit 1
+            sed -n 's/^PACKAGE_SIZE_MEASUREMENT //p' "$output" | jq -se --arg hash "$bundle_digest" '
+                length == 1 and .[0].schema_version == 1 and .[0].v2.manifest_sha256 == $hash and
+                .[0].ac003.status == "NOT_RUN" and
+                .[0].ac003.prerequisite == "v2 has no approved AC-003 budget"' >/dev/null || {
+                printf 'missing candidate-bound v2 budget prerequisite\n' >&2; exit 1
+            }
         fi
         printf '%s\n' "$case_id" >>"$tmp/cases.raw"
     done <"$tmp/oracles.tsv"

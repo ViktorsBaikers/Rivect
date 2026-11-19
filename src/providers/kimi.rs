@@ -27,7 +27,7 @@ use super::login_common::{self, BindingError, CommonError};
 use super::sse::{MAX_STREAM_BYTES, SseEvent, SseParser};
 use super::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, WireAuth, bounded_reason, check_deadline, read_chunk,
+    SecretRef, WireAuth, bounded_reason, check_deadline, read_chunk,
     resolve_admitted_credential_in, retain_lineage_epoch, retire_displaced_epochs, sse, transport,
     transport_status, violation, wire_body,
 };
@@ -1230,22 +1230,7 @@ impl KimiProvider {
             body["reasoning_effort"] = json!(value.name());
         }
         if !manifest.tools.is_empty() {
-            body["tools"] = Value::Array(
-                manifest
-                    .tools
-                    .iter()
-                    .map(|name| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "description": "",
-                                "parameters": { "type": "object" },
-                            },
-                        })
-                    })
-                    .collect(),
-            );
+            body["tools"] = super::ToolFormat::Chat.tools(CONNECTION, &manifest.tools)?;
         }
         Ok(body)
     }
@@ -1322,7 +1307,7 @@ impl Provider for KimiProvider {
                     model_id: model.clone(),
                 };
                 let binding = self.codec.binding(manifest, &model);
-                let body = self.codec.request_body(manifest, &fixed, &binding);
+                let body = self.codec.request_body(manifest, &fixed, &binding)?;
                 let bytes = wire_body(&self.connection, &body)?;
                 check_deadline(&self.connection, self.deadline, started)?;
                 let deadline = self.deadline;
@@ -1435,38 +1420,12 @@ impl KimiProvider {
         let usage = chat_usage(state.usage.as_ref())?;
         let mut tool_calls = Vec::with_capacity(state.blocks.len());
         for block in std::mem::take(&mut state.blocks) {
-            let Some(name) = block.name.filter(|name| !name.is_empty()) else {
-                return Err(violation(
-                    &self.connection,
-                    "a tool_call block never carried a function name",
-                ));
-            };
-            if !manifest.tools.iter().any(|declared| declared == &name) {
-                return Err(ProviderError::IncompatibleOutput {
-                    connection: self.connection.clone(),
-                    reason: bounded_reason(format!("tool_call names undeclared tool {name}")),
-                });
-            }
-            let path = if block.args.is_empty() {
-                None
-            } else {
-                let args: Value = serde_json::from_str(&block.args).map_err(|_parse| {
-                    violation(&self.connection, "a tool_call's arguments did not parse")
-                })?;
-                let Some(args) = args.as_object() else {
-                    return Err(violation(
-                        &self.connection,
-                        "a tool_call's arguments are not an object",
-                    ));
-                };
-                args.get("path").and_then(Value::as_str).map(str::to_string)
-            };
-            tool_calls.push(ToolCall {
-                tool: name,
-                path,
-                text: None,
-                test: None,
-            });
+            tool_calls.push(super::decode_chat_tool(
+                manifest,
+                &self.connection,
+                block.name,
+                &block.args,
+            )?);
         }
         self.commit_chat(manifest, model, &state);
         Ok(ProviderReply {

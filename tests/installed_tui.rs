@@ -15,10 +15,6 @@
 //! records no answer, no preapproval and no provider call. Screenshot or file
 //! presence is never used as interaction proof.
 //!
-//! The packaged artifact cannot be made to panic through any public input:
-//! the panic leg therefore runs the same production `TerminalGuard` in this
-//! test binary's ignored child and is reported as `test-child`, never as a
-//! packaged PASS.
 
 #![allow(
     clippy::expect_used,
@@ -34,18 +30,13 @@
 
 mod support;
 
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
-use rivect::contracts::{EffectClass, Question, TaskId};
-use rivect::policy::{ModeDecision, preapproval_scope};
-use rivect::resources::{OutputSettlement, OutputStream};
-use rivect::ui::{
-    DECISION_COMPOSER_PAUSED, DecisionPanel, LocalView, PANEL_COMPOSER_PAUSED, PermissionPanel,
-    RenderMode, TerminalGuard, initial_view, task_dock,
-};
+use rivect::contracts::{Lifecycle, MODEL_WIRE_MAX_BYTES, SessionId, TaskId};
+use rivect::state::TaskStore;
+use rivect::ui::{RenderMode, task_dock};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const STATES: usize = 19;
@@ -76,6 +67,8 @@ const LIVE_WORKERS: usize = 2;
 /// A settled live-resize frame may take longer than an ordinary first paint,
 /// and load stretches both; the deadline still fails a resize that never lands.
 const LIVE_RESIZE_WAIT: Duration = Duration::from_secs(60);
+
+const DECISION_UNANSWERED: &str = "Unanswered; question stays pending";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Geometry {
@@ -171,58 +164,65 @@ impl InputMode {
     }
 }
 
+const STATUS: &str = "Rivect · not connected · /help for help";
+const EMPTY_DOCK: &str = "No tasks. Login is a separate explicit action.";
+const INPUT: &str = "Input is available. Enter a task or a clarification.";
+const NO_PROJECT: &str = "No project or index is selected; ordinary replies are not blocked.";
+
+struct ExpectedReview {
+    dock: Vec<String>,
+    transcript: Vec<String>,
+    composer: String,
+}
+
+fn initial_view() -> ExpectedReview {
+    ExpectedReview {
+        dock: vec![EMPTY_DOCK.into()],
+        transcript: vec![INPUT.into(), NO_PROJECT.into()],
+        composer: String::new(),
+    }
+}
+
 struct StateFixture {
     name: &'static str,
-    view: LocalView,
-    needles: Vec<&'static str>,
-    /// The status line's visible token.
-    status: String,
-    /// The first painted dock row (the economy row when no task rows exist).
+    needles: &'static [&'static str],
     dock_probe: String,
-    /// The composer row's full text, paused marker included.
+    transcript_probe: String,
     composer_label: String,
-    /// Whether the state paints a modal border.
     modal: bool,
 }
 
 impl StateFixture {
-    fn new(name: &'static str, view: LocalView, needles: &[&'static str]) -> Self {
-        let reviewed = rivect::ui::review::ReviewState::view(name)
-            .unwrap_or_else(|| panic!("review entry carries no state {name}"));
+    fn new(
+        name: &'static str,
+        mut expected: ExpectedReview,
+        needles: &'static [&'static str],
+    ) -> Self {
+        let data = rivect::ui::review::projection(name).expect("known review state");
+        let modal = matches!(name, "awaiting-permission" | "awaiting-decision");
+        assert_eq!(data["status"], STATUS, "{name}: status");
+        assert_eq!(data["composer"], expected.composer, "{name}: composer");
+        let tasks = expected.dock.len().saturating_sub(1);
+        if tasks > 3 {
+            expected.dock.insert(2, format!("+{} more", tasks - 2));
+        }
+        assert_eq!(data["dock"], json!(expected.dock), "{name}: dock");
         assert_eq!(
-            view.status, reviewed.status,
-            "the PTY fixture and the packaged review view share a status: {name}"
-        );
-        assert_eq!(view.dock, reviewed.dock, "{name}: dock");
-        assert_eq!(view.transcript, reviewed.transcript, "{name}: transcript");
-        assert_eq!(view.composer, reviewed.composer, "{name}: composer");
-        assert_eq!(
-            view.decision.is_some(),
-            reviewed.decision.is_some(),
-            "{name}: decision presence"
+            data["lines"],
+            json!(expected.transcript),
+            "{name}: transcript"
         );
         assert_eq!(
-            view.panel.is_some(),
-            reviewed.panel.is_some(),
-            "{name}: panel presence"
+            !data["panel"].as_array().expect("panel rows").is_empty(),
+            modal,
+            "{name}: modal"
         );
-        let status = view.status.clone();
-        let dock_probe = view.dock.first().cloned().unwrap_or_default();
-        let composer_label = if view.decision.is_some() {
-            format!("> {DECISION_COMPOSER_PAUSED}")
-        } else if view.panel.is_some() {
-            format!("> {PANEL_COMPOSER_PAUSED}")
-        } else {
-            format!("> {}", view.composer)
-        };
-        let modal = view.decision.is_some() || view.panel.is_some();
         Self {
             name,
-            view,
-            needles: needles.to_vec(),
-            status,
-            dock_probe,
-            composer_label,
+            needles,
+            dock_probe: expected.dock.remove(0),
+            transcript_probe: expected.transcript.remove(0),
+            composer_label: format!("> {}", expected.composer).trim_end().to_owned(),
             modal,
         }
     }
@@ -244,11 +244,7 @@ fn status_with_tasks(tasks: &[(&str, &str, Option<&str>)], economy: Value) -> Va
 
 fn state_fixture(state: usize) -> StateFixture {
     match state {
-        // The two start states are the same production frame: the runtime
-        // projects no project or index fact, so the seeded views and their
-        // status/dock/transcript are identical. They stay distinct cells
-        // because the design brief names both states, not because the
-        // packaged artifact paints them differently.
+        // Both review IDs intentionally start with the same disconnected facts.
         0 => StateFixture::new(
             "start-no-connection",
             initial_view(),
@@ -274,12 +270,12 @@ fn state_fixture(state: usize) -> StateFixture {
         }
         3 => {
             let mut view = initial_view();
-            let mut output = OutputStream::new();
-            output.push_chunk(b"streaming marker line\n");
-            for _ in 0..120 {
-                output.push_chunk(b"long tool output line\n");
-            }
-            view.replace_output(output);
+            view.transcript
+                .push("PgUp/PgDn scroll · output · streaming".into());
+            view.transcript.push(format!(
+                "streaming marker line\n{}",
+                "long tool output line\n".repeat(120)
+            ));
             StateFixture::new(
                 "streaming-long-output",
                 view,
@@ -314,10 +310,7 @@ fn state_fixture(state: usize) -> StateFixture {
         }
         5 => {
             let mut view = initial_view();
-            view.decision = Some(DecisionPanel::new(Question::fixture(
-                &TaskId("task-1".to_string()),
-                1,
-            )));
+            view.composer = "[input paused: answer the decision card]".into();
             StateFixture::new(
                 "awaiting-decision",
                 view,
@@ -326,18 +319,7 @@ fn state_fixture(state: usize) -> StateFixture {
         }
         6 => {
             let mut view = initial_view();
-            let scope = format!(
-                "{}/workflow-scope/deep/nested/directory-tree/permission-grant-boundary-with-a-deliberately-long-tail-suffix",
-                "/tmp/installed-tui"
-            );
-            view.panel = Some(PermissionPanel::new(
-                ModeDecision::Ask,
-                EffectClass::Write,
-                "grant-installed-tui",
-                "task-170-fixture",
-                "2036-01-01T00:00:00Z",
-                scope,
-            ));
+            view.composer = "[input paused: answer the permission panel]".into();
             StateFixture::new(
                 "awaiting-permission",
                 view,
@@ -425,13 +407,11 @@ fn state_fixture(state: usize) -> StateFixture {
         }
         10 => {
             let mut view = initial_view();
-            let mut output = OutputStream::new();
-            output.push_chunk(b"partial body\n");
-            output.settle(OutputSettlement::Partial {
-                cause: "connection lost".to_string(),
-            });
-            view.replace_output(output);
-            view.dock_stale = Some("dock refresh failed: offline".to_string());
+            view.transcript.extend([
+                "PgUp/PgDn scroll · output · partial: connection lost".into(),
+                "partial body\n".into(),
+                "dock refresh failed: offline".into(),
+            ]);
             StateFixture::new(
                 "error-offline-partial",
                 view,
@@ -442,9 +422,7 @@ fn state_fixture(state: usize) -> StateFixture {
             )
         }
         11 => {
-            // Completion has no transcript line in production: it shows as
-            // the dock lifecycle row the projection builds, so the seeded
-            // frame carries that row and nothing it invented.
+            // Completion is observed in the seeded lifecycle row.
             let mut view = initial_view();
             view.dock = task_dock(&status_with_tasks(
                 &[("task-1", "completed", None)],
@@ -594,12 +572,7 @@ impl SurfaceFingerprints {
     }
 }
 
-/// The expected SGR fingerprint per theme and surface, pinned independently
-/// of the resolver. The indices are the xterm palette slots ratatui/crossterm
-/// emit for the tokens in `src/ui/theme.rs` (`38;5;n`): light status/modal
-/// Blue 4, light composer Magenta 5; dark status/modal Cyan 6, dark composer
-/// bright Magenta 13; high contrast LightYellow 11, LightCyan 14, White 15
-/// with bold. Body rows are `Reset`, which vt100 reports as `Default`.
+/// Independently pinned xterm indexes and emphasis for the five visible surfaces.
 fn expected_fingerprint(theme: &str, surface: &str) -> &'static str {
     match (theme, surface) {
         ("light", "status" | "modal") => "fg=Idx(4);bg=Default;bold=false",
@@ -616,11 +589,9 @@ fn expected_fingerprint(theme: &str, surface: &str) -> &'static str {
     }
 }
 
-/// One finished review frame: the final screen text, its rows, the five
-/// fingerprints and the bytes the child actually emitted.
+/// Captured review pages, actual surface cells, and raw terminal output.
 struct ReviewFrame {
     text: String,
-    rows: Vec<String>,
     fingerprints: SurfaceFingerprints,
     bytes: Vec<u8>,
 }
@@ -646,35 +617,6 @@ impl ThemeObservation {
             "transcript": self.fingerprints.transcript,
         })
     }
-}
-
-/// Replaces the one volatile screen token: the decision card's question id is
-/// generated per process, so two `--ui-review` runs of the same state differ
-/// only there. Everything else the renderer paints must be byte-identical.
-fn normalized_review_text(text: &str) -> String {
-    fn is_uuid(bytes: &[u8]) -> bool {
-        bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-    }
-    let bytes = text.as_bytes();
-    let mut normalized = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes.len() - index >= 36 && is_uuid(&bytes[index..index + 36]) {
-            normalized.push_str("<question>");
-            index += 36;
-        } else {
-            let ch = text[index..]
-                .chars()
-                .next()
-                .expect("a char boundary always yields a char");
-            normalized.push(ch);
-            index += ch.len_utf8();
-        }
-    }
-    normalized
 }
 
 /// Runs independent jobs on a bounded worker set, preserving job order in the
@@ -721,34 +663,155 @@ fn parallel_then_live<T: Copy + Send + Sync, R: Send>(
     results
 }
 
-fn await_review_screen(
+/// Text from the captured grid, with each visible cell bound to its actual SGR.
+/// Read the two responsive columns separately so wrapped body text is not interleaved.
+struct PaintedRegion {
+    text: String,
+    positions: Vec<(u16, u16)>,
+}
+
+impl PaintedRegion {
+    fn read(screen: &vt100::Screen, rows: u16, start: u16, end: u16) -> Self {
+        let mut text = String::new();
+        let mut positions = Vec::new();
+        for row in 0..rows {
+            let mut space = !text.is_empty();
+            for col in start..end {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let glyph = cell.contents();
+                if glyph.trim().is_empty() {
+                    space = !text.is_empty();
+                    continue;
+                }
+                if space {
+                    text.push(' ');
+                    positions.push((row, col));
+                    space = false;
+                }
+                text.push_str(glyph);
+                positions.extend(std::iter::repeat_n((row, col), glyph.len()));
+            }
+        }
+        Self { text, positions }
+    }
+
+    fn position(&self, label: &str) -> Option<(u16, u16)> {
+        self.positions.get(self.text.find(label)?).copied()
+    }
+
+    fn fingerprint(&self, screen: &vt100::Screen, label: &str) -> Option<String> {
+        let (row, col) = self.position(label)?;
+        let cell = screen.cell(row, col)?;
+        Some(format!(
+            "fg={:?};bg={:?};bold={}",
+            cell.fgcolor(),
+            cell.bgcolor(),
+            cell.bold()
+        ))
+    }
+}
+
+fn inspect_review(
     tui: &mut TuiPty,
     fixture: &StateFixture,
-    geometry: Geometry,
-) -> Result<(), String> {
-    // The first needle can match on the first PTY quantum while the last
-    // rows of the frame are still in flight (a high-contrast frame floods
-    // styled blanks across many quanta). Capture only a frame that held
-    // still; mark 0 settles the initial paint itself.
-    tui.wait_settled_after(fixture.needles[0], 0, WAIT)?;
-    for needle in &fixture.needles {
-        tui.wait(needle, WAIT)?;
-    }
-    if geometry == Geometry::LiveResize {
-        for (rows, cols) in [(40, 120), (20, 60)] {
-            let mark = tui.bytes()?.len();
-            tui.resize(rows, cols)?;
-            // The resize redraw starts a new byte stream; require a still
-            // screen after that point before the frame is captured.
-            tui.wait_settled_after(fixture.needles[0], mark, LIVE_RESIZE_WAIT)?;
+) -> Result<(String, SurfaceFingerprints), String> {
+    let modal = if fixture.name == "awaiting-decision" {
+        "awaiting decision"
+    } else {
+        "awaiting permission"
+    };
+    let mut surfaces: [Option<String>; 5] = Default::default();
+    let mut text = String::new();
+    for _ in 0..32 {
+        let raw = tui.bytes()?;
+        let mut parser = vt100::Parser::new(tui.rows, tui.cols, 0);
+        parser.process(&raw);
+        let screen = parser.screen();
+        let full = PaintedRegion::read(screen, tui.rows, 0, tui.cols);
+        // Review reserves one outer padding cell and one scrollbar cell. Its thumb is not a transcript glyph.
+        let content_end = tui.cols.saturating_sub(2);
+        let body_start = if tui.cols < 64 { 0 } else { 27 };
+        let left_end = if body_start == 0 {
+            content_end
+        } else {
+            body_start
+        };
+        let left = PaintedRegion::read(screen, tui.rows, 0, left_end);
+        let body = PaintedRegion::read(screen, tui.rows, body_start, content_end);
+        // The composer is pinned directly above the review help; a focused option can also start with '>'.
+        let composer = format!("{} Review · Esc closes", fixture.composer_label);
+        for (index, (region, label)) in [
+            (&full, STATUS),
+            (&left, &fixture.dock_probe),
+            (&body, &fixture.transcript_probe),
+            (&full, composer.as_str()),
+            (&body, modal),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if surfaces[index].is_none() {
+                surfaces[index] = region.fingerprint(screen, label);
+            }
+        }
+        if !fixture.modal
+            && ["awaiting decision", "awaiting permission"]
+                .iter()
+                .any(|label| body.text.contains(*label))
+        {
+            return Err(format!(
+                "{} paints an unexpected modal: {}",
+                fixture.name, body.text
+            ));
+        }
+        for region in [&full, &left, &body] {
+            text.push('\n');
+            text.push_str(&region.text);
+        }
+        if fixture.needles.iter().all(|&needle| text.contains(needle))
+            && surfaces[..4].iter().all(Option::is_some)
+            && (!fixture.modal || surfaces[4].is_some())
+        {
+            let [status, dock, transcript, composer, modal] = surfaces;
+            return Ok((
+                text,
+                SurfaceFingerprints {
+                    status: status.expect("status"),
+                    dock: dock.expect("dock"),
+                    composer: composer.expect("composer"),
+                    transcript: transcript.expect("transcript"),
+                    modal: if fixture.modal {
+                        modal.expect("modal")
+                    } else {
+                        "none".into()
+                    },
+                },
+            ));
+        }
+        let mark = raw.len();
+        tui.send(b"\x1b[6~")?;
+        if tui
+            .wait_settled_after("Review · Esc closes", mark, WAIT)
+            .is_err()
+        {
+            break;
         }
     }
-    // The composer prompt paints only after the startup cursor-query answer,
-    // which can land after the settle window above; require a still frame
-    // that already carries the composer row so control and theme captures
-    // share one settled state.
-    tui.wait_settled_after(&fixture.composer_label, 0, WAIT)?;
-    Ok(())
+    Err(format!(
+        "{} missing labels {:?}, surface samples {:?}; painted: {text}",
+        fixture.name,
+        fixture
+            .needles
+            .iter()
+            .filter(|needle| !text.contains(**needle))
+            .collect::<Vec<_>>(),
+        surfaces
+    ))
 }
 
 /// One packaged `--ui-review` run: environment in, final screen plus
@@ -760,11 +823,15 @@ fn review_frame(
     label: &str,
 ) -> Result<ReviewFrame, String> {
     let mut tui = TuiPty::spawn_review(geometry, fixture.name, env)?;
-    await_review_screen(&mut tui, fixture, geometry)?;
-    let screen_bytes = tui.bytes()?;
-    let rows = tui.row_texts(&screen_bytes);
-    let text = support::squashed(&rows.join("\n"));
-    let fingerprints = tui.surface_fingerprints(&screen_bytes, fixture)?;
+    tui.wait_settled_after(STATUS, 0, WAIT)?;
+    if geometry == Geometry::LiveResize {
+        for (rows, cols) in [(40, 120), (20, 60)] {
+            let mark = tui.bytes()?.len();
+            tui.resize(rows, cols)?;
+            tui.wait_settled_after(STATUS, mark, LIVE_RESIZE_WAIT)?;
+        }
+    }
+    let (text, fingerprints) = inspect_review(&mut tui, fixture)?;
     tui.send(b"\x1b")?;
     let (bytes, code, data_root_opened) = tui.finish_review()?;
     if code != Some(0) {
@@ -776,7 +843,6 @@ fn review_frame(
     require_fullscreen_restore(&bytes)?;
     Ok(ReviewFrame {
         text,
-        rows,
         fingerprints,
         bytes,
     })
@@ -806,7 +872,7 @@ fn observe_theme(
         &[("TERM", "xterm-256color"), ("RIVECT_THEME", theme)],
         theme,
     )?;
-    if normalized_review_text(&frame.text) != normalized_review_text(control) {
+    if &frame.text != control {
         return Err(format!(
             "{theme} text differs from the default control: {:?} != {control:?}",
             frame.text
@@ -867,11 +933,8 @@ fn mono_probe(
     if has_color_sgr(&frame.bytes) {
         return Err(format!("{theme} mono emitted an SGR color"));
     }
-    if !frame.text.contains(&support::squashed(&fixture.status)) {
-        return Err(format!(
-            "{theme} mono lost the status token {:?}",
-            fixture.status
-        ));
+    if !frame.text.contains(STATUS) {
+        return Err(format!("{theme} mono lost the status token {:?}", STATUS));
     }
     if !frame.text.contains(&support::squashed(&fixture.dock_probe)) {
         return Err(format!(
@@ -879,11 +942,13 @@ fn mono_probe(
             fixture.dock_probe
         ));
     }
-    let composer_row = frame.rows.last().map_or("", String::as_str).trim_end();
-    if composer_row != fixture.composer_label.trim_end() {
+    if !frame
+        .text
+        .contains(&format!("{} Review · Esc closes", fixture.composer_label))
+    {
         return Err(format!(
-            "{theme} mono composer row {composer_row:?} != {:?}",
-            fixture.composer_label.trim_end()
+            "mono lost composer label {:?}",
+            fixture.composer_label
         ));
     }
     let bold = theme == "high-contrast";
@@ -923,11 +988,8 @@ fn dumb_probe(fixture: &StateFixture) -> Result<(), String> {
     if has_color_sgr(&frame.bytes) {
         return Err("TERM=dumb emitted an SGR color".to_string());
     }
-    if !frame.text.contains(&support::squashed(&fixture.status)) {
-        return Err(format!(
-            "TERM=dumb lost the status token {:?}",
-            fixture.status
-        ));
+    if !frame.text.contains(STATUS) {
+        return Err(format!("TERM=dumb lost the status token {:?}", STATUS));
     }
     if !frame.text.contains(&support::squashed(&fixture.dock_probe)) {
         return Err(format!(
@@ -935,11 +997,13 @@ fn dumb_probe(fixture: &StateFixture) -> Result<(), String> {
             fixture.dock_probe
         ));
     }
-    let composer_row = frame.rows.last().map_or("", String::as_str).trim_end();
-    if composer_row != fixture.composer_label.trim_end() {
+    if !frame
+        .text
+        .contains(&format!("{} Review · Esc closes", fixture.composer_label))
+    {
         return Err(format!(
-            "TERM=dumb composer row {composer_row:?} != {:?}",
-            fixture.composer_label.trim_end()
+            "TERM=dumb lost composer label {:?}",
+            fixture.composer_label
         ));
     }
     Ok(())
@@ -958,7 +1022,7 @@ fn palette_probe(geometry: Geometry, theme: &'static str) -> Result<(), String> 
     if !has_color_sgr(&frame.bytes) {
         return Err(format!("{theme} emitted no SGR color"));
     }
-    if !frame.text.contains(&support::squashed(&fixture.status)) {
+    if !frame.text.contains(STATUS) {
         return Err(format!("{theme} lost the status token"));
     }
     if frame.fingerprints.surface("status") != expected_fingerprint(theme, "status") {
@@ -981,106 +1045,80 @@ fn no_color_probe(geometry: Geometry) -> Result<(), String> {
     if has_color_sgr(&frame.bytes) {
         return Err("NO_COLOR emitted an SGR color".to_string());
     }
-    if !frame.text.contains(&support::squashed(&fixture.status)) {
+    if !frame.text.contains(STATUS) {
         return Err("NO_COLOR lost the status token".to_string());
     }
     Ok(())
 }
 
-/// Reads the fingerprint of the first non-space cell on one row.
-fn fingerprint_at_row(
-    rows: &[String],
-    screen: &vt100::Screen,
-    row: usize,
-) -> Result<String, String> {
-    let text = rows
-        .get(row)
-        .ok_or_else(|| format!("inline screen has no row {row}"))?;
-    let column = text.chars().position(|ch| !ch.is_whitespace()).unwrap_or(0);
-    let row = u16::try_from(row).map_err(|error| format!("inline row overflow: {error}"))?;
-    let column = u16::try_from(column).map_err(|error| format!("inline col overflow: {error}"))?;
-    let cell = screen
-        .cell(row, column)
-        .ok_or_else(|| format!("no inline cell at {row},{column}"))?;
-    Ok(format!(
-        "fg={:?};bg={:?};bold={}",
-        cell.fgcolor(),
-        cell.bgcolor(),
-        cell.bold()
-    ))
+fn inline_fingerprint(tui: &TuiPty, bytes: &[u8], label: &str) -> Result<String, String> {
+    let mut parser = vt100::Parser::new(tui.rows, tui.cols, 0);
+    parser.process(bytes);
+    PaintedRegion::read(parser.screen(), tui.rows, 0, tui.cols)
+        .fingerprint(parser.screen(), label)
+        .ok_or_else(|| {
+            format!(
+                "inline has no painted {label:?}:\n{}",
+                parser.screen().contents()
+            )
+        })
 }
 
-/// One themed inline render per theme: the pinned status/dock/composer region
-/// and the modal border carry the expected tokens and labels.
+/// Pin all five inline colors to text painted by the installed client.
 fn inline_theme_probe(theme: &'static str) -> Result<(), String> {
     let mut tui = TuiPty::spawn(
         Geometry::W80H24,
         Some(RenderMode::Inline),
         &[("TERM", "xterm-256color"), ("RIVECT_THEME", theme)],
     )?;
-    tui.wait("Rivect · not connected", WAIT)?;
+    tui.wait("Message", WAIT)?;
+    let mark = tui.bytes()?.len();
+    tui.send(b"/help\r")?;
+    tui.wait_settled_after("Status: Commands: Enter submits", mark, WAIT)?;
     let bytes = tui.bytes()?;
-    let rows = tui.row_texts(&bytes);
-    let mut parser = vt100::Parser::new(tui.rows, tui.cols, 200);
-    parser.process(&bytes);
-    let screen = parser.screen();
-    for (surface, needle) in [
-        ("status", "Rivect · not connected"),
-        ("dock", rivect::ui::DOCK_EMPTY),
+    // The live dock is secondary text and the live composer is always bold;
+    // their fingerprints are pinned separately from the frozen review.
+    let (dock, composer) = match theme {
+        "light" => (
+            "fg=Idx(4);bg=Default;bold=false",
+            "fg=Idx(5);bg=Default;bold=true",
+        ),
+        "dark" => (
+            "fg=Idx(6);bg=Default;bold=false",
+            "fg=Idx(13);bg=Default;bold=true",
+        ),
+        "high-contrast" => (
+            "fg=Idx(11);bg=Default;bold=true",
+            "fg=Idx(14);bg=Default;bold=true",
+        ),
+        _ => return Err(format!("unknown inline theme {theme}")),
+    };
+    for (surface, needle, expected) in [
+        (
+            "status",
+            "No processes",
+            expected_fingerprint(theme, "status"),
+        ),
+        ("dock", "/accounting Session not connected", dock),
+        ("composer", "Message → Main", composer),
         (
             "transcript",
-            "Input is available. Enter a task or a clarification.",
+            "Status: Commands: Enter submits",
+            expected_fingerprint(theme, "transcript"),
         ),
     ] {
-        let row = rows
-            .iter()
-            .position(|text| support::squashed(text).contains(&support::squashed(needle)))
-            .ok_or_else(|| format!("inline screen carries no {needle:?}"))?;
-        let observed = fingerprint_at_row(&rows, screen, row)?;
-        let expected = expected_fingerprint(theme, surface);
+        let observed = inline_fingerprint(&tui, &bytes, needle)?;
         if observed != expected {
             return Err(format!(
                 "inline {theme} {surface} fingerprint {observed:?} != {expected:?}"
             ));
         }
     }
-    let composer_row = rows
-        .iter()
-        .rposition(|text| text.trim_start().starts_with('>'))
-        .ok_or_else(|| "inline screen carries no composer row".to_string())?;
-    let observed = fingerprint_at_row(&rows, screen, composer_row)?;
-    let expected = expected_fingerprint(theme, "composer");
-    if observed != expected {
-        return Err(format!(
-            "inline {theme} composer fingerprint {observed:?} != {expected:?}"
-        ));
-    }
-    // Open the production decision card to paint a modal border inline.
-    tui.send(b"inline palette probe\r")?;
-    tui.wait("focus 1/2", WAIT)?;
-    let bytes = tui.bytes()?;
-    let mut parser = vt100::Parser::new(tui.rows, tui.cols, 200);
-    parser.process(&bytes);
-    let screen = parser.screen();
-    let corner = (0..tui.rows).find_map(|row| {
-        (0..tui.cols)
-            .find(|col| {
-                screen
-                    .cell(row, *col)
-                    .is_some_and(|cell| cell.contents() == "┌")
-            })
-            .map(|col| (row, col))
-    });
-    let (row, col) = corner.ok_or_else(|| "inline decision card painted no border".to_string())?;
-    let cell = screen
-        .cell(row, col)
-        .ok_or_else(|| "inline modal corner cell missing".to_string())?;
-    let observed = format!(
-        "fg={:?};bg={:?};bold={}",
-        cell.fgcolor(),
-        cell.bgcolor(),
-        cell.bold()
-    );
+    // A production decision title supplies the modal sample.
+    let mark = tui.bytes()?.len();
+    tui.send(b"/task inline palette probe\r")?;
+    tui.wait_settled_after("focus 1/2", mark, WAIT)?;
+    let observed = inline_fingerprint(&tui, &tui.bytes()?, "awaiting decision")?;
     let expected = expected_fingerprint(theme, "modal");
     if observed != expected {
         return Err(format!(
@@ -1090,13 +1128,22 @@ fn inline_theme_probe(theme: &'static str) -> Result<(), String> {
     // The card refuses a key inside its consent floor (the first paint starts
     // a short clock); wait it out before dismissing.
     tui.pump(Duration::from_millis(400))?;
-    tui.send_card_key(b"\x1b", "decision left unanswered", WAIT)?;
+    tui.send_card_key(b"\x1b", DECISION_UNANSWERED, WAIT)?;
     tui.send(b"\x1b")?;
     let (bytes, code) = tui.finish()?;
     if code != Some(0) {
         return Err(format!("inline {theme} exit {code:?}"));
     }
     require_inline_restore(&bytes)
+}
+
+#[test]
+#[ignore = "focused palette proof; every role also runs in the installed matrix"]
+fn installed_inline_text_uses_fullscreen_palette_roles() {
+    for theme in THEMES {
+        inline_theme_probe(theme).expect("five colored inline text roles");
+    }
+    input_probe(InputMode::Plain, Geometry::W80H24).expect("plain inline text has no colors");
 }
 
 fn has_color_sgr(bytes: &[u8]) -> bool {
@@ -1110,7 +1157,7 @@ fn has_color_sgr(bytes: &[u8]) -> bool {
             end += 1;
         }
         if end < bytes.len() && bytes[end] == b'm' {
-            for part in bytes[start..end].split(|byte| *byte == b';') {
+            for part in bytes[start..end].split(|byte| matches!(*byte, b';' | b':')) {
                 let Ok(text) = std::str::from_utf8(part) else {
                     continue;
                 };
@@ -1249,13 +1296,39 @@ impl TuiPty {
         mode: Option<RenderMode>,
         env: &[(&str, &str)],
     ) -> Result<Self, String> {
-        let bundle = support::release::baseline_bundle();
+        Self::spawn_with_config(geometry, mode, env, None)
+    }
+
+    fn spawn_with_config(
+        geometry: Geometry,
+        mode: Option<RenderMode>,
+        env: &[(&str, &str)],
+        config: Option<&str>,
+    ) -> Result<Self, String> {
         let root = tempfile::TempDir::with_prefix("rivect-installed-tui-")
             .map_err(|error| format!("tui root: {error}"))?;
         let data = root.path().join("data");
         std::fs::create_dir_all(&data).map_err(|error| format!("data root: {error}"))?;
+        if let Some(text) = config {
+            std::fs::write(data.join("config.toml"), text).map_err(|e| e.to_string())?;
+        }
+        Self::spawn_at(geometry, mode, env, root, data)
+    }
+
+    fn spawn_at(
+        geometry: Geometry,
+        mode: Option<RenderMode>,
+        env: &[(&str, &str)],
+        root: tempfile::TempDir,
+        data: PathBuf,
+    ) -> Result<Self, String> {
+        let bundle = support::release::baseline_bundle();
         let (cols, rows) = geometry.size();
         let mut command = support::pty_command(bundle.join("rivect"));
+        command.env("HOME", root.path());
+        command.env("TMPDIR", root.path());
+        command.env("TERM", "xterm-256color");
+        command.cwd(root.path());
         match mode {
             Some(RenderMode::Linear) => {
                 // The accessibility surface has its own flag; `--tui`
@@ -1291,6 +1364,10 @@ impl TuiPty {
         let data = root.path().join("data");
         let (cols, rows) = geometry.size();
         let mut command = support::pty_command(bundle.join("rivect"));
+        command.env("HOME", root.path());
+        command.env("TMPDIR", root.path());
+        command.env("TERM", "xterm-256color");
+        command.cwd(root.path());
         command.arg("--ui-review");
         command.arg(state);
         command.env("RIVECT_DATA_ROOT", &data);
@@ -1324,79 +1401,6 @@ impl TuiPty {
         let mut parser = vt100::Parser::new(self.rows, self.cols, 200);
         parser.process(bytes);
         parser.screen().contents()
-    }
-
-    fn row_texts(&self, bytes: &[u8]) -> Vec<String> {
-        let mut parser = vt100::Parser::new(self.rows, self.cols, 200);
-        parser.process(bytes);
-        let screen = parser.screen();
-        (0..self.rows)
-            .map(|row| {
-                let mut text = String::new();
-                for col in 0..self.cols {
-                    match screen.cell(row, col) {
-                        Some(cell) if !cell.contents().is_empty() => {
-                            text.push_str(cell.contents());
-                        }
-                        _ => text.push(' '),
-                    }
-                }
-                text
-            })
-            .collect()
-    }
-
-    /// Reads the five palette carriers' SGR attributes from the final screen:
-    /// the status cell, the transcript start, the dock row, the composer row
-    /// and the modal frame's top-left border corner. The rows come from the
-    /// renderer's own layout anchors, never from searching the screen text.
-    fn surface_fingerprints(
-        &self,
-        bytes: &[u8],
-        fixture: &StateFixture,
-    ) -> Result<SurfaceFingerprints, String> {
-        let mut parser = vt100::Parser::new(self.rows, self.cols, 200);
-        parser.process(bytes);
-        let screen = parser.screen();
-        let cell = |row: u16, col: u16| -> Result<String, String> {
-            let cell = screen
-                .cell(row, col)
-                .ok_or_else(|| format!("screen has no cell {row},{col}"))?;
-            Ok(format!(
-                "fg={:?};bg={:?};bold={}",
-                cell.fgcolor(),
-                cell.bgcolor(),
-                cell.bold()
-            ))
-        };
-        let (transcript_row, dock_row, composer_row) =
-            rivect::ui::view_anchors(&fixture.view, self.cols, self.rows);
-        let status = cell(0, 0)?;
-        let transcript = cell(transcript_row, 0)?;
-        let dock = cell(dock_row, 0)?;
-        let composer = cell(composer_row, 0)?;
-        let modal = if fixture.modal {
-            let corner = (0..self.rows).find_map(|row| {
-                (0..self.cols)
-                    .find(|col| {
-                        screen
-                            .cell(row, *col)
-                            .is_some_and(|cell| cell.contents() == "┌")
-                    })
-                    .map(|col| (row, col))
-            });
-            let (row, col) = corner.ok_or_else(|| "no modal border was painted".to_string())?;
-            cell(row, col)?
-        } else {
-            "none".to_string()
-        };
-        Ok(SurfaceFingerprints {
-            status,
-            dock,
-            composer,
-            modal,
-            transcript,
-        })
     }
 
     fn answer_cursor_query(&mut self) -> Result<(), String> {
@@ -1574,6 +1578,465 @@ impl TuiPty {
     }
 }
 
+const CONTEXT_WARNING: &str = "% full (auto-compact off)";
+const NOT_SHORTER: &str = "compaction would not shorten the history";
+// Longer than the one-second remeasurement backstop and two dock refreshes.
+const CONTEXT_BEATS: Duration = Duration::from_secs(2);
+
+struct ContextFixture {
+    root: tempfile::TempDir,
+    session: SessionId,
+}
+
+impl ContextFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("context data root");
+        std::fs::create_dir(root.path().join("runtime")).expect("owner directory");
+        let config = format!(
+            "{}\n[context]\nauto_compact = false\n",
+            support::base_config()
+        );
+        std::fs::write(root.path().join("config.toml"), config).expect("explicit context guard");
+        let mut store =
+            TaskStore::open(&root.path().join("runtime/rivect.db")).expect("open store");
+        let (session, _, _, _) = store
+            .open_session("context-seed", "installed", None)
+            .expect("open session");
+        Self { root, session }
+    }
+
+    // Only call between installed clients: the owner admits one writer.
+    fn detached(&self) -> TaskStore {
+        TaskStore::open(&self.root.path().join("runtime/rivect.db")).expect("detached task store")
+    }
+
+    fn task(&self, goal: &str) -> TaskId {
+        self.detached()
+            .create_task(
+                &self.session,
+                goal,
+                "installed",
+                goal,
+                (&["read the rollout notes".to_owned()], &[]),
+            )
+            .expect("create context task")
+            .task_id
+    }
+
+    fn fill(&self, task: &TaskId) -> (usize, [u8; 32]) {
+        let mut store = self.detached();
+        store
+            .materialize_obligations(task)
+            .expect("materialize criterion");
+        let scope = format!("task:{}", task.0);
+        let text = "a scoped line of the file ".repeat(1800);
+        for index in 0..18 {
+            let observation = format!("record {index:02}: {text}");
+            let digest = format!("{:x}", Sha256::digest(observation.as_bytes()));
+            store
+                .insert_evidence(task, 0, &scope, &observation, &digest)
+                .expect("store evidence");
+        }
+        let stamp = context_stamp(&store, task);
+        assert!(
+            stamp.0 * 100 / MODEL_WIRE_MAX_BYTES >= 80,
+            "seed must independently earn a warning"
+        );
+        stamp
+    }
+
+    fn attach(&self, geometry: Geometry) -> TuiPty {
+        let root = tempfile::tempdir().expect("isolated PTY home");
+        let mut tui = TuiPty::spawn_at(
+            geometry,
+            Some(RenderMode::Fullscreen),
+            &[],
+            root,
+            self.root.path().to_owned(),
+        )
+        .expect("installed context PTY");
+        tui.wait("Message → Main", WAIT).expect("thread is ready");
+        tui.send(format!("/resume {}\r", self.session.0).as_bytes())
+            .expect("attach seeded session");
+        tui
+    }
+}
+
+fn context_stamp(store: &TaskStore, task: &TaskId) -> (usize, [u8; 32]) {
+    let context = store
+        .assembled_context(task)
+        .expect("owner assembles context");
+    (
+        context.text.len(),
+        Sha256::digest(context.text.as_bytes()).into(),
+    )
+}
+
+fn detach_context(mut tui: TuiPty) {
+    tui.send(b"/exit\r").expect("leave thread");
+    let (bytes, code) = tui.finish().expect("reap installed owner");
+    assert_eq!(code, Some(0));
+    require_fullscreen_restore(&bytes).expect("restored PTY");
+}
+
+fn warning_line(frame: &str) -> &str {
+    frame
+        .lines()
+        .find(|row| row.contains(CONTEXT_WARNING))
+        .expect("one painted warning row")
+}
+
+fn context_frame_without(tui: &mut TuiPty, present: &str, absent: &str) -> String {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let frame = tui.screen(&tui.bytes().expect("terminal bytes"));
+        if support::squashed(&frame).contains(present) && !frame.contains(absent) {
+            return frame;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {present:?} without {absent:?}: {frame}"
+        );
+        tui.pump(Duration::from_millis(25))
+            .expect("next owner frame");
+    }
+}
+
+fn quiet_context(tui: &mut TuiPty, witness: &str) {
+    // Task IDs and the hidden count now live in the explicit accounting view.
+    tui.wait("/accounting context", WAIT)
+        .expect("owner measurement ready");
+    tui.send(b"/accounting\r").expect("open full accounting");
+    context_frame_without(tui, witness, CONTEXT_WARNING);
+    tui.pump(CONTEXT_BEATS).expect("repeated measurements");
+    let frame = tui.screen(&tui.bytes().expect("terminal bytes"));
+    assert!(
+        support::squashed(&frame).contains(witness) && !frame.contains(CONTEXT_WARNING),
+        "{frame}"
+    );
+}
+
+fn toggle_context_guard(tui: &mut TuiPty, previous: bool) {
+    tui.send(b"/settings\r").expect("settings");
+    tui.wait("context.auto_compact", WAIT)
+        .expect("settings loaded");
+    tui.send(b"/").expect("search");
+    tui.wait("Search settings", WAIT).expect("search input");
+    tui.send(b"context.auto_compact\r").expect("find guard");
+    tui.wait("1 result", WAIT).expect("filtered guard");
+    tui.wait(&format!("context.auto_compact = {previous}"), WAIT)
+        .expect("effective guard");
+    tui.send(b" ").expect("preview opposite value");
+    tui.wait("Confirm change", WAIT)
+        .expect("real settings proposal");
+    tui.send(b"y").expect("confirm guard edit");
+    tui.wait("Saved to user config", WAIT)
+        .expect("owner published setting");
+    tui.send(b"\x1b").expect("close settings");
+    context_frame_without(tui, "Message → Main", "Settings Center");
+}
+
+fn dismiss_context_question(tui: &mut TuiPty) -> String {
+    tui.wait("focus 1/2", WAIT).expect("real pending question");
+    tui.send_card_key(b"\x1b", DECISION_UNANSWERED, WAIT)
+        .expect("pending question dismissed")
+}
+
+#[test]
+fn installed_context_warning_tracks_setting_without_rewriting_bytes_p1_p3() {
+    let fixture = ContextFixture::new();
+    let task = fixture.task("context guard check");
+    let dock = format!("task {}:", task.0);
+    assert!(context_stamp(&fixture.detached(), &task).0 * 100 / MODEL_WIRE_MAX_BYTES < 80);
+    let mut tui = fixture.attach(Geometry::W80H24);
+    quiet_context(&mut tui, &dock);
+    detach_context(tui);
+
+    let before = fixture.fill(&task);
+    let mut tui = fixture.attach(Geometry::W80H24);
+    let expected = format!(
+        "{}{}",
+        before.0 * 100 / MODEL_WIRE_MAX_BYTES,
+        CONTEXT_WARNING
+    );
+    tui.wait(&expected, WAIT).expect("owner measurement paints");
+    toggle_context_guard(&mut tui, false);
+    quiet_context(&mut tui, &dock);
+    toggle_context_guard(&mut tui, true);
+    tui.wait(&expected, WAIT)
+        .expect("unchanged full context warns again");
+    tui.pump(CONTEXT_BEATS).expect("further measurement beats");
+    tui.send(b"/rewind\r").expect("preview live owner context");
+    let measured = tui
+        .wait(&format!("{} assembled bytes", before.0), WAIT)
+        .expect("owner reports same length");
+    assert!(warning_line(&measured).contains(&expected));
+    detach_context(tui);
+    assert_eq!(
+        context_stamp(&fixture.detached(), &task),
+        before,
+        "paint must preserve length and SHA-256"
+    );
+}
+
+#[test]
+fn installed_printed_compact_command_folds_and_clears_only_warning_p2_p8() {
+    let fixture = ContextFixture::new();
+    let task = fixture.task("compact this conversation");
+    let before = fixture.fill(&task);
+    let mut tui = fixture.attach(Geometry::W80H24);
+    let warned = tui.wait(CONTEXT_WARNING, WAIT).expect("full context warns");
+    let token = warning_line(&warned)
+        .split_whitespace()
+        .find(|word| word.starts_with('/'))
+        .expect("printed continuation");
+    tui.send(format!("{token}\r").as_bytes())
+        .expect("submit exactly the offered command");
+    tui.wait(&format!("Context compacted: {}", before.0), WAIT)
+        .expect("owner's accepted fold");
+    quiet_context(&mut tui, &format!("task {}:", task.0));
+    detach_context(tui);
+    let after = context_stamp(&fixture.detached(), &task);
+    assert!(after.0 < before.0 && after.0 * 100 / MODEL_WIRE_MAX_BYTES < 80);
+}
+
+#[test]
+fn installed_empty_compact_has_no_wire_field() {
+    let fixture = ContextFixture::new();
+    let mut tui = fixture.attach(Geometry::W80H24);
+    tui.wait("Resumed session:", WAIT)
+        .expect("attached empty session");
+    tui.send(b"/compact\r").expect("empty compaction");
+    let frame = tui
+        .wait("No conversation to compact yet; submit a task first.", WAIT)
+        .expect("plain note");
+    assert!(!frame.contains("task_id"));
+    detach_context(tui);
+    assert!(
+        fixture
+            .detached()
+            .projection_page(&fixture.session, None)
+            .expect("empty session")
+            .0
+            .is_empty()
+    );
+}
+
+#[test]
+fn installed_compact_targets_newest_recovered_conversation_p10() {
+    let fixture = ContextFixture::new();
+    let older = fixture.task("settled rollout");
+    fixture.fill(&older);
+    let completed = fixture
+        .detached()
+        .complete_if_eligible(&fixture.session, &older)
+        .expect("settle older task");
+    assert_eq!(completed.lifecycle, Lifecycle::Completed);
+    let older_before = context_stamp(&fixture.detached(), &older);
+    assert!(older_before.0 * 100 / MODEL_WIRE_MAX_BYTES >= 80);
+    let newer = fixture.task("newer rollout");
+    let mut tui = fixture.attach(Geometry::W120H40);
+    quiet_context(&mut tui, &format!("task {}:", newer.0));
+    detach_context(tui);
+
+    let before = fixture.fill(&newer);
+    let mut tui = fixture.attach(Geometry::W160H50);
+    let frame = tui
+        .wait(CONTEXT_WARNING, WAIT)
+        .expect("full newer conversation");
+    let warning = warning_line(&frame);
+    assert!(
+        warning.contains(&format!("task {}", newer.0)) && !warning.contains(&older.0),
+        "{warning}"
+    );
+    tui.send(b"/compact\r").expect("fold named task");
+    tui.wait(&format!("Context compacted: {}", before.0), WAIT)
+        .expect("named task's fold");
+    quiet_context(&mut tui, &format!("task {}:", newer.0));
+    detach_context(tui);
+    let store = fixture.detached();
+    assert!(context_stamp(&store, &newer).0 < before.0);
+    assert_eq!(
+        context_stamp(&store, &older),
+        older_before,
+        "older bytes unchanged"
+    );
+}
+
+#[test]
+fn installed_compact_retains_pending_subject_and_serves_input_after_refusal_p4_p10() {
+    let fixture = ContextFixture::new();
+    let mut tui = fixture.attach(Geometry::W120H40);
+    tui.wait("Resumed session:", WAIT)
+        .expect("attached session");
+    tui.send(b"/task ledger\r")
+        .expect("composer submits pending task");
+    let card = tui
+        .wait("focus 1/2", WAIT)
+        .expect("accepted task has a question");
+    let id = card
+        .lines()
+        .find_map(|row| row.split_once("task: "))
+        .and_then(|(_, tail)| tail.split_whitespace().next())
+        .expect("visible task identity");
+    let pending = TaskId(id.to_owned());
+    dismiss_context_question(&mut tui);
+    tui.send(b"/compact\r")
+        .expect("request fold on empty history");
+    tui.wait(NOT_SHORTER, WAIT)
+        .expect("owner's typed refusal is painted");
+    tui.send(b"/help\r").expect("composer still serves input");
+    tui.wait("Commands: Enter submits", WAIT)
+        .expect("help after refusal");
+    detach_context(tui);
+
+    let pending_before = {
+        let store = fixture.detached();
+        assert_eq!(
+            store
+                .snapshot(&pending)
+                .expect("composer receipt")
+                .lifecycle,
+            Lifecycle::Waiting
+        );
+        let stamp = context_stamp(&store, &pending);
+        assert!(stamp.0 * 100 / MODEL_WIRE_MAX_BYTES < 80);
+        stamp
+    };
+    let last = fixture.task("full conversation behind pending ledger");
+    let last_before = fixture.fill(&last);
+    let page = fixture
+        .detached()
+        .projection_page(&fixture.session, None)
+        .expect("owner task order");
+    assert!(!page.1 && page.0.len() == 2);
+    assert_eq!(
+        page.0[0].task_id, last,
+        "newest durable row is independently full"
+    );
+    assert_eq!(page.0[1].task_id, pending);
+    let mut tui = fixture.attach(Geometry::W120H40);
+    let restored = tui
+        .wait("focus 1/2", WAIT)
+        .expect("reattached pending question");
+    assert!(restored.contains(&format!("task: {}", pending.0)));
+    dismiss_context_question(&mut tui);
+    quiet_context(&mut tui, &format!("task {}:", last.0));
+    tui.send(b"/compact\r")
+        .expect("fold should follow pending, not newest");
+    tui.wait(NOT_SHORTER, WAIT)
+        .expect("pending history refused, newer one not folded");
+    detach_context(tui);
+    let store = fixture.detached();
+    assert_eq!(
+        context_stamp(&store, &last),
+        last_before,
+        "newest bytes and digest unchanged"
+    );
+    assert_eq!(
+        context_stamp(&store, &pending),
+        pending_before,
+        "refusal changed pending bytes"
+    );
+}
+
+fn transcript_band(tui: &mut TuiPty, entries: usize) -> usize {
+    let first = "context transcript line 01";
+    let last = format!("context transcript line {entries:02}");
+    // Both ends exist, but don't fit together. Compare unique durable rows, not repeated labels.
+    tui.wait("Resumed session:", WAIT)
+        .expect("thread page loaded");
+    tui.send(&b"\x1b[6~".repeat(30)).expect("scroll to newest");
+    let bottom = tui.wait(&last, WAIT).expect("newest transcript row");
+    assert!(
+        !bottom.contains(first),
+        "transcript must extend beyond viewport"
+    );
+    let mark = tui.bytes().expect("before page up").len();
+    tui.send(&b"\x1b[5~".repeat(30)).expect("scroll to oldest");
+    let top = tui
+        .wait_settled_after(first, mark, WAIT)
+        .expect("oldest transcript row");
+    assert!(
+        !top.contains(&last),
+        "newest entry really scrolled offscreen"
+    );
+    let band = (1..=entries)
+        .filter(|n| top.contains(&format!("context transcript line {n:02}")))
+        .count();
+    assert!(
+        (1..entries).contains(&band),
+        "only part of the transcript fits: {band}/{entries}"
+    );
+    band
+}
+
+#[test]
+fn installed_context_warning_survives_overflow_and_fits_60_columns_p9() {
+    let fixture = ContextFixture::new();
+    for n in 1..=13 {
+        fixture.task(&format!("context transcript line {n:02}"));
+    }
+    let mut tui = fixture.attach(Geometry::W80H24);
+    let band = transcript_band(&mut tui, 13);
+    detach_context(tui);
+    for n in 14..=18 {
+        fixture.task(&format!("context transcript line {n:02}"));
+    }
+    let last = fixture.task("context transcript line 19");
+    let mut tui = fixture.attach(Geometry::W80H24);
+    assert_eq!(
+        transcript_band(&mut tui, 19),
+        band,
+        "six more entries cannot grow the visible band"
+    );
+    detach_context(tui);
+    fixture.fill(&last);
+    let mut tui = fixture.attach(Geometry::W80H24);
+    tui.wait(CONTEXT_WARNING, WAIT)
+        .expect("warning above overfull transcript");
+    transcript_band(&mut tui, 19);
+    let frame = tui.screen(&tui.bytes().expect("scrolled frame"));
+    assert!(warning_line(&frame).contains("/compact"));
+    tui.send(&b"\x1b[6~".repeat(30))
+        .expect("scroll to newest before opening accounting");
+    tui.wait("context transcript line 19", WAIT)
+        .expect("newest row visible");
+    toggle_context_guard(&mut tui, false);
+    quiet_context(&mut tui, "+17 more");
+    toggle_context_guard(&mut tui, true);
+    tui.wait(CONTEXT_WARNING, WAIT)
+        .expect("warning restored on long thread");
+    detach_context(tui);
+
+    let mut tui = fixture.attach(Geometry::W60H20);
+    let warned = tui.wait(CONTEXT_WARNING, WAIT).expect("narrow warning");
+    assert!(
+        warning_line(&warned).trim_end().ends_with("/compact"),
+        "{warned}"
+    );
+    let data = tui.pty.data_root().clone();
+    support::with_unavailable_evidence(&data, || {
+        let frame = tui
+            .wait("dock refresh failed:", WAIT)
+            .expect("actual failed dock poll");
+        let (warning, row) = frame
+            .lines()
+            .enumerate()
+            .find(|(_, row)| row.contains(CONTEXT_WARNING))
+            .expect("failed poll must retain warning");
+        let mark = frame
+            .lines()
+            .position(|row| row.contains("dock refresh failed:"))
+            .expect("fault mark");
+        assert!(row.trim_end().ends_with("/compact"), "{frame}");
+        assert_ne!(warning, mark, "two independent notices need two rows");
+    });
+    let recovered = context_frame_without(&mut tui, CONTEXT_WARNING, "dock refresh failed:");
+    assert!(warning_line(&recovered).trim_end().ends_with("/compact"));
+    detach_context(tui);
+}
+
 fn exercise_resize(tui: &mut TuiPty, geometry: Geometry) -> Result<(), String> {
     if geometry != Geometry::LiveResize {
         return Ok(());
@@ -1581,16 +2044,30 @@ fn exercise_resize(tui: &mut TuiPty, geometry: Geometry) -> Result<(), String> {
     for (rows, cols) in [(40, 120), (20, 60)] {
         let mark = tui.bytes()?.len();
         tui.resize(rows, cols)?;
-        tui.wait_settled_after("Rivect · not connected", mark, LIVE_RESIZE_WAIT)?;
+        tui.wait_settled_after("Message", mark, LIVE_RESIZE_WAIT)?;
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "focused installed input diagnostics; also exercised by the full matrix"]
+fn installed_decision_mouse_and_paste_inputs_across_geometries() {
+    let mut failures = Vec::new();
+    for geometry in Geometry::ALL {
+        for input in [InputMode::Vim, InputMode::Mouse, InputMode::Paste] {
+            if let Err(reason) = input_probe(input, geometry) {
+                failures.push(format!("{} {}: {reason}", geometry.label(), input.label()));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
     match input {
         InputMode::Keyboard => {
             let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Fullscreen), &[])?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             tui.send(b"/help\r")?;
             tui.wait("Commands: Enter submits", WAIT)?;
@@ -1604,10 +2081,10 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
         InputMode::Vim => vim_probe(geometry),
         InputMode::Unicode => {
             let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Fullscreen), &[])?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             tui.send("держ あ".as_bytes())?;
-            tui.wait("> держ あ", WAIT)?;
+            tui.wait("держ あ", WAIT)?;
             tui.send(b"\x1b")?;
             let (bytes, code) = tui.finish()?;
             if code != Some(0) {
@@ -1617,10 +2094,25 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
         }
         InputMode::Paste => {
             let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Fullscreen), &[])?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             tui.send(b"\x1b[200~alpha\nbeta\x1b[201~")?;
-            tui.wait("> alpha beta", WAIT)?;
+            tui.wait("beta", WAIT)?;
+            let mut parser = vt100::Parser::new(tui.rows, tui.cols, 0);
+            parser.process(&tui.bytes()?);
+            // UTF-8 offsets in rows include the Unicode rail and composer label.
+            let screen = parser.screen();
+            let region = PaintedRegion::read(screen, tui.rows, 0, tui.cols);
+            if !region
+                .position("alpha")
+                .zip(region.position("beta"))
+                .is_some_and(|((y, x), next)| next == (y + 1, x))
+            {
+                return Err(format!(
+                    "paste did not paint consecutive aligned rows:\n{}",
+                    screen.rows(0, tui.cols).collect::<Vec<_>>().join("\n")
+                ));
+            }
             tui.send(b"\x1b")?;
             let (bytes, code) = tui.finish()?;
             if code != Some(0) {
@@ -1638,7 +2130,7 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
                 Some(RenderMode::Fullscreen),
                 &[("RIVECT_REDUCE_MOTION", "1")],
             )?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             tui.send(b"/help\r")?;
             tui.wait("Commands: Enter submits", WAIT)?;
@@ -1658,7 +2150,7 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
         }
         InputMode::Plain => {
             let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Inline), &[("TERM", "dumb")])?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             tui.send(b"/help\r")?;
             tui.wait("Commands: Enter submits", WAIT)?;
@@ -1674,7 +2166,7 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
         }
         InputMode::Fullscreen => {
             let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Fullscreen), &[])?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             tui.send(b"/help\r")?;
             tui.wait("Commands: Enter submits", WAIT)?;
@@ -1688,7 +2180,7 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
         InputMode::Inline => inline_probe(geometry),
         InputMode::Mouse => {
             let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Fullscreen), &[])?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             let before = tui.bytes()?;
             if has_mouse_capture(&before) {
@@ -1718,7 +2210,7 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
                 Some(RenderMode::Fullscreen),
                 &[("TERM", "tmux-256color")],
             )?;
-            tui.wait("Rivect · not connected", WAIT)?;
+            tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             tui.send(b"/help\r")?;
             tui.wait("Commands: Enter submits", WAIT)?;
@@ -1737,21 +2229,33 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
 
 fn inline_probe(geometry: Geometry) -> Result<(), String> {
     let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Inline), &[])?;
-    tui.wait("Rivect · not connected", WAIT)?;
+    tui.wait("Message", WAIT)?;
     exercise_resize(&mut tui, geometry)?;
     tui.send(b"/help\r")?;
     tui.wait("Commands: Enter submits", WAIT)?;
     tui.send(b"draft text")?;
-    tui.wait("> draft text", WAIT)?;
+    tui.wait("draft text", WAIT)?;
     // The draft survives a surface switch: the key is outside the composer.
+    let mark = tui.bytes()?.len();
     tui.send(b"\x14")?;
-    // The fullscreen transcript follows its tail, so the switch's own row
-    // is visible without a paging keypress.
-    tui.wait("tui: switched to fullscreen", WAIT)?;
-    tui.wait("> draft text", WAIT)?;
+    tui.wait_settled_after("draft text", mark, WAIT)?;
+    if !tui.bytes()?[mark..]
+        .windows(8)
+        .any(|part| part == b"\x1b[?1049h")
+    {
+        return Err("fullscreen switch did not enter alternate screen".into());
+    }
+    tui.wait("draft text", WAIT)?;
+    let mark = tui.bytes()?.len();
     tui.send(b"\x14")?;
-    tui.wait("tui: switched to inline", WAIT)?;
-    tui.wait("> draft text", WAIT)?;
+    tui.wait_settled_after("draft text", mark, WAIT)?;
+    if !tui.bytes()?[mark..]
+        .windows(8)
+        .any(|part| part == b"\x1b[?1049l")
+    {
+        return Err("inline switch did not leave alternate screen".into());
+    }
+    tui.wait("draft text", WAIT)?;
     tui.send(b"\x1b")?;
     let rows = tui.rows;
     let cols = tui.cols;
@@ -1773,15 +2277,15 @@ fn inline_probe(geometry: Geometry) -> Result<(), String> {
 
 fn vim_probe(geometry: Geometry) -> Result<(), String> {
     let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Fullscreen), &[])?;
-    tui.wait("Rivect · not connected", WAIT)?;
+    tui.wait("Message", WAIT)?;
     exercise_resize(&mut tui, geometry)?;
-    tui.send(b"vim card probe\r")?;
-    tui.wait("awaiting decision", WAIT)?;
+    tui.send(b"/task vim card probe\r")?;
+    tui.wait("Begin the first step", WAIT)?;
     tui.wait("focus 1/2", WAIT)?;
     std::thread::sleep(Duration::from_millis(300));
     tui.send_card_key(b"j", "focus 2/2", WAIT)?;
     std::thread::sleep(Duration::from_millis(300));
-    tui.send_card_key(b"\x1b", "decision left unanswered", WAIT)?;
+    tui.send_card_key(b"\x1b", DECISION_UNANSWERED, WAIT)?;
     tui.send(b"\x1b")?;
     let (bytes, code) = tui.finish()?;
     if code != Some(0) {
@@ -1791,87 +2295,54 @@ fn vim_probe(geometry: Geometry) -> Result<(), String> {
 }
 
 fn zero_send_and_approval() -> Result<(), String> {
-    let mut world = support::open_world("installed-tui-inspection", None);
-    let session = world.open_session("inspection");
-    let task = world.create_task(&session, "inspection");
-    let mut view = initial_view();
-    view.decision = Some(DecisionPanel::new(Question::fixture(&task, 1)));
-    for code in [
-        KeyCode::Right,
-        KeyCode::Down,
-        KeyCode::PageDown,
-        KeyCode::Char('j'),
-        KeyCode::Char('k'),
-    ] {
-        let event = TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
-        rivect::ui::handle_decision_event(&event, &mut view, &mut world.runtime, &session);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let endpoint = listener.local_addr().map_err(|e| e.to_string())?;
+    let config = format!(
+        "config_version = 1\n[connections.vllm]\nkind=\"local\"\nendpoint=\"http://{endpoint}/v1\"\n[models.defaults]\nmodel={{mode=\"fixed\",connection=\"vllm\",model_id=\"probe\"}}\neffort={{mode=\"auto\"}}\nfallback={{mode=\"off\"}}\n"
+    );
+    let mut tui = TuiPty::spawn_with_config(
+        Geometry::W80H24,
+        Some(RenderMode::Fullscreen),
+        &[],
+        Some(&config),
+    )?;
+    tui.wait("Message", WAIT)?;
+    tui.send(b"/task inspect witnesses\r")?;
+    tui.wait("focus 1/2", WAIT)?;
+    let db = rusqlite::Connection::open_with_flags(
+        tui.pty.data_root().join("runtime/rivect.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| e.to_string())?;
+    let no_effect = || -> Result<(), String> {
+        let absent: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE state='pending') AND NOT EXISTS(SELECT 1 FROM questions WHERE answer_json IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM answer_attempts) AND NOT EXISTS(SELECT 1 FROM preapprovals) AND NOT EXISTS(SELECT 1 FROM usage_settlements)", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if !absent {
+            return Err("inspection changed question, preapproval, or usage state".into());
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e.to_string()),
+            Ok(_) => Err("inspection contacted the provider".into()),
+        }
+    };
+    tui.send(b"j")?;
+    tui.wait("focus 2/2", WAIT)?;
+    tui.send(b"k")?;
+    tui.wait("focus 1/2", WAIT)?;
+    no_effect()?;
+    tui.pump(Duration::from_millis(250))?;
+    tui.send(b"\x1b")?;
+    tui.wait(DECISION_UNANSWERED, WAIT)?;
+    tui.send(b"/permissions\r")?;
+    tui.wait("Permissions:", WAIT)?;
+    no_effect()?;
+    tui.send(b"/exit\r")?;
+    let (bytes, code) = tui.finish()?;
+    if code != Some(0) {
+        return Err(format!("inspection exit {code:?}"));
     }
-    if world.provider_calls.load(Ordering::SeqCst) != 0 {
-        return Err("focusing the decision card called the provider".to_string());
-    }
-    if world
-        .runtime
-        .store()
-        .answered_question(&task)
-        .map_err(|error| error.to_string())?
-        .is_some()
-    {
-        return Err("focusing the decision card recorded an answer".to_string());
-    }
-    if !world
-        .runtime
-        .store()
-        .answer_attempts(&task)
-        .map_err(|error| error.to_string())?
-        .is_empty()
-    {
-        return Err("focusing the decision card recorded an attempt".to_string());
-    }
-
-    let scope = "/tmp/installed-tui-inspection-scope";
-    let grant = "grant-inspection";
-    view.panel = Some(PermissionPanel::new(
-        ModeDecision::Ask,
-        EffectClass::Write,
-        grant,
-        "task-170-fixture",
-        "2036-01-01T00:00:00Z",
-        scope,
-    ));
-    let key = preapproval_scope(EffectClass::Write, grant, scope)
-        .ok_or_else(|| "inspection scope is not valid unicode".to_string())?;
-    for code in [
-        KeyCode::Right,
-        KeyCode::Down,
-        KeyCode::PageDown,
-        KeyCode::Char('j'),
-        KeyCode::Char('k'),
-    ] {
-        let mut writer = world.runtime.store_writer();
-        rivect::ui::handle_panel_key(code, KeyModifiers::NONE, &mut view, &mut writer);
-    }
-    if world
-        .runtime
-        .store()
-        .is_preapproved(&key)
-        .map_err(|error| error.to_string())?
-    {
-        return Err("inspecting the permission panel recorded a preapproval".to_string());
-    }
-    let mut writer = world.runtime.store_writer();
-    rivect::ui::handle_panel_key(KeyCode::Esc, KeyModifiers::NONE, &mut view, &mut writer);
-    if view.panel.is_some() {
-        return Err("Esc did not close the permission panel".to_string());
-    }
-    if world
-        .runtime
-        .store()
-        .is_preapproved(&key)
-        .map_err(|error| error.to_string())?
-    {
-        return Err("dismissing the permission panel recorded a preapproval".to_string());
-    }
-    Ok(())
+    require_fullscreen_restore(&bytes)
 }
 
 fn headless_pipe_probe(geometry: Geometry, input: InputMode) -> Result<(), String> {
@@ -1882,6 +2353,9 @@ fn headless_pipe_probe(geometry: Geometry, input: InputMode) -> Result<(), Strin
     std::fs::create_dir_all(&data).map_err(|error| format!("pipe data: {error}"))?;
     let mut command = std::process::Command::new(bundle.join("rivect"));
     command
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
         .arg("--headless")
         .arg("--data-root")
         .arg(&data)
@@ -1954,26 +2428,21 @@ const RESTORE_PANIC_CLAIM: &str =
     "NOT_RUN (owned by installed_terminal_restores_after_exit_cancel_and_panic; test-child)";
 const INLINE_SCROLLBACK_CLAIM: &str =
     "NOT_RUN (owned by installed_inline_clear_after_long_transcript_keeps_later_rows)";
-const ZERO_SEND_CLAIM: &str = "NOT_RUN (unit-level proof: installed_focus_and_inspection_never_send_or_approve_unit_level; no packaged interaction claim)";
+const ZERO_SEND_CLAIM: &str = "NOT_RUN (owned by installed_focus_and_inspection_never_send_or_approve; packaged decision and read-only permission inspection)";
 /// The theme inputs are rendered observations now: the report carries one
 /// fingerprint per state, geometry and theme instead of a NOT_RUN family.
 const THEME_CLAIM: &str = "rendered under every state and geometry; per-state status/dock/composer/modal fingerprint in theme_fingerprints";
 
-/// The permission panel's renderer-only claim: the frame proves the renderer
-/// paints the seeded state, never an approval/decision path opening a panel.
-const RENDERER_ONLY_CLAIM: &str = "renderer-only: no production approval/decision path opens the permission panel; the Ask verdict carries no class or target and the sole constructor is the passive `--ui-review` renderer in src/ui/review.rs (DEC-017)";
+const RENDERER_ONLY_CLAIM: &str = "renderer-only: this passive permission fixture does not initiate a request or confer authority";
 
-/// The streaming and failed-output fixtures' renderer-only claim: the step
-/// driver that would feed `LocalView::output` in production is deferred, so
-/// the frame proves the renderer paints the seeded stream, nothing more.
-const RENDERER_ONLY_OUTPUT_CLAIM: &str = "renderer-only: no production producer feeds view.output (the step-driver feed is deferred); the frame proves the renderer paints the seeded stream";
+const RENDERER_ONLY_OUTPUT_CLAIM: &str = "renderer-only: this seeded output tests presentation, not delivery by a running provider or tool";
 
 /// The non-TTY state is not a TUI frame at all: a non-TTY entry routes to
 /// the structured headless loop, so this cell proves the TUI renderer can
 /// paint the seeded text, never that a terminal produces it.
 const RENDERER_ONLY_NON_TTY_CLAIM: &str = "renderer-only: the non-TTY entry routes to the structured headless loop; the TUI cannot paint this state in production";
 
-/// The states whose frame is a renderer fixture with no production producer.
+/// These matrix states are passive review fixtures, not producer or authority proofs.
 fn renderer_only_claim(state: &str) -> Option<&'static str> {
     match state {
         "awaiting-permission" => Some(RENDERER_ONLY_CLAIM),
@@ -1983,18 +2452,16 @@ fn renderer_only_claim(state: &str) -> Option<&'static str> {
     }
 }
 
-/// What each seeded state can honestly claim: the two start states are one
-/// production frame, completion has no transcript line, and the permission,
-/// streaming, failed-output and non-TTY states are the renderer's alone.
+/// Keep the claims about static fixtures distinct from separate runtime scenarios.
 fn state_claims() -> Value {
     json!({
-        "start-no-connection": "production start frame; identical to no-project-index because the runtime projects no project or index fact",
-        "no-project-index": "same production start frame as start-no-connection; no project or index projection exists",
+        "start-no-connection": "seeded disconnected start; no provider is contacted",
+        "no-project-index": "same seeded start with no project or index selected",
         "awaiting-permission": RENDERER_ONLY_CLAIM,
         "streaming-long-output": RENDERER_ONLY_OUTPUT_CLAIM,
         "error-offline-partial": RENDERER_ONLY_OUTPUT_CLAIM,
         "non-tty": RENDERER_ONLY_NON_TTY_CLAIM,
-        "success": "completion is the dock lifecycle row only; production has no completion transcript line",
+        "success": "completion is observed in the seeded task lifecycle row",
     })
 }
 
@@ -2457,8 +2924,7 @@ fn installed_unknown_theme_falls_back_to_mono_with_one_note() {
         "the note is emitted before the alternate screen, so it survives restore"
     );
     assert_eq!(
-        normalized_review_text(&unknown.text),
-        normalized_review_text(&control),
+        unknown.text, control,
         "the mono fallback changes no visible text"
     );
     assert_eq!(
@@ -2543,7 +3009,7 @@ fn installed_ui_review_keys_stay_passive_and_ctrl_c_restores() {
 fn installed_inline_clear_after_long_transcript_keeps_later_rows() {
     let mut tui =
         TuiPty::spawn(Geometry::W80H24, Some(RenderMode::Inline), &[]).expect("inline pty");
-    tui.wait("Input is available", WAIT).expect("inline screen");
+    tui.wait("Message", WAIT).expect("inline screen");
     for _ in 0..8 {
         tui.send(b"/help\r").expect("help");
     }
@@ -2553,9 +3019,11 @@ fn installed_inline_clear_after_long_transcript_keeps_later_rows() {
     tui.wait("New conversation:", WAIT)
         .expect("clear announcement");
     tui.send(b"/settings\r").expect("settings");
-    tui.wait("Settings:", WAIT)
-        .expect("rows after /clear reach inline scrollback");
-    tui.send(b"\x1b").expect("exit");
+    tui.wait("Settings Center", WAIT)
+        .expect("settings after clear");
+    tui.send(b"\x1b").expect("close settings");
+    tui.wait("Message", WAIT).expect("composer");
+    tui.send(b"/exit\r").expect("exit");
     let (bytes, code) = tui.finish().expect("teardown");
     assert_eq!(code, Some(0), "inline /clear exits 0");
     require_inline_restore(&bytes).expect("inline restore");
@@ -2573,15 +3041,14 @@ fn installed_inline_survives_a_terminal_that_never_answers_cursor_queries() {
         &[("TERM", "dumb")],
     )
     .expect("inline pty");
-    tui.wait("Rivect · not connected", WAIT)
-        .expect("inline screen");
+    tui.wait("Message", WAIT).expect("inline screen");
     tui.deaf = true;
     tui.send(b"/help\r").expect("help");
     tui.wait("Commands: Enter submits", WAIT)
         .expect("the transcript lands without a cursor answer");
     // The degraded insert repaints the pinned region in full: without the
     // query-free repaint the scroll leaves the status row blank.
-    tui.wait("Rivect · not connected", WAIT)
+    tui.wait("Message", WAIT)
         .expect("the pinned region survives the unanswered query");
     tui.send(b"\x1b").expect("exit");
     let (bytes, code) = tui.finish().expect("teardown");
@@ -2598,9 +3065,8 @@ fn installed_inline_survives_a_terminal_that_never_answers_cursor_queries() {
 fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
     let mut tui =
         TuiPty::spawn(Geometry::W80H24, Some(RenderMode::Inline), &[]).expect("inline pty");
-    tui.wait("Rivect · not connected", WAIT)
-        .expect("inline screen");
-    tui.send(b"inline card probe\r").expect("submit task");
+    tui.wait("Message", WAIT).expect("inline screen");
+    tui.send(b"/task inline card probe\r").expect("submit task");
     // The production first-question card: its prompt and focus counter are
     // both painted in the nine-row inline region, above the two-row footer.
     // The footer is the last row a card frame paints, so waiting on it
@@ -2627,13 +3093,13 @@ fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
     let bytes = tui.bytes().expect("inline bytes");
     let refused = support::squashed(&tui.screen(&bytes));
     assert!(
-        refused.contains("focus 1/2") && !refused.contains("decision left unanswered"),
+        refused.contains("focus 1/2") && !refused.contains(DECISION_UNANSWERED),
         "an unaimed Esc inside the floor never dismisses the card: {refused}"
     );
     // The waits above already outlasted the floor, so this Esc is admitted
     // and the card leaves the question pending for the wire surface.
     tui.send(b"\x1b").expect("dismiss card");
-    tui.wait("decision left unanswered", WAIT)
+    tui.wait(DECISION_UNANSWERED, WAIT)
         .expect("the admitted Esc dismisses the card");
     tui.send(b"\x1b").expect("exit");
     let (bytes, code) = tui.finish().expect("teardown");
@@ -2673,12 +3139,12 @@ fn installed_linear_mode_is_append_only_plain_text() {
     for (label, mode, env) in cases {
         let mut tui = TuiPty::spawn(Geometry::W80H24, mode, env)
             .unwrap_or_else(|error| panic!("{label} linear pty: {error}"));
-        tui.wait("Input is available. Enter a task or a clarification.", WAIT)
+        tui.wait("Message · Enter submits · Ctrl+D exits", WAIT)
             .unwrap_or_else(|error| panic!("{label} linear screen: {error}"));
         tui.send(b"/help\r").expect("help");
-        tui.wait("Commands: Enter submits", WAIT)
+        tui.wait("/exit · /new · /clear", WAIT)
             .unwrap_or_else(|error| panic!("{label} linear help: {error}"));
-        tui.send(b"\x1b").expect("exit");
+        tui.send(b"\x04").expect("exit");
         let (bytes, code) = tui.finish().expect("teardown");
         assert_eq!(code, Some(0), "{label}: the linear session exits 0");
         assert!(
@@ -2690,14 +3156,18 @@ fn installed_linear_mode_is_append_only_plain_text() {
             "{label}: linear emitted cursor addressing: {}",
             String::from_utf8_lossy(&bytes)
         );
-        let start = b"Input is available. Enter a task or a clarification.\r\nProject:";
+        assert!(
+            support::find_subsequence(&bytes, b"/resume [session]\r\n/decision").is_some(),
+            "{label}: help separates session and decision commands with one physical newline"
+        );
+        let start = b"/cancel\r\nMessage ";
         assert!(
             support::find_subsequence(&bytes, start).is_some(),
             "{label}: consecutive transcript rows arrive intact: {}",
             String::from_utf8_lossy(&bytes)
         );
         assert!(
-            support::find_subsequence(&bytes, b"Commands: Enter submits").is_some(),
+            support::find_subsequence(&bytes, "/exit · /new · /clear".as_bytes()).is_some(),
             "{label}: the help row arrives in the stream"
         );
     }
@@ -2712,41 +3182,75 @@ fn installed_fresh_project_prepares_and_cancels_login() {
     std::fs::create_dir(&home).expect("isolated HOME");
     std::fs::create_dir(&project).expect("project directory");
     let mut command = support::pty_command(support::release::baseline_bundle().join("rivect"));
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("TERM", "xterm-256color");
+    command.env("TMPDIR", root.path());
     command.cwd(&project);
     command.env("HOME", &home);
     command.arg("--data-root");
     command.arg(&data);
-    let mut pty =
+    let pty =
         support::PtySession::spawn(command, 24, 120, root, data).expect("spawn packaged Rivect");
-    let screen = |pty: &support::PtySession, needle: &str| {
-        support::wait_for_screen_text(pty, 24, 120, needle, WAIT).expect("read terminal")
+    let mut tui = TuiPty {
+        pty,
+        rows: 24,
+        cols: 120,
+        cursor_at: 0,
+        deaf: false,
     };
-    let fresh = screen(&pty, "Run /login");
+    let fresh = tui
+        .wait_settled_after("Message → Main", 0, WAIT)
+        .expect("fresh thread");
+    let mut rows = fresh.lines();
+    let header = rows
+        .find(|row| row.contains("Project:"))
+        .expect("project label");
+    let (sidebar, first) = header.split_once("Project:").expect("project label");
+    let mut visible_path = first.trim().to_owned();
+    let project = project.canonicalize().expect("canonical cwd");
+    let path = project.to_str().expect("UTF-8 cwd");
+    for row in rows {
+        if visible_path.len() >= path.len() {
+            break;
+        }
+        visible_path.extend(
+            row.chars()
+                .skip(sidebar.chars().count())
+                .skip_while(|ch| *ch == ' '),
+        );
+        visible_path.truncate(visible_path.trim_end().len());
+    }
+    assert_eq!(visible_path, path, "{fresh}");
     assert!(
-        fresh.contains(
-            project
-                .canonicalize()
-                .expect("canonical cwd")
-                .to_str()
-                .expect("UTF-8 cwd")
-        ),
+        fresh.contains("not connected") && fresh.contains("Run /login"),
         "{fresh}"
     );
-    assert!(fresh.contains("not connected"), "{fresh}");
     assert!(!fresh.contains("NOT_RUN"), "{fresh}");
-    pty.send(b"/login\r").expect("prepare login");
-    let pending = screen(&pty, "Login pending:");
-    assert!(pending.contains("Login pending:"), "{pending}");
-    assert!(pending.contains("not connected"), "{pending}");
-    pty.send(b"/login cancel\r").expect("cancel login");
-    let cancelled = screen(&pty, "Login cancelled.");
-    assert!(cancelled.contains("Login cancelled."), "{cancelled}");
-    assert!(cancelled.contains("not connected"), "{cancelled}");
-    pty.send(b"\x1b").expect("exit");
-    assert_eq!(pty.wait_exit(WAIT).expect("process exit"), Some(0));
-    let bytes = pty.collected().expect("terminal output");
+    tui.send(b"/login\r").expect("prepare login");
+    let pending = tui
+        .wait_settled_after("Paste the callback URL", 0, WAIT)
+        .expect("private callback prompt");
+    assert!(
+        pending.contains("Private login") && pending.contains("Login pending: https://"),
+        "{pending}"
+    );
+    tui.send(b"\x1b")
+        .expect("leave private entry without completing login");
+    tui.wait("Login pending · /login cancel", WAIT)
+        .expect("pending status and cancel action");
+    tui.send(b"/login cancel\r").expect("cancel login");
+    let cancelled = tui
+        .wait_settled_after("Login cancelled.", 0, WAIT)
+        .expect("cancelled receipt");
+    assert!(
+        cancelled.contains("not connected") && !cancelled.contains("Login pending"),
+        "{cancelled}"
+    );
+    tui.send(b"/exit\r").expect("exit");
+    let (bytes, code) = tui.finish().expect("teardown");
+    assert_eq!(code, Some(0));
     require_fullscreen_restore(&bytes).expect("terminal restored");
-    pty.finish().expect("teardown");
 }
 
 #[test]
@@ -2754,8 +3258,7 @@ fn installed_terminal_restores_after_exit_cancel_and_panic() {
     // Exit and cancel run on the packaged artifact.
     let mut exit =
         TuiPty::spawn(Geometry::W80H24, Some(RenderMode::Fullscreen), &[]).expect("exit pty");
-    exit.wait("Rivect · not connected", WAIT)
-        .expect("exit screen");
+    exit.wait("Message", WAIT).expect("exit screen");
     exit.send(b"\x1b").expect("exit key");
     let (bytes, code) = exit.finish().expect("exit teardown");
     assert_eq!(code, Some(0), "Esc exits cleanly");
@@ -2763,58 +3266,39 @@ fn installed_terminal_restores_after_exit_cancel_and_panic() {
 
     let mut cancel =
         TuiPty::spawn(Geometry::W60H20, Some(RenderMode::Fullscreen), &[]).expect("cancel pty");
-    cancel
-        .wait("Rivect · not connected", WAIT)
-        .expect("cancel screen");
+    cancel.wait("Message", WAIT).expect("cancel screen");
     cancel.send(b"\x03").expect("cancel key");
     let (bytes, code) = cancel.finish().expect("cancel teardown");
     assert_eq!(code, Some(130), "Ctrl-C cancels");
     require_fullscreen_restore(&bytes).expect("cancel restore");
 
-    // The packaged artifact has no public panic trigger, so the panic leg
-    // runs the same production guard in this test binary's child.
-    panic_restore().expect("panic restore");
-}
-
-fn panic_restore() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
-    let root = tempfile::TempDir::with_prefix("rivect-installed-panic-")
-        .map_err(|error| format!("panic root: {error}"))?;
-    let data = root.path().join("data");
-    std::fs::create_dir_all(&data).map_err(|error| format!("panic data: {error}"))?;
-    let mut command = support::pty_command(exe);
-    command.env("RIVECT_INSTALLED_TUI_PANIC", "1");
-    command.args([
-        "--ignored",
-        "--exact",
-        "panic_child",
-        "--test-threads=1",
-        "--nocapture",
-    ]);
-    let mut pty = support::PtySession::spawn(command, 20, 80, root, data)
-        .map_err(|error| format!("panic pty: {error}"))?;
-    let entered = pty
-        .wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-        .map_err(|error| format!("panic read: {error}"))?;
-    if !entered {
-        return Err("panic child never entered the alternate screen".to_string());
+    // The fatal handler has no packaged panic hook. Exercise the same renderer code in a private throw-only child.
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tui/launch_test.py");
+    let home = tempfile::tempdir().expect("panic probe home");
+    let mut probe = std::process::Command::new("python3");
+    probe
+        .arg("-B")
+        .arg(script)
+        .arg(support::release::baseline_bundle().join("rivect"))
+        .arg("Launch.test_uncaught_restores_terminal")
+        .env_clear()
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path());
+    for key in ["PATH", "RIVECT_TEST_BUN", "CARGO_TARGET_DIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            probe.env(key, value);
+        }
     }
-    let code = pty
-        .wait_exit(Duration::from_secs(10))
-        .map_err(|error| format!("panic wait: {error}"))?;
-    let bytes = pty
-        .collected()
-        .map_err(|error| format!("panic read: {error}"))?;
-    pty.finish()
-        .map_err(|error| format!("panic teardown: {error}"))?;
-    if code == Some(0) {
-        return Err("panic child exited successfully".to_string());
-    }
-    require_fullscreen_restore(&bytes)
+    let output = probe.output().expect("run OpenTUI crash PTY");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
-fn installed_focus_and_inspection_never_send_or_approve_unit_level() {
+fn installed_focus_and_inspection_never_send_or_approve() {
     zero_send_and_approval().expect("focus/inspection is passive");
 }
 
@@ -2879,14 +3363,4 @@ fn installed_mixed_streams_print_help_and_exit_instead_of_waiting() {
         !log_text.contains('\u{1b}'),
         "the refusal is plain text: {log_text}"
     );
-}
-
-#[test]
-#[ignore = "panic child: its parent spawns it with RIVECT_INSTALLED_TUI_PANIC"]
-fn panic_child() {
-    if std::env::var_os("RIVECT_INSTALLED_TUI_PANIC").is_none() {
-        return;
-    }
-    let _guard = TerminalGuard::enter().expect("terminal guard");
-    panic!("installed tui panic restore probe");
 }

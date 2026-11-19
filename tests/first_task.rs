@@ -34,7 +34,7 @@ use std::time::Duration;
 use support::{
     World, answer_custom, corpus_answer_custom, corpus_answer_option, corpus_config_read,
     corpus_create, corpus_question_current, corpus_status, corpus_steer, ensure_helper, open_world,
-    rivect_binary, spawn_pty,
+    rivect_binary,
 };
 
 fn scoped_world(tag: &str, config: Option<&str>) -> (World, PathBuf, PathBuf, String) {
@@ -3035,231 +3035,239 @@ fn evidence_invalidation_blocks_completion() {
     );
 }
 
-const TUI_ROWS: usize = 24;
-const TUI_COLS: usize = 80;
+const TUI_ROWS: u16 = 24;
+const TUI_COLS: u16 = 80;
+const WAIT: Duration = Duration::from_secs(30);
 
-fn wait_for_visible_tui_text(
-    pty: &support::PtySession,
-    needle: &str,
-    timeout: Duration,
-) -> Result<String, support::PtyIoError> {
-    support::wait_for_screen_text(pty, TUI_ROWS, TUI_COLS, needle, timeout)
+fn packaged_command() -> portable_pty::CommandBuilder {
+    let mut command = support::pty_command(support::release::baseline_bundle().join("rivect"));
+    command.env("TERM", "xterm-256color");
+    command
 }
 
-/// The composer create opens the production start card; a case that only
-/// submits work dismisses it before asserting the transcript or exiting.
-fn dismiss_start_card(pty: &mut support::PtySession) {
-    if wait_for_visible_tui_text(pty, "awaiting decision", Duration::from_secs(5)).is_ok() {
-        // The card's first frame flushes only while the harness drains the
-        // PTY; the consent floor runs from that completed paint. A bare
-        // sleep stalls the flush and lands the Esc inside the floor, so
-        // pump well past it: parallel fixtures can starve the child's paint.
-        pty.pump_for(Duration::from_secs(2))
-            .expect("pump past the decision consent floor");
-        pty.send(b"\x1b").expect("pty send dismiss");
-        let _left =
-            wait_for_visible_tui_text(pty, "decision left unanswered", Duration::from_secs(5));
+fn spawn_thread_at(data: &Path, project: &Path) -> support::PtySession {
+    let scratch = tempfile::TempDir::new().expect("terminal scratch");
+    let mut command = packaged_command();
+    command.env("HOME", scratch.path());
+    command.env("RIVECT_DATA_ROOT", data);
+    command.cwd(project);
+    let pty = support::PtySession::spawn(command, TUI_ROWS, TUI_COLS, scratch, data.to_owned())
+        .expect("spawn packaged TUI");
+    see(&pty, "Message → Main");
+    pty
+}
+
+fn isolated_thread(config: Option<&str>) -> (tempfile::TempDir, support::PtySession) {
+    let root = tempfile::TempDir::new().expect("fixture root");
+    let data = root.path().join("data");
+    let project = root.path().join("project");
+    std::fs::create_dir(&data).expect("data directory");
+    std::fs::create_dir(&project).expect("project directory");
+    if let Some(config) = config {
+        std::fs::write(data.join("config.toml"), config).expect("fixture config");
     }
+    let pty = spawn_thread_at(&data, &project);
+    (root, pty)
+}
+
+fn see(pty: &support::PtySession, text: &str) -> String {
+    support::visible_text(pty, TUI_ROWS, TUI_COLS, text, WAIT)
+}
+
+fn see_frame(
+    pty: &mut support::PtySession,
+    cols: u16,
+    why: &str,
+    matches: impl Fn(&vt100::Screen) -> bool,
+) -> String {
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut parser = vt100::Parser::new(TUI_ROWS, cols, 0);
+    let mut offset = 0;
+    loop {
+        let bytes = pty.collected().expect("read terminal frame");
+        parser.process(&bytes[offset..]);
+        offset = bytes.len();
+        let screen = parser.screen();
+        if matches(screen) {
+            return screen.contents();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "missing {why}: {}",
+            screen.contents()
+        );
+        pty.pump_for(Duration::from_millis(25)).expect("pump frame");
+    }
+}
+
+/// A wrapped path or UUID may share its continuation rows with an unrelated sidebar.
+fn see_wrapped(pty: &mut support::PtySession, cols: u16, label: &str, expected: &str) -> String {
+    see_frame(pty, cols, expected, |screen| {
+        let start = screen.rows(0, cols).enumerate().find_map(|(row, text)| {
+            let (prefix, _) = text.split_once(label)?;
+            let col = u16::try_from(unicode_width::UnicodeWidthStr::width(prefix)).ok()?;
+            Some((row, col))
+        });
+        let Some((row, col)) = start else {
+            return false;
+        };
+        let mut remaining = expected;
+        for text in screen.rows(col, cols - col).skip(row) {
+            let part = text.trim_end();
+            if part == remaining {
+                return true;
+            }
+            let Some(rest) = remaining.strip_prefix(part) else {
+                return false;
+            };
+            remaining = rest.trim_start();
+        }
+        false
+    })
+}
+
+/// Single-letter needles can already occur in the project path. Match draft rows only.
+fn see_draft(pty: &mut support::PtySession, expected: &str) -> String {
+    see_frame(pty, TUI_COLS, expected, |screen| {
+        let editor = screen
+            .rows(0, TUI_COLS)
+            .enumerate()
+            .find_map(|(row, text)| {
+                let (_, right) = text.split_once("Message → Main")?;
+                let draft = right.trim_start();
+                let prefix = &text[..text.len() - draft.len()];
+                let col = u16::try_from(unicode_width::UnicodeWidthStr::width(prefix)).ok()?;
+                (col < TUI_COLS).then_some((row, col))
+            });
+        let Some((row, col)) = editor else {
+            return false;
+        };
+        let mut rows = screen.rows(col, TUI_COLS - col).skip(row);
+        expected.lines().all(|line| {
+            rows.next()
+                .is_some_and(|painted| painted.trim_end() == line)
+        })
+    })
+}
+
+fn exit_thread(mut pty: support::PtySession) {
+    pty.send(b"\x1b").expect("exit");
+    assert_eq!(pty.wait_exit(WAIT).expect("pty wait"), Some(0));
+    pty.finish().expect("pty teardown");
+}
+
+fn dismiss_start_card(pty: &mut support::PtySession) -> String {
+    let card = see(pty, "awaiting decision");
+    let id = card
+        .lines()
+        .find_map(|row| row.split_once("task: "))
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("task id on start card")
+        .to_owned();
+    pty.pump_for(Duration::from_millis(250))
+        .expect("consent floor");
+    pty.send(b"\x1b").expect("dismiss unanswered question");
+    see(pty, "Unanswered; question stays pending");
+    id
+}
+
+fn answer_card(pty: &mut support::PtySession, prompt: &str, second: bool) {
+    see(pty, prompt);
+    if second {
+        pty.send(b"\x1b[B").expect("select second option");
+    }
+    let (row, focus) = if second {
+        ("> 2. ", "focus 2/")
+    } else {
+        ("> 1. ", "focus 1/")
+    };
+    see_frame(pty, TUI_COLS, focus, |screen| {
+        let frame = screen.contents();
+        frame.contains(prompt) && frame.contains(row) && frame.contains(focus)
+    });
+    pty.pump_for(Duration::from_millis(250))
+        .expect("painted consent floor");
+    support::confirm_witness(pty);
+}
+
+fn task_store(pty: &support::PtySession) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        pty.data_root().join("runtime/rivect.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read owner database")
+}
+
+fn assert_saved_goal(pty: &support::PtySession, id: &str, expected: &[u8]) {
+    let bytes: Vec<u8> = task_store(pty)
+        .query_row(
+            "SELECT goal_bytes FROM tasks WHERE task_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .expect("saved goal");
+    assert_eq!(bytes, expected);
 }
 
 #[test]
 fn tui_enter_dispatches_tasks_and_help() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-    pty.send(b"\r/help\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains("Commands:"),
-        "Enter on /help must show help through the fullscreen entry path: {visible:?}"
-    );
-    assert!(
-        !visible.contains("q quits when composer is empty"),
-        "help must not advertise empty-composer q quit: {visible:?}"
-    );
-    assert!(
-        !visible.contains("Submitted task:"),
-        "empty Enter and /help must not create a task: {visible:?}"
-    );
-
-    pty.send(b"task from q\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: task from q (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    assert!(
-        visible.contains("Submitted task: task from q (accepted: "),
-        "non-empty Enter must show the accepted task receipt: {visible:?}"
-    );
-    // The dock projection is its own state change and can paint a frame
-    // after the receipt: wait for it instead of reading the receipt frame.
-    let visible =
-        wait_for_visible_tui_text(&pty, ": waiting", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains(": waiting"),
-        "task dock must show the work waiting on its start question: {visible:?}"
-    );
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    let (_root, mut pty) = isolated_thread(None);
+    pty.send(b"\r/help\r").expect("empty Enter then help");
+    let help = see(&pty, "Commands:");
+    assert!(!help.contains("q quits when composer is empty"));
+    assert!(help.contains("No active task"), "{help}");
+    pty.send(b"/task task from q\r")
+        .expect("submit project task");
+    let id = dismiss_start_card(&mut pty);
+    let frame = see(&pty, "Machine waiting");
+    assert!(frame.contains("task from q"), "{frame}");
+    pty.send(b"\t").expect("inspect the waiting task");
+    see(&pty, &format!("waiting · {id}"));
+    pty.send(b"\x1b").expect("close task details");
+    see(&pty, "Message → Main");
+    assert_saved_goal(&pty, &id, b"task from q");
+    exit_thread(pty);
 }
 
 #[test]
 fn tui_lowercase_q_starts_composer_and_dispatches_exact_goal() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    pty.send(b"q").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "> q", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains("> q"),
-        "first lowercase q must remain in composer while TUI runs: {visible:?}"
-    );
-
-    pty.send(b"uery the root\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: query the root (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    assert!(
-        visible.contains("Submitted task: query the root (accepted: "),
-        "TUI must dispatch exact goal after q-first input: {visible:?}"
-    );
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-
-    let db_path = pty.data_root().join("runtime").join("rivect.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    let goal: Vec<u8> = conn
-        .query_row(
-            "SELECT goal_bytes FROM tasks WHERE goal_bytes = ?1",
-            rusqlite::params![b"query the root".to_vec()],
-            |row| row.get(0),
-        )
-        .expect("query persisted TUI goal");
-    assert_eq!(
-        goal.as_slice(),
-        b"query the root",
-        "TUI dispatch must persist exact goal bytes"
-    );
-    drop(conn);
-    pty.finish().expect("pty teardown");
+    let (_root, mut pty) = isolated_thread(None);
+    pty.send(b"q").expect("type first letter");
+    see_draft(&mut pty, "q");
+    pty.send(b"uery the root\r")
+        .expect("submit q-first message");
+    let id = dismiss_start_card(&mut pty);
+    see(&pty, "query the root");
+    assert_saved_goal(&pty, &id, b"query the root");
+    exit_thread(pty);
 }
 
 #[test]
 fn tui_bracketed_paste_fills_the_composer_without_submitting() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    // One atomic paste event: the pasted newline joins the draft as a
-    // space — it must not submit the way the raw byte stream's `\n`
-    // did before bracketed paste.
-    pty.send("\x1b[200~multi line\npaste goal\x1b[201~".as_bytes())
-        .expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "> multi line paste goal", Duration::from_secs(10))
-            .expect("pty screen");
-    assert!(
-        visible.contains("> multi line paste goal"),
-        "the pasted text reaches the composer draft: {visible:?}"
-    );
-    assert!(
-        !visible.contains("Submitted task:"),
-        "a pasted newline never submits: {visible:?}"
-    );
-
-    // Only a real Enter submits — and it submits the joined draft
-    // verbatim.
-    pty.send(b"\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: multi line paste goal (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    assert!(
-        visible.contains("Submitted task: multi line paste goal"),
-        "the joined draft is the submitted goal: {visible:?}"
-    );
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    let (_root, mut pty) = isolated_thread(None);
+    pty.send(b"\x1b[200~multi line\npaste goal\x1b[201~")
+        .expect("paste draft");
+    let draft = see_draft(&mut pty, "multi line\npaste goal");
+    assert!(draft.contains("No active task"), "{draft}");
+    pty.send(b"\r").expect("submit pasted message");
+    let id = dismiss_start_card(&mut pty);
+    assert_eq!(session_counts(&pty).0, 1, "exactly one task submitted");
+    assert_saved_goal(&pty, &id, b"multi line\npaste goal");
+    exit_thread(pty);
 }
 
 #[test]
 fn tui_char_chords_never_type_their_letter_into_the_composer() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    // A Ctrl or Alt chord is a command the composer does not bind:
-    // its letter must never land in the draft (Ctrl+W is not "w").
-    // `\x17` is the Ctrl+W byte; `ESC`+`v` in one write merges into a
-    // single Alt+V event, the same merge `\x1b\r` makes.
-    pty.send(b"\x17").expect("pty send");
-    pty.send(b"\x1bv").expect("pty send");
-    pty.send(b"x").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "> x", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains("> x"),
-        "the bare char lands and neither chord typed its letter: {visible:?}"
-    );
-    assert!(
-        !visible.contains("wvx"),
-        "a chord must not type its letter: {visible:?}"
-    );
-
-    // The draft is exactly the bare char — Enter submits it verbatim.
-    pty.send(b"\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let visible = wait_for_visible_tui_text(&pty, "Submitted task: x (", Duration::from_secs(10))
-        .expect("pty screen");
-    assert!(
-        visible.contains("Submitted task: x ("),
-        "the composer held exactly the typed char: {visible:?}"
-    );
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    let (_root, mut pty) = isolated_thread(None);
+    pty.send(b"\x17").expect("Ctrl-W");
+    pty.send(b"\x1bv").expect("Alt-V");
+    pty.send(b"x").expect("bare x");
+    see_draft(&mut pty, "x");
+    pty.send(b"\r").expect("submit");
+    let id = dismiss_start_card(&mut pty);
+    assert_eq!(session_counts(&pty).0, 1, "exactly one task submitted");
+    assert_saved_goal(&pty, &id, b"x");
+    exit_thread(pty);
 }
 
 // ----- the composer's /new and /clear -----
@@ -3286,59 +3294,83 @@ fn listed_tasks(status: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The accepted task id the transcript's receipt line carries.
-fn accepted_task_id(screen: &str) -> String {
-    let line = screen
-        .lines()
-        .find(|line| line.contains("(accepted: "))
-        .unwrap_or_else(|| panic!("the accepted receipt line is on screen: {screen:?}"));
-    line.split("(accepted: ")
-        .nth(1)
-        .expect("the receipt names its id")
-        .split(')')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
+/// Gate the offline HTTP response, not the store: this is a real send on a running task.
+fn held_messages() -> (
+    ChatPeer,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (entered, requests) = std::sync::mpsc::sync_channel(1);
+    let (release, gate) = std::sync::mpsc::sync_channel(1);
+    let peer = ChatPeer::scripted(move |_, _| {
+        entered.send(()).expect("request observer");
+        gate.recv_timeout(WAIT)
+            .expect("explicit release of held response");
+        // Message ingress admits text only. This real tool reply settles it as blocked.
+        chat_stream("read_file", json!({"path":"not-read.txt"}))
+    });
+    (peer, requests, release)
 }
 
-/// Settles the guard fixture's own run state directly: a submitted task waits
-/// on its start question, and these cases prove the session-switch guard over
-/// running work rather than over the start card.
-fn mark_task_running(pty: &support::PtySession) -> String {
-    let db_path = pty.data_root().join("runtime").join("rivect.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    conn.busy_timeout(Duration::from_secs(10))
-        .expect("busy timeout");
-    conn.execute(
-        "UPDATE tasks SET lifecycle = 'running' WHERE task_id = (SELECT task_id FROM tasks ORDER BY rowid DESC LIMIT 1)",
-        [],
-    )
-    .expect("mark the fixture task running");
-    conn.query_row(
-        "SELECT task_id FROM tasks ORDER BY rowid DESC LIMIT 1",
-        [],
-        |row| row.get(0),
-    )
-    .expect("read the marked task")
+fn session_counts(pty: &support::PtySession) -> (i64, i64) {
+    task_store(pty)
+        .query_row(
+            "SELECT (SELECT count(*) FROM tasks), (SELECT count(*) FROM sessions)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("task and session counts")
 }
 
-/// The reconstructed frame once `needle` appears at least `count` times:
-/// the composer can paint the same line twice, so `contains` is not enough.
-fn wait_for_repeated_tui_text(
-    pty: &support::PtySession,
-    needle: &str,
-    count: usize,
-    timeout: Duration,
-) -> Result<String, support::PtyIoError> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let visible = support::reconstruct_screen(&pty.collected()?, TUI_ROWS, TUI_COLS);
-        if visible.matches(needle).count() >= count || std::time::Instant::now() >= deadline {
-            return Ok(visible);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+fn switch_idle(pty: &mut support::PtySession, command: &str) {
+    pty.send(format!("{command}\r").as_bytes())
+        .expect("switch conversation");
+    see_frame(pty, TUI_COLS, "empty new conversation", |screen| {
+        let frame = screen.contents();
+        frame.contains("New conversation:")
+            && frame.contains("No active task")
+            && !frame.contains("Commands:")
+    });
+}
+
+fn refuse_running(pty: &mut support::PtySession, command: &str, goal: &str) -> String {
+    let before = session_counts(pty);
+    let id: String = task_store(pty)
+        .query_row(
+            "SELECT task_id FROM tasks WHERE goal_bytes = ?1 AND lifecycle = 'running'",
+            rusqlite::params![goal.as_bytes()],
+            |row| row.get(0),
+        )
+        .expect("real running task");
+    see(pty, "Main · running");
+    pty.send(format!("{command}\r").as_bytes())
+        .expect("attempt session switch");
+    let screen = see_wrapped(
+        pty,
+        TUI_COLS,
+        &format!("{command} refused:"),
+        &format!("{command} refused: task {id} is running"),
+    );
+    assert!(!screen.contains("New conversation:"), "{screen}");
+    assert!(
+        screen.contains(goal.lines().next().expect("nonempty goal")),
+        "{screen}"
+    );
+    assert!(screen.contains("Main · running"), "{screen}");
+    assert_eq!(
+        session_counts(pty),
+        before,
+        "a refused switch mints no session or task"
+    );
+    let state: String = task_store(pty)
+        .query_row(
+            "SELECT lifecycle FROM tasks WHERE task_id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .expect("lifecycle after refusal");
+    assert_eq!(state, "running", "switching must not cancel live work");
+    id
 }
 
 #[test]
@@ -3491,598 +3523,248 @@ fn new_and_clear_create_an_independent_conversation_p3() {
 
 #[test]
 fn new_and_clear_create_an_independent_conversation_p4() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    // A conversation with no running task: /clear is /new's alias, so the
-    // transcript the operator was reading is cleared and a new conversation is
-    // announced. A reroute back to the removed `view.clear` would keep the
-    // help rows and announce nothing.
-    pty.send(b"/help\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains("Commands:"),
-        "help paints the transcript first: {visible:?}"
-    );
-    pty.send(b"/clear\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(&pty, "New conversation: ", Duration::from_secs(10))
-        .expect("pty screen");
-    let screen = support::squashed(&visible);
-    assert!(
-        screen.contains("New conversation: "),
-        "Enter on /clear announces the new conversation: {screen:?}"
-    );
-    assert!(
-        !screen.contains("Commands:"),
-        "/clear drops the transcript rows: {screen:?}"
-    );
-
-    // A running task refuses the switch typed: nothing pauses a running task
-    // on a session switch in this build, so the composer names the task and
-    // the conversation the operator is reading stays addressable.
-    pty.send(b"stored conversation\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let _visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: stored conversation (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    let stored_task = mark_task_running(&pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        &format!("task {stored_task}: running"),
-        Duration::from_secs(10),
-    )
-    .expect("running dock");
-    assert!(
-        visible.contains(&format!("task {stored_task}: running")),
-        "the stored conversation has live work: {visible:?}"
-    );
-    let running = stored_task;
-
-    pty.send(b"/clear\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
-    let screen = support::squashed(&visible);
-    assert!(
-        screen.contains(&format!("/clear refused: task {running} is running")),
-        "a running task refuses the switch with its own typed cause: {screen:?}"
-    );
-    assert!(
-        screen.contains("Submitted task: stored conversation"),
-        "a refused switch keeps the transcript: {screen:?}"
-    );
-    assert!(
-        screen.contains(&format!("task {running}: running")),
-        "the dock still names the running task: {screen:?}"
-    );
-
-    // The stored conversation survives the view it was read in.
-    let db_path = pty.data_root().join("runtime").join("rivect.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    let tasks: i64 = conn
-        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
-        .expect("count tasks");
-    assert_eq!(tasks, 1, "/clear never deletes the stored conversation");
-    drop(conn);
-
-    // /help is the one command vocabulary a human reads.
-    pty.send(b"/help\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "/compact", Duration::from_secs(10)).expect("pty screen");
-    let screen = support::squashed(&visible);
-    for token in ["/new", "/clear", "/compact"] {
-        assert!(screen.contains(token), "help names {token}: {screen:?}");
+    let (peer, entered, release) = held_messages();
+    let (_root, mut pty) = isolated_thread(Some(&local_chat_config(&peer.endpoint())));
+    pty.send(b"/help\r").expect("help");
+    see(&pty, "Commands:");
+    switch_idle(&mut pty, "/clear");
+    pty.send(b"stored conversation\r").expect("submit");
+    entered.recv_timeout(WAIT).expect("provider entered");
+    refuse_running(&mut pty, "/clear", "stored conversation");
+    assert_eq!(session_counts(&pty), (1, 2));
+    release.send(()).expect("release response");
+    see(&pty, "You blocked");
+    pty.send(b"/help\r").expect("help after refusal");
+    let help = see(&pty, "/compact");
+    for name in ["/new", "/clear", "/compact"] {
+        assert!(help.contains(name), "{help}");
     }
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    assert_eq!(peer.requests(), 1);
+    exit_thread(pty);
 }
 
 #[test]
 fn new_and_clear_create_an_independent_conversation_p5() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    // A typed /clear with nothing running is /new's alias: the transcript is
-    // cleared and the new conversation is announced.
-    pty.send(b"/help\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains("Commands:"),
-        "help paints the transcript first: {visible:?}"
-    );
-    pty.send(b"/clear\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(&pty, "New conversation: ", Duration::from_secs(10))
-        .expect("pty screen");
-    let screen = support::squashed(&visible);
-    assert!(
-        screen.contains("New conversation: "),
-        "a typed /clear runs the command: {screen:?}"
-    );
-    assert!(
-        !screen.contains("Commands:"),
-        "a typed /clear drops the transcript rows: {screen:?}"
-    );
-    let announcements = visible.matches("New conversation: ").count();
-
-    // A document pasted as one bracketed paste is text, line breaks
-    // included: the /clear inside it is not the command.
-    pty.send("\x1b[200~notes\n/clear\nend\x1b[201~".as_bytes())
-        .expect("pty send");
-    let visible = wait_for_visible_tui_text(&pty, "> notes /clear end", Duration::from_secs(10))
-        .expect("pty screen");
-    assert!(
-        visible.contains("> notes /clear end"),
-        "the pasted document is composer text: {visible:?}"
-    );
-    assert_eq!(
-        visible.matches("New conversation: ").count(),
-        announcements,
-        "a pasted /clear never runs: {visible:?}"
-    );
-
-    // Enter submits the draft as a task: the document's /clear line stays
-    // part of the goal.
-    pty.send(b"\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: notes /clear end (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    assert_eq!(
-        visible.matches("Submitted task:").count(),
-        1,
-        "the pasted document became one task: {visible:?}"
-    );
-    let stored_task = mark_task_running(&pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        &format!("task {stored_task}: running"),
-        Duration::from_secs(10),
-    )
-    .expect("running dock");
-    let running = stored_task;
-    assert!(
-        visible.contains(&format!("task {running}: running")),
-        "the dock names the running task: {visible:?}"
-    );
-
-    // Only an exactly typed command reaches the dispatcher, and a running
-    // task refuses the switch with its own typed cause instead of faking it.
-    pty.send(b"/clear\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
-    let screen = support::squashed(&visible);
-    assert!(
-        screen.contains(&format!("/clear refused: task {running} is running")),
-        "a typed /clear while a task runs is refused typed: {screen:?}"
-    );
-    assert!(
-        screen.contains("Submitted task: notes /clear end"),
-        "the refused switch keeps the transcript: {screen:?}"
-    );
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    let (peer, entered, release) = held_messages();
+    let (_root, mut pty) = isolated_thread(Some(&local_chat_config(&peer.endpoint())));
+    pty.send(b"/help\r").expect("help");
+    see(&pty, "Commands:");
+    switch_idle(&mut pty, "/clear");
+    assert_eq!(session_counts(&pty), (0, 2));
+    pty.send(b"\x1b[200~notes\n/clear\nend\x1b[201~")
+        .expect("paste document");
+    // The compact editor shows two rows; visit both ends before submitting.
+    pty.send(b"\x1b[B\x1b[B")
+        .expect("show the end of the draft");
+    see_draft(&mut pty, "/clear\nend");
+    pty.send(b"\x1b[A\x1b[A")
+        .expect("show the start of the draft");
+    see_draft(&mut pty, "notes\n/clear");
+    assert_eq!(session_counts(&pty), (0, 2), "embedded /clear is text");
+    pty.send(b"\r").expect("submit document");
+    entered.recv_timeout(WAIT).expect("provider entered");
+    let id = refuse_running(&mut pty, "/clear", "notes\n/clear\nend");
+    assert_saved_goal(&pty, &id, b"notes\n/clear\nend");
+    assert_eq!(session_counts(&pty), (1, 2));
+    release.send(()).expect("release response");
+    see(&pty, "You blocked");
+    assert_eq!(peer.requests(), 1);
+    exit_thread(pty);
 }
 
 #[test]
 fn composer_settings_paints_the_served_entries_and_config_is_its_alias() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    // `/settings` paints the dispatcher's own `settings.open` answer: the
-    // three base-supplied keys every settings view edits. A hand-written
-    // projection that painted an empty or invented list would not name them.
-    pty.send(b"/settings\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "Settings:", Duration::from_secs(10)).expect("pty screen");
-    let screen = support::squashed(&visible);
-    assert!(
-        screen.contains("Settings:"),
-        "/settings opens the settings surface: {screen:?}"
-    );
-    for key in ["workflow.enabled", "decisions.mode", "context.auto_compact"] {
-        assert!(
-            screen.contains(&format!("{key} = ")),
-            "/settings names its served key {key}: {screen:?}"
-        );
+    let (_root, mut pty) = isolated_thread(None);
+    for command in [b"/settings\r".as_slice(), b"/config\r"] {
+        pty.send(command).expect("open settings");
+        for key in ["workflow.enabled", "decisions.mode", "context.auto_compact"] {
+            let screen = see(&pty, &format!("{key} = "));
+            assert!(screen.contains("Settings Center"), "{screen}");
+        }
+        pty.send(b"\x1b").expect("close settings");
+        let thread = see(&pty, "Message → Main");
+        assert!(!thread.contains("Settings Center"), "{thread}");
     }
-
-    // `/config` is the same alias and the same served answer: a second
-    // `Settings:` block is painted, not a second hand-written view.
-    pty.send(b"/config\r").expect("pty send");
-    let visible = wait_for_repeated_tui_text(&pty, "Settings:", 2, Duration::from_secs(10))
-        .expect("pty screen");
-    let screen = support::squashed(&visible);
-    assert_eq!(
-        visible.matches("Settings:").count(),
-        2,
-        "/config opens the same settings surface: {screen:?}"
-    );
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    exit_thread(pty);
 }
 
 #[test]
 fn misused_slash_command_is_a_usage_line_not_a_task_p6() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    // An argument is not the command.
-    pty.send(b"/clear now\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "Unknown command. /help", Duration::from_secs(10))
-            .expect("pty screen");
-    assert!(
-        support::squashed(&visible).contains("Unknown command. /help"),
-        "an argument is a usage line naming /help: {visible:?}"
-    );
-
-    // A near miss is not the command either.
-    pty.send(b"/cler\r").expect("pty send");
-    let visible =
-        wait_for_repeated_tui_text(&pty, "Unknown command. /help", 2, Duration::from_secs(10))
-            .expect("pty screen");
-    let screen = support::squashed(&visible);
-    assert_eq!(
-        visible.matches("Unknown command. /help").count(),
-        2,
-        "both misuses paint their own usage line: {screen:?}"
-    );
-    assert!(
-        !screen.contains("Submitted task:"),
-        "a misuse never becomes a task: {screen:?}"
-    );
-    assert!(
-        !screen.contains("New conversation: "),
-        "neither misuse runs /clear: {screen:?}"
-    );
-
-    // Spending nothing means nothing was submitted and nothing was read.
-    let db_path = pty.data_root().join("runtime").join("rivect.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    let tasks: i64 = conn
-        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
-        .expect("count tasks");
-    assert_eq!(tasks, 0, "a usage line spends nothing");
-    drop(conn);
-
-    // The loop keeps serving: the next command is read normally.
-    pty.send(b"/help\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains("Commands:"),
-        "a misused command never ends the session: {visible:?}"
-    );
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    let (_root, mut pty) = isolated_thread(None);
+    // Initialize the actual owner, so an absent database cannot masquerade as zero work.
+    pty.send(b"/resume\r").expect("open session list");
+    see(&pty, "sessions");
+    let counts = session_counts(&pty);
+    assert_eq!(counts.0, 0);
+    for misuse in [b"/clear now\r".as_slice(), b"/cler\r"] {
+        pty.send(misuse).expect("submit invalid slash command");
+        let usage = see_wrapped(
+            &mut pty,
+            TUI_COLS,
+            "Unknown command.",
+            "Unknown command. Use /help or Tab for commands.",
+        );
+        assert!(!usage.contains("New conversation:"), "{usage}");
+        assert_eq!(session_counts(&pty), counts);
+        pty.send(b"/help\r").expect("valid command after misuse");
+        see_frame(&mut pty, TUI_COLS, "help without misuse notice", |screen| {
+            let frame = screen.contents();
+            frame.contains("Commands:") && !frame.contains("Unknown command.")
+        });
+    }
+    exit_thread(pty);
 }
 
 #[test]
 fn new_requires_an_idle_session_p8() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
-    );
-
-    // Positive control: nothing runs yet, so /new serves.
-    pty.send(b"/new\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(&pty, "New conversation", Duration::from_secs(10))
-        .expect("pty screen");
-    assert!(
-        visible.contains("New conversation"),
-        "/new serves an idle session: {visible:?}"
-    );
-
-    pty.send(b"probe\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: probe (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    let running = accepted_task_id(&visible);
-    assert!(
-        !running.is_empty(),
-        "the accepted receipt names its task: {visible:?}"
-    );
-    let running = mark_task_running(&pty);
-    let _ = wait_for_visible_tui_text(
-        &pty,
-        &format!("task {running}: running"),
-        Duration::from_secs(10),
-    )
-    .expect("running dock");
-
-    // With that task running the switch is refused, and the refusal
-    // names the task it would have left behind.
-    pty.send(b"/new\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
-    let refusal = visible
-        .lines()
-        .find(|line| line.contains("/new refused:"))
-        .unwrap_or_else(|| panic!("the refusal is painted: {visible:?}"));
-    assert!(
-        refusal.contains(&format!("task {running} is running")),
-        "the refusal names the running task: {refusal:?}"
-    );
-    assert!(
-        visible.matches("New conversation").count() == 1,
-        "a refused /new starts no conversation: {visible:?}"
-    );
-    assert_eq!(
-        visible.matches("Submitted task:").count(),
-        1,
-        "a refused /new submits nothing: {visible:?}"
-    );
-
-    // Spending nothing: one task, and no session minted by the refusal.
-    let db_path = pty.data_root().join("runtime").join("rivect.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    let tasks: i64 = conn
-        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
-        .expect("count tasks");
-    let sessions: i64 = conn
-        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-        .expect("count sessions");
-    assert_eq!(tasks, 1, "a refused /new spends nothing");
-    assert_eq!(
-        sessions, 2,
-        "the boot session plus the one served /new; the refusal minted none"
-    );
-    drop(conn);
-
-    // Blocked work spends nothing: a task that is not running leaves the
-    // conversation startable, so `/new` serves instead of holding it for a
-    // run that is not happening.
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    conn.busy_timeout(Duration::from_secs(10))
-        .expect("busy timeout");
-    conn.execute(
-        "UPDATE tasks SET lifecycle = 'blocked' WHERE task_id = ?1",
-        [&running],
-    )
-    .expect("block the accepted task");
-    let previous: String = conn
+    let (peer, entered, release) = held_messages();
+    let (_root, mut pty) = isolated_thread(Some(&local_chat_config(&peer.endpoint())));
+    switch_idle(&mut pty, "/new");
+    assert_eq!(session_counts(&pty), (0, 2));
+    pty.send(b"probe\r").expect("submit first probe");
+    entered.recv_timeout(WAIT).expect("first provider request");
+    let id = refuse_running(&mut pty, "/new", "probe");
+    assert_eq!(session_counts(&pty), (1, 2));
+    let previous: String = task_store(&pty)
+        .query_row(
+            "SELECT session_id FROM tasks WHERE task_id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .expect("source session");
+    release.send(()).expect("release first response");
+    see(&pty, "You blocked");
+    switch_idle(&mut pty, "/new");
+    let current: String = task_store(&pty)
         .query_row(
             "SELECT session_id FROM sessions ORDER BY rowid DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
-        .expect("read the conversation /new leaves");
-    drop(conn);
-
-    // The painted line wraps after `(previous:`, so the switch is named by
-    // the conversation it left on the row below: the head of that id must
-    // still be visible there. The first served `/new` already painted one
-    // wrapped marker, so the wait needs the second one.
-    let left_behind = previous.get(..8).unwrap_or(previous.as_str());
-    pty.send(b"/new\r").expect("pty send");
-    let visible = wait_for_repeated_tui_text(&pty, "(previous:", 2, Duration::from_secs(10))
-        .expect("pty screen");
-    let rows: Vec<&str> = visible.lines().collect();
-    let marker = rows
-        .iter()
-        .rposition(|row| row.contains("(previous:"))
-        .expect("the switch names the conversation it left");
-    assert!(
-        rows.get(marker + 1)
-            .is_some_and(|row| row.contains(left_behind)),
-        "the previous conversation's head is visible below the wrapped marker: {visible:?}"
-    );
-    assert!(
-        !visible.contains(&format!("(previous: {left_behind}")),
-        "the pinned projection is the wrapped two-line form: {visible:?}"
-    );
-
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    let tasks: i64 = conn
-        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
-        .expect("count tasks");
-    let sessions: i64 = conn
-        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-        .expect("count sessions");
-    drop(conn);
-    assert_eq!(tasks, 1, "a served /new creates no task");
-    assert_eq!(sessions, 3, "the boot session and two served /new");
-
-    // A running task still refuses, in the conversation the switch left:
-    // the rule is about the run, not a blanket admission.
-    pty.send(b"second probe\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let _visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: second probe (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    let live = mark_task_running(&pty);
-    let _ = wait_for_visible_tui_text(
-        &pty,
-        &format!("task {live}: running"),
-        Duration::from_secs(10),
-    )
-    .expect("running dock");
-    pty.send(b"/new\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        &format!("refused: task {live} is running"),
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    assert!(
-        visible.contains(&format!("refused: task {live} is running")),
-        "a running task still refuses the switch: {visible:?}"
-    );
-    assert!(
-        visible.matches("New conversation:").count() == 1,
-        "the refusal starts no conversation: {visible:?}"
-    );
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    let sessions: i64 = conn
-        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-        .expect("count sessions");
-    drop(conn);
-    assert_eq!(sessions, 3, "the second refusal mints no conversation");
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+        .expect("new session id");
+    assert_ne!(current, previous);
+    for (label, id) in [
+        ("New conversation:", current),
+        ("Previous session:", previous),
+    ] {
+        see_wrapped(&mut pty, TUI_COLS, label, &format!("{label} {id}"));
+    }
+    assert_eq!(session_counts(&pty), (1, 3));
+    pty.send(b"second probe\r").expect("submit second probe");
+    entered.recv_timeout(WAIT).expect("second provider request");
+    let second = refuse_running(&mut pty, "/new", "second probe");
+    assert_ne!(id, second);
+    assert_eq!(session_counts(&pty), (2, 3));
+    release.send(()).expect("release second response");
+    see(&pty, "You blocked");
+    assert_eq!(peer.requests(), 2);
+    exit_thread(pty);
 }
 
 #[test]
 fn new_requires_an_idle_session_p9() {
-    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be entered on start"
+    let (root, mut pty) = isolated_thread(None);
+    pty.send(b"/task probe\r").expect("submit project task");
+    let first = dismiss_start_card(&mut pty);
+    let session = rivect::contracts::SessionId(
+        task_store(&pty)
+            .query_row(
+                "SELECT session_id FROM tasks WHERE task_id = ?1",
+                rusqlite::params![first],
+                |r| r.get(0),
+            )
+            .expect("source conversation"),
     );
+    exit_thread(pty);
 
-    // One real task names the session the guard reads; the seed below
-    // fills the page the guard used to scan.
-    pty.send(b"probe\r").expect("pty send");
-    dismiss_start_card(&mut pty);
-    let visible = wait_for_visible_tui_text(
-        &pty,
-        "Submitted task: probe (accepted: ",
-        Duration::from_secs(10),
-    )
-    .expect("pty screen");
-    let first = accepted_task_id(&visible);
-    assert!(!first.is_empty(), "the receipt names its task: {visible:?}");
-
-    let db_path = pty.data_root().join("runtime").join("rivect.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    conn.busy_timeout(Duration::from_secs(10))
-        .expect("busy timeout");
-    let session: String = conn
-        .query_row(
-            "SELECT session_id FROM tasks WHERE task_id = ?1",
-            [&first],
-            |row| row.get(0),
-        )
-        .expect("read the task session");
-    conn.execute(
-        "UPDATE tasks SET lifecycle = 'completed' WHERE task_id = ?1",
-        [&first],
-    )
-    .expect("settle the submitted task");
-    // A session past the page cap: `PAGE_MAX` settled rows fill the first
-    // page, and the running task behind them is the one the switch would
-    // orphan.
-    let seed = conn
-        .unchecked_transaction()
-        .expect("open the seed transaction");
-    let insert = "INSERT INTO tasks (task_id, session_id, revision, intent_revision, contract_revision, lifecycle, goal_bytes, goal_digest, goal_artifact_id, event_cursor)
-                  VALUES (?1, ?2, 0, 0, 1, ?3, x'', '', '', 0)";
-    for index in 0..=rivect::contracts::PAGE_MAX {
-        seed.execute(
-            insert,
-            rusqlite::params![format!("seed-{index:04}"), &session, "completed"],
-        )
-        .expect("seed a settled task");
+    let data = root.path().join("data");
+    let project = root.path().join("project");
+    let running = {
+        let mut world = support::open_world_at(&data, None);
+        world
+            .runtime
+            .store_writer()
+            .cancel_task(&session, &rivect::contracts::TaskId(first), 1, None)
+            .expect("settle initial project task");
+        let mut tasks = Vec::new();
+        for index in 0..=rivect::contracts::PAGE_MAX {
+            tasks.push(world.create_task(&session, &format!("guard-page-{index}")));
+        }
+        let first_page = |world: &mut World| {
+            listed_tasks(&world.dispatch(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"runtime.status", "params":{
+                "schema_version":1,"session_id":session.0,"page":{"page_size":rivect::contracts::PAGE_MAX}
+            }
+        })))
+        };
+        let page = first_page(&mut world);
+        assert_eq!(page.len(), rivect::contracts::PAGE_MAX as usize);
+        let outside = tasks
+            .iter()
+            .position(|task| !page.contains(&task.0))
+            .expect("task past page cap");
+        let live = tasks.swap_remove(outside);
+        for task in tasks {
+            world
+                .runtime
+                .store_writer()
+                .cancel_task(&session, &task, 1, None)
+                .expect("settle page fixture");
+        }
+        let page = first_page(&mut world);
+        assert_eq!(page.len(), rivect::contracts::PAGE_MAX as usize);
+        assert!(!page.contains(&live.0));
+        assert_eq!(
+            world
+                .runtime
+                .store()
+                .task_lifecycle(&live)
+                .expect("lifecycle"),
+            Lifecycle::Running
+        );
+        live
+    };
+    let mut pty = spawn_thread_at(&data, &project);
+    pty.send(b"/new\r").expect("attempt switch");
+    let refused = see_wrapped(
+        &mut pty,
+        TUI_COLS,
+        "/new refused:",
+        &format!("/new refused: task {} is running", running.0),
+    );
+    assert!(!refused.contains("New conversation:"));
+    assert_eq!(session_counts(&pty).1, 1);
+    exit_thread(pty);
+    {
+        let mut world = support::open_world_at(&data, None);
+        world
+            .runtime
+            .store_writer()
+            .cancel_task(&session, &running, 1, None)
+            .expect("settle last running task");
     }
-    let running = "seed-in-flight";
-    seed.execute(insert, rusqlite::params![running, &session, "running"])
-        .expect("seed the running task");
-    seed.commit().expect("commit the seed");
-    drop(conn);
-
-    // The running task is past the first page: the switch is still refused,
-    // and the refusal names it.
-    pty.send(b"/new\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
-    assert!(
-        visible.contains(&format!("task {running} is running")),
-        "the refusal names the task past the page: {visible:?}"
-    );
-    assert!(
-        !visible.contains("New conversation"),
-        "a refused /new starts no conversation: {visible:?}"
-    );
-
-    // Once that task settles nothing runs, and the switch is admitted.
-    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
-    conn.busy_timeout(Duration::from_secs(10))
-        .expect("busy timeout");
-    conn.execute(
-        "UPDATE tasks SET lifecycle = 'completed' WHERE task_id = ?1",
-        [running],
-    )
-    .expect("settle the running task");
-    let sessions: i64 = conn
-        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-        .expect("count sessions");
-    drop(conn);
-    assert_eq!(sessions, 1, "the refusal minted no session");
-
-    pty.send(b"/new\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(&pty, "New conversation", Duration::from_secs(10))
-        .expect("pty screen");
-    assert!(
-        visible.contains("New conversation"),
-        "an idle session still serves /new: {visible:?}"
-    );
-
-    pty.send(b"\x1b").expect("pty send");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
-    pty.finish().expect("pty teardown");
+    let mut pty = spawn_thread_at(&data, &project);
+    switch_idle(&mut pty, "/new");
+    assert_eq!(session_counts(&pty).1, 2);
+    exit_thread(pty);
 }
 
+fn spawn_root_case(
+    root: tempfile::TempDir,
+    data: &Path,
+    env_data: &Path,
+    args: &[&str],
+) -> support::PtySession {
+    let mut command = packaged_command();
+    command.env("HOME", root.path());
+    command.env("RIVECT_DATA_ROOT", env_data);
+    command.cwd(root.path());
+    for arg in args {
+        command.arg(arg);
+    }
+    support::PtySession::spawn(command, TUI_ROWS, TUI_COLS, root, data.to_owned())
+        .expect("packaged root case")
+}
 #[test]
 fn tui_data_root_flag_overrides_environment() {
     let root = tempfile::TempDir::with_prefix("rivect-tui-flag-").expect("tui flag root");
@@ -4091,23 +3773,16 @@ fn tui_data_root_flag_overrides_environment() {
     std::fs::create_dir_all(&flag_root).expect("flag root");
     std::fs::create_dir_all(&env_root).expect("env root");
     let flag_text = flag_root.to_string_lossy().to_string();
-    let mut pty = support::spawn_pty_with_args(
-        &rivect_binary(),
-        24,
-        80,
-        root,
-        &flag_root,
-        &env_root,
-        &["--data-root", &flag_text],
-    );
+    let mut pty = spawn_root_case(root, &flag_root, &env_root, &["--data-root", &flag_text]);
     assert!(
         pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
             .expect("pty read"),
         "TUI must start"
     );
-    pty.send(b"p\r").expect("pty send");
-    pty.pump_for(Duration::from_secs(2)).expect("pty pump");
-    dismiss_start_card(&mut pty);
+    see(&pty, "Message → Main");
+    pty.send(b"/task p\r").expect("submit in flag root");
+    let id = dismiss_start_card(&mut pty);
+    assert_saved_goal(&pty, &id, b"p");
     pty.send(b"\x1b").expect("pty send");
     let exit = pty.wait_exit(Duration::from_secs(10)).expect("pty wait");
     assert_eq!(exit, Some(0), "TUI must exit cleanly");
@@ -4124,24 +3799,19 @@ fn tui_data_root_flag_overrides_environment() {
     let env_only_root =
         tempfile::TempDir::with_prefix("rivect-tui-env-only-").expect("tui env-only root");
     let env_only_path = env_only_root.path().to_path_buf();
-    let mut env_only = support::spawn_pty_with_args(
-        &rivect_binary(),
-        24,
-        80,
-        env_only_root,
-        &env_only_path,
-        &env_only_path,
-        &[],
-    );
+    let mut env_only = spawn_root_case(env_only_root, &env_only_path, &env_only_path, &[]);
     assert!(
         env_only
             .wait_for(b"\x1b[?1049h", Duration::from_secs(10))
             .expect("pty read"),
         "TUI must start without --data-root"
     );
-    env_only.send(b"p\r").expect("pty send");
-    env_only.pump_for(Duration::from_secs(2)).expect("pty pump");
-    dismiss_start_card(&mut env_only);
+    see(&env_only, "Message → Main");
+    env_only
+        .send(b"/task p\r")
+        .expect("submit in environment root");
+    let id = dismiss_start_card(&mut env_only);
+    assert_saved_goal(&env_only, &id, b"p");
     env_only.send(b"\x1b").expect("pty send");
     assert_eq!(
         env_only
@@ -4158,7 +3828,7 @@ fn tui_data_root_flag_overrides_environment() {
 
 #[test]
 fn tui_fullscreen_restore() {
-    let mut pty = spawn_pty(&rivect_binary(), 24, 80);
+    let (_root, mut pty) = isolated_thread(None);
     assert!(
         pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
             .expect("pty read"),
@@ -4185,15 +3855,16 @@ fn tui_error_restores_terminal() {
     let root = tempfile::TempDir::with_prefix("rivect-pty-error-").expect("pty error root");
     let data_root = root.path().join("root-file");
     std::fs::write(&data_root, b"not a directory").expect("root file");
-    let mut pty =
-        support::spawn_pty_with_args(&rivect_binary(), 24, 80, root, &data_root, &data_root, &[]);
+    let mut pty = spawn_root_case(root, &data_root, &data_root, &[]);
 
     assert!(
         pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
             .expect("pty read"),
         "alternate screen must be entered on start"
     );
-    pty.send(b"a\r").expect("pty send");
+    see(&pty, "session open failed");
+    pty.send(b"/task a\r")
+        .expect("attempt project task after failed open");
     assert_eq!(
         pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
         Some(1)
@@ -4216,7 +3887,7 @@ fn tui_error_restores_terminal() {
 
 #[test]
 fn tui_mouse_off_default() {
-    let mut pty = spawn_pty(&rivect_binary(), 24, 80);
+    let (_root, mut pty) = isolated_thread(None);
     assert!(
         pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
             .expect("pty read"),
@@ -4313,15 +3984,8 @@ fn pty_env_probe_child() {
     let root = tempfile::TempDir::with_prefix("rivect-pty-env-").expect("pty env root");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data dir");
-    let mut pty = support::spawn_pty_with_args(
-        "/usr/bin/env",
-        TUI_ROWS as u16,
-        TUI_COLS as u16,
-        root,
-        &data,
-        &data,
-        &[],
-    );
+    let mut pty =
+        support::spawn_pty_with_args("/usr/bin/env", TUI_ROWS, TUI_COLS, root, &data, &data, &[]);
     assert_eq!(
         pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
         Some(0)
@@ -4573,13 +4237,11 @@ fn tui_failed_open_reports_verdict_before_alternate_screen() {
     let root = tempfile::TempDir::with_prefix("rivect-pty-open-verdict-").expect("pty root");
     let data_root = root.path().to_path_buf();
     stage_pending_verdict_then_broken_config(&data_root);
-    let mut pty =
-        support::spawn_pty_with_args(&rivect_binary(), 24, 80, root, &data_root, &data_root, &[]);
+    let mut pty = spawn_root_case(root, &data_root, &data_root, &[]);
     // The degraded session still enters the alternate screen and renders
     // the open failure on its transcript — asserted on the reconstructed
     // screen, since the renderer emits positioned words, not raw lines.
-    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10))
-        .expect("pty screen");
+    let visible = see(&pty, "session open failed");
     assert!(
         visible.contains("session open failed"),
         "the transcript records the open failure inside the session: {visible:?}"
@@ -4610,19 +4272,18 @@ fn tui_lazy_retry_failed_open_reports_verdict_after_restore() {
     let root = tempfile::TempDir::with_prefix("rivect-pty-lazy-open-verdict-").expect("pty root");
     let data_root = root.path().to_path_buf();
     stage_pending_verdict_then_broken_config(&data_root);
-    let mut pty =
-        support::spawn_pty_with_args(&rivect_binary(), 24, 80, root, &data_root, &data_root, &[]);
+    let mut pty = spawn_root_case(root, &data_root, &data_root, &[]);
     // The degraded session leaves the dispatch slot empty, so a submitted
     // task drives the lazy-retry open: it fails the same way and its
     // propagated error is the only channel left once the guard restores
     // the primary screen.
-    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10))
-        .expect("pty screen");
+    let visible = see(&pty, "session open failed");
     assert!(
         visible.contains("session open failed"),
         "the degraded session records the eager open failure: {visible:?}"
     );
-    pty.send(b"retry the open\r").expect("pty send");
+    pty.send(b"/task retry the open\r")
+        .expect("retry failed open");
     assert_eq!(
         pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
         Some(1),
@@ -4678,6 +4339,118 @@ fn tui_lazy_retry_failed_open_reports_verdict_after_restore() {
         "the failure prefix precedes the carried verdict: {restored_text:?}"
     );
     pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn installed_owner_refusal_retries_after_the_holder_exits_and_restores_the_terminal() {
+    const ROWS: u16 = 40;
+    const COLS: u16 = 120;
+    const POINTER: &str = "update boundary: upd.owner pointer: runtime/owner.lock";
+    const NEXT: &str =
+        "update next: stop the update, close the process that holds this data root, then retry";
+    const FAILURE: &str = "tui failed: tui runtime open failed: owner configuration failed";
+    const VERDICT: &str = "publication recovery: torn_or_unparseable verdict stays pending";
+
+    fn assert_eager_pair(text: &str) {
+        assert_eq!(text.lines().filter(|line| *line == POINTER).count(), 1);
+        assert_eq!(text.lines().filter(|line| *line == NEXT).count(), 1);
+        let mut rows = text.lines().skip_while(|line| *line != POINTER);
+        assert_eq!(rows.nth(1), Some(NEXT));
+    }
+
+    fn grid(bytes: &[u8], rows: u16, cols: u16) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(bytes);
+        parser
+    }
+
+    fn restored(mut pty: support::PtySession, rows: u16, cols: u16, code: u32) -> String {
+        assert_eq!(
+            pty.wait_exit(WAIT).expect("wait for natural exit"),
+            Some(code)
+        );
+        let parser = grid(&pty.collected().expect("drained PTY"), rows, cols);
+        assert!(
+            !parser.screen().alternate_screen(),
+            "exit stranded alternate screen"
+        );
+        assert!(!parser.screen().hide_cursor(), "exit left cursor hidden");
+        pty.finish().expect("PTY teardown");
+        parser.screen().contents()
+    }
+
+    let (root, mut holder) = isolated_thread(None);
+    switch_idle(&mut holder, "/new");
+    assert_eq!(session_counts(&holder), (0, 2));
+    assert!(
+        grid(
+            &holder.collected().expect("owner frame"),
+            TUI_ROWS,
+            TUI_COLS
+        )
+        .screen()
+        .alternate_screen()
+    );
+
+    let data = root.path().join("data");
+    let scratch = tempfile::tempdir().expect("contender scratch");
+    let mut command = packaged_command();
+    command.env("HOME", scratch.path());
+    command.env("RIVECT_DATA_ROOT", &data);
+    command.cwd(root.path().join("project"));
+    let mut retry = support::PtySession::spawn(command, ROWS, COLS, scratch, data.clone())
+        .expect("launch competing installed client");
+    let cause =
+        "session open failed: tui runtime open failed: another owner already holds this data root";
+    let frame = support::visible_text(&retry, ROWS, COLS, cause, WAIT);
+    assert!(
+        frame.contains(cause),
+        "incomplete contention frame: {frame}"
+    );
+    assert!(
+        frame.contains(POINTER) && frame.contains(NEXT),
+        "missing operator guidance: {frame}"
+    );
+
+    let bytes = retry.collected().expect("degraded frame");
+    let mut probe = vt100::Parser::new(ROWS, COLS, 0);
+    let entered = bytes
+        .iter()
+        .position(|byte| {
+            probe.process(std::slice::from_ref(byte));
+            probe.screen().alternate_screen()
+        })
+        .expect("contender entered alternate screen");
+    assert_eager_pair(&grid(&bytes[..entered], ROWS, COLS).screen().contents());
+    probe.process(&bytes[entered + 1..]);
+    assert!(probe.screen().alternate_screen());
+
+    holder.send(b"\x1b").expect("close healthy owner");
+    drop(restored(holder, TUI_ROWS, TUI_COLS, 0));
+    // Stage through the store only after the healthy owner has left. The retry
+    // must now pass election, reach recovery, and fail at configuration instead.
+    stage_pending_verdict_then_broken_config(&data);
+    retry
+        .send(b"/task retry the open\r")
+        .expect("retry degraded open");
+    let main = restored(retry, ROWS, COLS, 1);
+    let (above, below) = main
+        .split_once(FAILURE)
+        .expect("retry failure on restored screen");
+    assert_eager_pair(above);
+    assert!(!above.contains(VERDICT));
+    assert_eq!(main.matches(FAILURE).count(), 1);
+    assert_eq!(main.matches(VERDICT).count(), 1);
+    assert!(
+        below
+            .strip_prefix('\n')
+            .is_some_and(|rest| rest.starts_with(VERDICT))
+    );
+    assert!(!below.contains(POINTER) && !below.contains(NEXT));
+    drop(
+        rivect::owner::Owner::elect(&data)
+            .expect("failed retry released the election and writer locks"),
+    );
 }
 
 #[test]
@@ -6786,36 +6559,61 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
     let data = root.path().join("private-state");
     let project = root.path().join("coding-project");
     std::fs::create_dir(&project).expect("project directory");
-    let mut command = support::pty_command(rivect_binary());
+    let mut command = packaged_command();
+    command.env("HOME", root.path());
     command.arg("--data-root");
     command.arg(&data);
     command.cwd(&project);
     let mut pty = support::PtySession::spawn(command, 24, 100, root, data).expect("spawn the TUI");
-    let screen = support::wait_for_screen_text(&pty, 24, 100, "Project:", Duration::from_secs(10))
-        .expect("project label");
-    assert!(
-        screen.contains(
-            project
-                .canonicalize()
-                .expect("canonical cwd")
-                .to_str()
-                .expect("UTF-8 cwd")
-        ),
-        "{screen}"
-    );
+    support::visible_text(&pty, 24, 100, "Run /login", WAIT);
+    let project = project.canonicalize().expect("canonical cwd");
+    let expected = project.to_str().expect("UTF-8 cwd");
+    let screen = see_wrapped(&mut pty, 100, "Project:", &format!("Project: {expected}"));
     assert!(screen.contains("Run /login"), "{screen}");
     assert!(!screen.contains("settled unknown"), "{screen}");
     assert!(!screen.contains("NOT_RUN"), "{screen}");
     pty.send(b"/login\r").expect("start browser login");
-    let pending =
-        support::wait_for_screen_text(&pty, 24, 100, "Login pending:", Duration::from_secs(10))
-            .expect("pending login");
-    assert!(pending.contains("Login pending:"), "{pending}");
-    assert!(pending.contains("not connected"), "{pending}");
+    // Do not print the private panel: it contains fresh callback state.
+    for marker in [
+        "Private login",
+        "Paste the callback URL",
+        "https://auth.openai.com/oauth/authorize?",
+    ] {
+        assert!(
+            support::wait_for_screen_text(&pty, 24, 100, marker, WAIT)
+                .expect("private login panel")
+                .contains(marker),
+            "missing private login marker"
+        );
+    }
+    pty.send(b"\x1b").expect("close private login panel");
+    // Re-parse the real VT100 grid, not the text-only approximation, after
+    // the TUI leaves the private surface. Keep callback state out of diagnostics.
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut parser = vt100::Parser::new(24, 100, 0);
+    let mut offset = 0;
+    loop {
+        let bytes = pty.collected().expect("private terminal frame");
+        parser.process(&bytes[offset..]);
+        offset = bytes.len();
+        let pending = parser.screen().contents();
+        if pending.contains("Message → Main") && pending.contains("Login pending · /login cancel")
+        {
+            assert!(
+                !pending.contains("Session connected") && !pending.contains("oauth/authorize"),
+                "private login data remained in the thread"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending login did not return to the composer"
+        );
+        pty.pump_for(Duration::from_millis(25))
+            .expect("pending login repaint");
+    }
     pty.send(b"/login cancel\r").expect("cancel browser login");
-    let cancelled =
-        support::wait_for_screen_text(&pty, 24, 100, "Login cancelled.", Duration::from_secs(10))
-            .expect("cancelled login");
+    let cancelled = support::visible_text(&pty, 24, 100, "Login cancelled.", WAIT);
     assert!(cancelled.contains("Login cancelled."), "{cancelled}");
     assert!(cancelled.contains("not connected"), "{cancelled}");
     pty.send(b"\x1b").expect("pty send exit");
@@ -6850,39 +6648,21 @@ fn ordinary_tui_input_displays_the_provider_reply() {
         local_chat_config(&peer.endpoint()),
     )
     .expect("loopback config");
-    let mut command = support::pty_command(rivect_binary());
-    command.arg("--data-root");
-    command.arg(&data);
-    command.cwd(&project);
-    let mut pty = support::PtySession::spawn(command, 24, 80, root, data).expect("spawn the TUI");
-    let initial = wait_for_visible_tui_text(&pty, "Project:", Duration::from_secs(10))
-        .expect("project label");
-    assert!(initial.contains("Project:"), "{initial}");
+    let mut pty = spawn_thread_at(&data, &project);
     pty.send(b"Should we change the stock constant?\r")
-        .expect("submit task");
-    let start = wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
-        .expect("task decision");
-    assert!(start.contains("awaiting decision"), "{start}");
-    pty.pump_for(Duration::from_secs(2))
-        .expect("wait for consent");
-    pty.send(b"\r").expect("begin task");
-    let answer = wait_for_visible_tui_text(
-        &pty,
-        "Keep the existing stock constant.",
-        Duration::from_secs(10),
-    )
-    .expect("model reply");
+        .expect("submit ordinary message");
+    see(&pty, "Keep the existing stock constant.");
+    let answer = see(&pty, "You waiting");
     assert!(
         answer.contains("Keep the existing stock constant."),
         "{answer}"
     );
-    assert!(!answer.contains(": completed"), "{answer}");
-    pty.send(b"\x1b").expect("exit");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty exit"),
-        Some(0)
+    assert!(
+        !support::squashed(&answer).contains("You completed"),
+        "{answer}"
     );
-    pty.finish().expect("pty teardown");
+    assert_eq!(peer.requests(), 1);
+    exit_thread(pty);
 }
 
 #[test]
@@ -6934,66 +6714,50 @@ fn ordinary_tui_file_edit(allow: bool, changed: bool) {
         local_chat_config(&peer.endpoint()),
     )
     .expect("loopback config");
-    let mut command = support::pty_command(rivect_binary());
-    command.arg("--data-root");
-    command.arg(&data);
-    command.cwd(&project);
-    let mut pty = support::PtySession::spawn(command, 24, 80, root, data).expect("spawn the TUI");
-    let initial = wait_for_visible_tui_text(&pty, "Project:", Duration::from_secs(10))
-        .expect("project label");
-    assert!(initial.contains("Project:"), "{initial}");
-    pty.send(b"Increase the stock count by one.\r")
-        .expect("submit task");
-    let start = wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
-        .expect("task decision");
-    assert!(start.contains("awaiting decision"), "{start}");
-    pty.pump_for(Duration::from_secs(2))
-        .expect("wait for consent");
-    pty.send(b"\r").expect("begin task");
-    wait_for_visible_tui_text(&pty, "Share inventory.rs", Duration::from_secs(10))
-        .expect("read disclosure decision");
+    let mut pty = spawn_thread_at(&data, &project);
+    pty.send(b"/task Increase the stock count by one.\r")
+        .expect("submit project task");
+    answer_card(&mut pty, "awaiting decision", false);
+    see(&pty, "Share inventory.rs");
     assert_eq!(peer.requests(), 1);
-    pty.pump_for(Duration::from_secs(2))
-        .expect("wait for consent");
-    pty.send(b"\x1b[B\r").expect("share the read result once");
-    let approval = wait_for_visible_tui_text(&pty, "awaiting permission", Duration::from_secs(10))
-        .expect("write decision");
-    assert!(approval.contains("awaiting permission"), "{approval}");
+    answer_card(&mut pty, "Share inventory.rs", true);
+    see(&pty, "awaiting permission");
     assert_eq!(
         std::fs::read_to_string(&file).expect("read project file"),
         "const STOCK: u8 = 17;\n"
     );
-    wait_for_visible_tui_text(&pty, "Write inventory.rs", Duration::from_secs(10))
-        .expect("exact write target");
-    pty.pump_for(Duration::from_secs(2))
-        .expect("wait for consent");
-    let (keys, response, expected) = if changed {
+    see(&pty, "Write inventory.rs");
+    let (response, expected) = if changed {
         let user_text = "const STOCK: u8 = 22; // edited by user\n";
         std::fs::write(&file, user_text).expect("intervening user change");
-        (b"\x1b[B\r".as_slice(), "target changed", user_text)
+        ("blocked: denied", user_text)
     } else if allow {
         (
-            b"\x1b[B\r".as_slice(),
             "I updated the inventory constant to 18.",
             "const STOCK: u8 = 18;\n",
         )
     } else {
-        (
-            b"\r".as_slice(),
-            "permission denied",
-            "const STOCK: u8 = 17;\n",
-        )
+        ("permission denied", "const STOCK: u8 = 17;\n")
     };
-    pty.send(keys).expect("answer the permission decision");
-    let screen =
-        wait_for_visible_tui_text(&pty, response, Duration::from_secs(10)).expect("write outcome");
+    answer_card(&mut pty, "Write inventory.rs", allow);
+    let screen = see(&pty, response);
     assert!(screen.contains(response), "{screen}");
+    if changed {
+        let detail: String = task_store(&pty)
+            .query_row(
+                "SELECT detail FROM attempts WHERE effect_class = 'write' AND state = 'rejected'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("rejected write attempt");
+        assert!(detail.contains("target changed"), "{detail}");
+    }
     assert_eq!(
         std::fs::read_to_string(&file).expect("read project file"),
         expected
     );
     assert_eq!(peer.requests(), if allow && !changed { 3 } else { 2 });
-    pty.finish().expect("pty teardown");
+    exit_thread(pty);
 }
 
 #[test]
@@ -7012,10 +6776,17 @@ fn ordinary_tui_task_reports_a_failing_check_as_failed() {
 }
 
 fn ordinary_tui_file_check(replacement: Option<u8>) {
+    const PROJECT_RULE: &str = "Keep the inventory fixture in shelf order.";
     let peer = ChatPeer::scripted(move |turn, payload| {
         let request = String::from_utf8_lossy(payload);
         match turn {
-            0 => chat_stream("read_file", json!({"path": "src/inventory.rs"})),
+            0 => {
+                assert!(
+                    request.contains(PROJECT_RULE),
+                    "project instructions missing from first model request"
+                );
+                chat_stream("read_file", json!({"path": "src/inventory.rs"}))
+            }
             1 => {
                 assert!(request.contains("STOCK: u8 = 17"), "{request}");
                 chat_stream(
@@ -7032,14 +6803,18 @@ fn ordinary_tui_file_check(replacement: Option<u8>) {
             }
             3 if replacement == Some(19) => {
                 assert!(
-                    request.contains(r#"\"exit_code\":101"#) && request.contains("1 failed"),
+                    request.contains(r#"\"exit_code\":101"#)
+                        && !request.contains("test result:")
+                        && !request.contains("LOCAL_STDOUT_CANARY"),
                     "{request}"
                 );
                 chat_text_stream("The inventory check failed.")
             }
             3 => {
                 assert!(
-                    request.contains(r#"\"exit_code\":0"#) && request.contains("1 passed"),
+                    request.contains(r#"\"exit_code\":0"#)
+                        && !request.contains("test result:")
+                        && !request.contains("LOCAL_STDOUT_CANARY"),
                     "{request}"
                 );
                 chat_text_stream("The inventory check passed.")
@@ -7054,6 +6829,7 @@ fn ordinary_tui_file_check(replacement: Option<u8>) {
     std::fs::create_dir_all(home.join(".cargo")).expect("cargo home");
     std::fs::create_dir(&data).expect("data directory");
     std::fs::create_dir_all(project.join("src")).expect("project directory");
+    std::fs::write(project.join("AGENTS.md"), PROJECT_RULE).expect("project instructions");
     let file = project.join("src/inventory.rs");
     std::fs::write(&file, "pub const STOCK: u8 = 17;\n").expect("initial code");
     std::fs::write(
@@ -7068,7 +6844,7 @@ fn ordinary_tui_file_check(replacement: Option<u8>) {
     .expect("lockfile");
     std::fs::write(
         project.join("src/lib.rs"),
-        "mod inventory;\n#[test]\nfn stock_is_eighteen() { assert_eq!(inventory::STOCK, 18); }\n",
+        "mod inventory;\n#[test]\nfn stock_is_eighteen() { println!(\"test result: LOCAL_STDOUT_CANARY\"); assert_eq!(inventory::STOCK, 18); }\n",
     )
     .expect("independent check");
     std::fs::write(
@@ -7076,43 +6852,56 @@ fn ordinary_tui_file_check(replacement: Option<u8>) {
         local_chat_config(&peer.endpoint()),
     )
     .expect("loopback config");
-    let executable = if std::env::var_os("RIVECT_TEST_BUNDLE").is_some() {
-        support::release::baseline_bundle().join("rivect")
-    } else {
-        PathBuf::from(rivect_binary())
-    };
-    let mut command = support::pty_command(executable);
+    let mut command = packaged_command();
     command.arg("--data-root");
     command.arg(&data);
     command.cwd(&project);
     command.env("HOME", home);
-    command.env("CARGO", env!("CARGO"));
+    // The paired client forwards PATH, never CARGO. Expose the actual toolchain,
+    // not a rustup shim pointing into the test runner's HOME.
+    let mut cargo = Path::new(env!("CARGO"))
+        .canonicalize()
+        .expect("installed cargo");
+    if cargo.file_name().is_none_or(|file| file != "cargo")
+        || !cargo.with_file_name("rustc").is_file()
+    {
+        let mut rustup = std::process::Command::new("rustup");
+        rustup.env_clear();
+        for key in ["HOME", "PATH", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
+            if let Some(value) = std::env::var_os(key) {
+                rustup.env(key, value);
+            }
+        }
+        let output = rustup
+            .args(["which", "cargo"])
+            .output()
+            .expect("locate toolchain cargo");
+        assert!(output.status.success(), "rustup could not locate cargo");
+        cargo = PathBuf::from(
+            std::str::from_utf8(&output.stdout)
+                .expect("toolchain path")
+                .trim(),
+        )
+        .canonicalize()
+        .expect("canonical cargo");
+    }
+    let bin = cargo.parent().expect("toolchain bin");
+    assert!(bin.join("rustc").is_file(), "toolchain must contain rustc");
+    let path = std::env::join_paths([bin, Path::new("/usr/bin"), Path::new("/bin")])
+        .expect("toolchain search path");
+    command.env("PATH", path);
     let mut pty =
         support::PtySession::spawn(command, 24, 80, root, data.clone()).expect("spawn the TUI");
-    let see = |pty: &support::PtySession, text: &str| {
-        let screen =
-            wait_for_visible_tui_text(pty, text, Duration::from_secs(16)).expect("terminal read");
-        assert!(screen.contains(text), "expected {text:?} in {screen}");
-    };
-    see(&pty, "Project:");
-    pty.send(b"Increase STOCK from 17 to 18 and run the stock_is_eighteen unit test.\r")
-        .expect("submit task");
-    for (prompt, keys) in [
-        ("awaiting decision", b"\r".as_slice()),
-        ("Share src/inventory.rs", b"\x1b[B\r".as_slice()),
-        ("Write src/inventory.rs", b"\x1b[B\r".as_slice()),
-        (
-            "Run Cargo test stock_is_eighteen",
-            if replacement.is_some() {
-                b"\x1b[B\r".as_slice()
-            } else {
-                b"\r".as_slice()
-            },
-        ),
+    see(&pty, "Message → Main");
+    pty.send(b"/task Increase STOCK from 17 to 18 and run the stock_is_eighteen unit test.\r")
+        .expect("submit project task");
+    for (prompt, second) in [
+        ("awaiting decision", false),
+        ("Share src/inventory.rs", true),
+        ("Write src/inventory.rs", true),
+        ("Run Cargo test stock_is_eighteen", replacement.is_some()),
     ] {
-        see(&pty, prompt);
-        pty.pump_for(Duration::from_secs(2)).expect("consent floor");
-        pty.send(keys).expect("select and submit");
+        answer_card(&mut pty, prompt, second);
     }
     match replacement {
         Some(18) => {
@@ -7142,7 +6931,7 @@ fn ordinary_tui_file_check(replacement: Option<u8>) {
         format!("pub const STOCK: u8 = {};\n", replacement.unwrap_or(18))
     );
     assert_eq!(peer.requests(), if replacement.is_some() { 4 } else { 3 });
-    pty.finish().expect("pty teardown");
+    exit_thread(pty);
 }
 
 #[test]
@@ -7177,25 +6966,11 @@ fn ordinary_tui_context_survives_restart_in_the_same_project() {
             "The batching interval is 73.",
         ),
     ] {
-        let root = tempfile::TempDir::new().expect("terminal scratch");
-        let mut command = support::pty_command(rivect_binary());
-        command.arg("--data-root");
-        command.arg(&data);
-        command.cwd(&project);
-        let mut pty = support::PtySession::spawn(command, 24, 80, root, data.clone()).expect("TUI");
-        let ready =
-            wait_for_visible_tui_text(&pty, "Project:", Duration::from_secs(10)).expect("startup");
-        assert!(ready.contains("Project:"), "{ready}");
-        pty.send(format!("{goal}\r").as_bytes()).expect("submit");
-        let decision =
-            wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
-                .expect("decision");
-        assert!(decision.contains("awaiting decision"), "{decision}");
-        pty.pump_for(Duration::from_secs(2)).expect("consent floor");
-        pty.send(b"\r").expect("begin");
-        let screen =
-            wait_for_visible_tui_text(&pty, reply, Duration::from_secs(10)).expect("reply");
-        assert!(screen.contains(reply), "{screen}");
+        let mut pty = spawn_thread_at(&data, &project);
+        pty.send(format!("/task {goal}\r").as_bytes())
+            .expect("submit project task");
+        answer_card(&mut pty, "awaiting decision", false);
+        see(&pty, reply);
         pty.send(b"\x1b").expect("exit");
         assert_eq!(
             pty.wait_exit(Duration::from_secs(10)).expect("child exit"),
@@ -7235,47 +7010,16 @@ fn tui_composer_shares_a_read_result_only_after_consent() {
     )
     .expect("config write");
 
-    let mut command = support::pty_command(rivect_binary());
-    command.arg("--data-root");
-    command.arg(&data);
-    command.cwd(&cwd);
-    let mut pty =
-        support::PtySession::spawn(command, 24, 80, root, data.clone()).expect("spawn the TUI");
-    assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
-        "the TUI enters the alternate screen"
-    );
-    pty.send("do the first task\r".as_bytes())
-        .expect("pty send");
-    let card = wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
-        .expect("start card");
-    assert!(card.contains("Begin"), "the start card names begin: {card}");
-    // The card's first frame flushes only while the harness drains the PTY;
-    // the consent floor runs from that completed paint. A bare sleep stalls
-    // the flush and lands the Enter inside the floor, so pump well past it:
-    // parallel fixtures can starve the child's paint.
-    pty.pump_for(Duration::from_secs(2))
-        .expect("pump past the decision consent floor");
-    pty.send(b"\r").expect("pty send enter");
-    let sharing = wait_for_visible_tui_text(&pty, "Share inventory.txt", Duration::from_secs(10))
-        .expect("file disclosure decision");
-    assert!(sharing.contains("Share inventory.txt"), "{sharing}");
+    let mut pty = spawn_thread_at(&data, &cwd);
+    pty.send(b"/task do the first task\r")
+        .expect("submit project task");
+    let card = see(&pty, "awaiting decision");
+    assert!(card.contains("Begin"), "{card}");
+    answer_card(&mut pty, "awaiting decision", false);
+    see(&pty, "Share inventory.txt");
     assert_eq!(peer.requests(), 1, "file bytes have not been shared");
-    pty.pump_for(Duration::from_secs(2))
-        .expect("wait for consent");
-    pty.send(b"\x1b[B\r")
-        .expect("select allow once and confirm");
-    let answer = wait_for_visible_tui_text(
-        &pty,
-        "The inventory sample was read.",
-        Duration::from_secs(10),
-    )
-    .expect("model reply after consent");
-    assert!(
-        answer.contains("The inventory sample was read."),
-        "{answer}"
-    );
+    answer_card(&mut pty, "Share inventory.txt", true);
+    see(&pty, "The inventory sample was read.");
     pty.send(b"\x1b").expect("pty send exit");
     assert_eq!(
         pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),

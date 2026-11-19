@@ -55,6 +55,10 @@ command -v jq >/dev/null 2>&1 || {
     printf 'release-gate: jq is required\n' >&2
     exit 1
 }
+jq -e '.schema_version == 2' "$bundle/rivect.manifest.json" >/dev/null || {
+    printf 'release-gate: native v2 candidate required\n' >&2
+    exit 2
+}
 
 run_producer() {
     manifest=$1
@@ -64,7 +68,7 @@ run_producer() {
         exit 1
 }
 
-export RIVECT_TEST_BUNDLE="$bundle"
+export RIVECT_TEST_BUNDLE="$bundle" RIVECT_V2_TEST_BUNDLE="$bundle"
 if [ "$receipts_only" = false ]; then
     run_producer tests/fixtures/provider-trials.json target/provider-trials.json
     for group in a01-a12 a13-a24 a25-a36 sections; do

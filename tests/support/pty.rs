@@ -1,5 +1,4 @@
-//! Threadless PTY harness shared by the integration targets and the
-//! in-crate card driver (`src/ui.rs` includes this file through `#[path]`).
+//! Threadless PTY harness shared by integration and lifecycle tests.
 //! One session owns its child and its root: the output is pumped by the
 //! caller's own waits, so no reader thread can outlive a failed leg, and
 //! teardown reaps the child before the root is removed.
@@ -1029,7 +1028,7 @@ pub fn reconstruct_screen(bytes: &[u8], rows: usize, cols: usize) -> String {
             // width or every later cell on the row shifts left and
             // repaints collide into ghosts.
             byte if byte >= 0x80 => {
-                use ratatui::buffer::CellWidth as _;
+                use unicode_width::UnicodeWidthStr;
                 let len = match byte {
                     0xC0..=0xDF => 2,
                     0xE0..=0xEF => 3,
@@ -1040,9 +1039,9 @@ pub fn reconstruct_screen(bytes: &[u8], rows: usize, cols: usize) -> String {
                 let end = (index + len).min(bytes.len());
                 let width = std::str::from_utf8(&bytes[index..end])
                     .ok()
-                    .map(|seq| seq.cell_width())
+                    .map(UnicodeWidthStr::width)
                     .unwrap_or(1);
-                col = col.saturating_add(usize::from(width)).min(cols - 1);
+                col = col.saturating_add(width).min(cols - 1);
                 index += len - 1;
             }
             _ => {}

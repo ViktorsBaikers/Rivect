@@ -4,9 +4,7 @@
 #![allow(
     clippy::expect_used,
     clippy::panic,
-    clippy::let_underscore_must_use,
-    let_underscore_drop,
-    reason = "test assertions fail loudly with the observed screen or verdict; the pty handle mirrors the shared corpus harness (standards §14)"
+    reason = "offline permission fixtures fail loudly with the observed verdict or terminal frame"
 )]
 
 mod support;
@@ -2413,150 +2411,216 @@ fn forged_approved_text_grants_nothing() {
     );
 }
 
-// ----- AC-090: permission panel on a real PTY, 60x20 -----
+// ----- AC-090: installed terminal, owner-issued manual write, independent store oracle -----
 
-const CHILD_ENV: &str = "RIVECT_PERMISSION_PANEL_PTY";
-const SCOPE_ENV: &str = "RIVECT_PERMISSION_PANEL_SCOPE";
-const PTY_ROWS: u16 = 20;
-const PTY_COLS: u16 = 60;
-const CHILD_INITIATOR: &str = "task-170-fixture";
-const CHILD_EXPIRY: &str = "2036-01-01T00:00:00Z";
-const CHILD_GRANT_ID: &str = "grant-pty-panel";
-
-use crossterm::event::{
-    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
-};
-use rivect::commands::Runtime;
-use rivect::providers::LoopbackProvider;
 use rivect::state::TaskStore;
-use rivect::ui::{
-    PANEL_ALLOWED_NOTE, PANEL_DENIED_NOTE, PANEL_FOOTER_HINT, PANEL_LIMITED_NOTE, PanelAction,
-    PermissionPanel, TerminalGuard, handle_panel_key, initial_view, render,
-};
+use rivect::ui::RenderMode;
 use std::time::{Duration, Instant};
 
-#[test]
-fn allow_once_note_states_only_what_is_true() {
-    // The allow-once note names the chosen action and the absence of a
-    // grant: no consent carrier consumes the request yet, so the note must
-    // not claim it does — and it never claims permission applies anywhere.
-    assert!(
-        !PANEL_ALLOWED_NOTE.contains("permission applies"),
-        "overclaiming note: {PANEL_ALLOWED_NOTE}"
-    );
-    assert!(
-        !PANEL_ALLOWED_NOTE.contains("request consumed"),
-        "the note claims a consume seam that does not exist yet: {PANEL_ALLOWED_NOTE}"
-    );
-    assert!(PANEL_ALLOWED_NOTE.contains("allowed once"));
-    assert!(PANEL_ALLOWED_NOTE.contains("no grant recorded"));
+const PTY_ROWS: u16 = 20;
+const PTY_COLS: u16 = 60;
+const WAIT: Duration = Duration::from_secs(10);
+const FOOTER: &str = "arrows move, PgUp/PgDn scroll, Enter confirms, Esc denies";
+const DENY: &str = "[deny]";
+const ONCE: &str = "[allow once]";
+const LIMITED: &str = "[allow with limited grant (10 min)]";
+
+fn installed_terminal(root: tempfile::TempDir, args: &[&str], data: PathBuf) -> Screen {
+    let mut command = support::pty_command(support::release::baseline_bundle().join("rivect"));
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("TERM", "xterm-256color");
+    command.env("HOME", root.path());
+    command.env("TMPDIR", root.path());
+    command.env("RIVECT_DATA_ROOT", &data);
+    command.cwd(root.path());
+    for arg in args {
+        command.arg(*arg);
+    }
+    let session = support::PtySession::spawn(command, PTY_ROWS, PTY_COLS, root, data)
+        .expect("AC-090 requires the installed bundle and a real 60x20 PTY");
+    Screen {
+        session,
+        parser: vt100::Parser::new(PTY_ROWS, PTY_COLS, 0),
+        consumed: 0,
+    }
 }
 
-/// PTY child role: renders the production panel through the real terminal
-/// lifecycle and drives the production key handler. Two phases: the default
-/// panel (unsolicited Enter must deny), then a re-opened panel where an
-/// explicit "allow with limited grant" records a preapproval and the
-/// store-backed decide reads it back.
-#[test]
-#[ignore = "parent spawns this test binary with the child env and --ignored --exact; a plain run must not count it green"]
-fn pty_child_permission_panel() -> io::Result<()> {
-    if std::env::var_os(CHILD_ENV).is_none() {
-        // Plain test run: the parent spawns this binary with the marker.
-        return Ok(());
+struct Request {
+    screen: Screen,
+    task: String,
+    grant: String,
+    target: PathBuf,
+    db: PathBuf,
+}
+
+fn seed_permission(
+    data: &Path,
+    directory: PathBuf,
+    target: &Path,
+) -> (
+    rivect::contracts::SessionId,
+    rivect::contracts::TaskId,
+    String,
+) {
+    let mut world = support::open_world_at(data, None);
+    let session = world.open_session("ac090-session");
+    let task = world.create_task(&session, "ac090-write");
+    let grant = world
+        .runtime
+        .policy_writer()
+        .grant_classes(directory, vec![EffectClass::Write]);
+    let mut worker = CountingWorker { calls: 0 };
+    let refusal = world
+        .runtime
+        .executor_with_worker(&mut worker)
+        .admit(
+            &task,
+            rivect::executor::EffectRequest::Write {
+                grant_id: grant.clone(),
+                path: target.to_path_buf(),
+                bytes: b"not admitted".to_vec(),
+            },
+            PermissionMode::Manual,
+        )
+        .expect_err("manual write awaits permission");
+    assert!(matches!(refusal, ExecutorError::ModeAsk));
+    assert_eq!(worker.calls, 0);
+    (session, task, grant)
+}
+
+impl Request {
+    fn open(overflow: bool, corrupt_grant: bool) -> Self {
+        Self::open_on(RenderMode::Fullscreen, overflow, corrupt_grant)
     }
-    let data_root = PathBuf::from(std::env::var("RIVECT_DATA_ROOT").expect("child data root env"));
-    let scope = std::env::var(SCOPE_ENV).expect("child scope env");
-    let mut runtime =
-        Runtime::open(&data_root, Box::new(LoopbackProvider::new())).map_err(|carrier| {
-            let cause = carrier.into_source();
-            io::Error::other(format!(
-                "child runtime open failed: {}",
-                rivect::ui::failure_report(&cause)
-            ))
-        })?;
-    let mut guard = TerminalGuard::enter()?;
-    let mut view = initial_view();
-    fn open_panel(view: &mut rivect::ui::LocalView, scope: &str) {
-        view.panel = Some(PermissionPanel::new(
-            ModeDecision::Ask,
-            EffectClass::Write,
-            CHILD_GRANT_ID,
-            CHILD_INITIATOR,
-            CHILD_EXPIRY,
-            scope.to_string(),
-        ));
-    }
-    open_panel(&mut view, &scope);
-    let mut second_phase = false;
-    let mut done = false;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && !done {
-        render(guard.terminal_mut(), &view)?;
-        let Ok(true) = poll(Duration::from_millis(250)) else {
-            continue;
-        };
-        let TermEvent::Key(KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            ..
-        }) = read()?
-        else {
-            continue;
-        };
-        if view.panel.is_some() {
-            if !handle_panel_key(code, modifiers, &mut view, &mut runtime.store_writer()) {
-                break;
+
+    fn open_on(surface: RenderMode, overflow: bool, corrupt_grant: bool) -> Self {
+        let root = fixture_dir("ac090");
+        let data = root.path().join(".rivect");
+        std::fs::create_dir(&data).expect("fixture data root");
+        let mut directory = root
+            .path()
+            .join("workflow-scope/deep/nested/directory-tree");
+        if overflow {
+            for _ in 0..14 {
+                directory.push("scope-segment-with-a-deliberately-long-name");
             }
-        } else if code == KeyCode::Enter && !second_phase {
-            second_phase = true;
-            open_panel(&mut view, &scope);
-        } else if code == KeyCode::Enter {
-            // Store-backed read-back: the limited grant the panel just wrote
-            // is what decide consults (DEC-016 same-handle round trip).
-            let mut ctx = rivect::executor::admission_context(
-                runtime.store(),
-                PermissionMode::Manual,
-                EffectClass::Write,
-                CHILD_GRANT_ID,
-                Path::new(&scope),
-                Path::new(&scope),
-            )
-            .map_err(|source| io::Error::other(format!("context assembly failed: {source}")))?;
-            ctx.mode = PermissionMode::PreapprovedOnly;
-            let verdict = runtime
-                .policy()
-                .decide(Path::new(&scope), EffectClass::Write, &ctx);
-            view.transcript
-                .push(format!("preapproved-only write: {}", verdict.token()));
-            done = true;
-        } else if code == KeyCode::Esc {
-            break;
+        }
+        std::fs::create_dir_all(&directory).expect("fixture scope");
+        let directory = directory.canonicalize().expect("canonical scope");
+        let target = directory.join(if overflow {
+            "tail-marker-end"
+        } else {
+            "permission-grant-boundary-with-a-deliberately-long-tail-suffix"
+        });
+        std::fs::write(&target, b"original").expect("fixture target");
+        let (session, task, grant) = seed_permission(&data, directory, &target);
+        let db = data.join("runtime/rivect.db");
+        if corrupt_grant {
+            corrupt_pending_grant(
+                &db,
+                &task.0,
+                &grant,
+                target.to_str().expect("fixture target"),
+            );
+        }
+        let args: &[&str] = match surface {
+            RenderMode::Fullscreen => &["--tui", "fullscreen"],
+            RenderMode::Inline => &["--tui", "inline"],
+            RenderMode::Linear => &["--linear"],
+        };
+        let mut screen = installed_terminal(root, args, data);
+        screen.see("Message");
+        assert_eq!(
+            screen.parser.screen().alternate_screen(),
+            surface == RenderMode::Fullscreen,
+            "public launch must start in its requested surface"
+        );
+        screen
+            .session
+            .send(format!("/resume {}\r\r", session.0).as_bytes())
+            .expect("attach with queued composer Enter");
+        // Only a retained, current owner request can open this modal. A rejection,
+        // a review frame or a goal containing permission language is not a request.
+        screen.see(if surface == RenderMode::Linear {
+            "Awaiting permission · write"
+        } else {
+            "awaiting permission"
+        });
+        assert_eq!(
+            screen.parser.screen().alternate_screen(),
+            surface != RenderMode::Linear,
+            "inline must move private permission UI to the alternate screen; linear must not"
+        );
+        Self {
+            screen,
+            task: task.0,
+            grant,
+            target,
+            db,
         }
     }
-    render(guard.terminal_mut(), &view)?;
-    guard.restore()?;
-    Ok(())
+
+    fn observe(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(&self.db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("observe actual owner database")
+    }
+
+    fn no_grant(&self) {
+        let count: i64 = self
+            .observe()
+            .query_row("SELECT count(*) FROM preapprovals", [], |row| row.get(0))
+            .expect("preapproval count");
+        assert_eq!(count, 0);
+        assert_eq!(
+            std::fs::read(&self.target).expect("asked write target"),
+            b"original"
+        );
+    }
+
+    fn confirm(&mut self) {
+        std::thread::sleep(rivect::ui::DECISION_CONSENT_DELAY);
+        support::confirm_witness(&mut self.screen.session);
+    }
+
+    fn assert_header(&self, frame: &str) {
+        assert!(
+            frame.contains("awaiting permission") && frame.contains("decision: ask"),
+            "{frame}"
+        );
+        assert!(frame.contains("effect: write"), "{frame}");
+        assert!(
+            frame.contains(&format!("initiator: {}", self.task)),
+            "{frame}"
+        );
+        assert!(frame.contains(&format!("grant: {}", self.grant)), "{frame}");
+        assert!(
+            frame
+                .lines()
+                .any(|row| row.split_once("expiry: ").is_some_and(|(_, value)| {
+                    let value = value.trim().trim_end_matches('│').trim_end();
+                    value.len() >= 20
+                        && value.as_bytes().get(10) == Some(&b'T')
+                        && value.ends_with('Z')
+                })),
+            "missing request expiry: {frame}"
+        );
+        assert!(frame.contains(FOOTER), "{frame}");
+    }
 }
 
-/// Spawns this test binary as the PTY child (`--exact` so only the harness
-/// test runs) on a session that owns `root`; fallible so the AC-090 gate
-/// can record an honest NOT_RUN marker instead of aborting on hosts
-/// without an allocatable pty.
-fn spawn_panel_child(root: tempfile::TempDir, scope: &str) -> io::Result<support::PtySession> {
-    let exe = std::env::current_exe()?;
-    let data_root = root.path().to_path_buf();
-    let mut command = support::pty_command(exe);
-    command.env("RIVECT_DATA_ROOT", &data_root);
-    command.env(CHILD_ENV, "1");
-    command.env(SCOPE_ENV, scope);
-    command.arg("--ignored");
-    command.arg("--exact");
-    command.arg("pty_child_permission_panel");
-    command.arg("--test-threads=1");
-    command.arg("--nocapture");
-    support::PtySession::spawn(command, PTY_ROWS, PTY_COLS, root, data_root)
-        .map_err(io::Error::other)
+// Policy mints only key-safe ids. Damage one already-issued identity offline,
+// in this test's private database; never add an operator command to forge it.
+fn corrupt_pending_grant(db: &Path, task: &str, grant: &str, scope: &str) {
+    let mut conn = rusqlite::Connection::open(db).expect("open isolated fixture database");
+    let tx = conn.transaction().expect("begin fixture mutation");
+    let changed = tx.execute("UPDATE pending_permissions SET grant_id=?1 WHERE task_id=?2 AND grant_id=?3 AND scope=?4",
+        rusqlite::params!["grant\rid", task, grant, scope]).expect("damage private grant fixture");
+    assert_eq!(
+        changed, 1,
+        "AC-090 needs one owner-bound pending grant identity; rejection text is not authority"
+    );
+    tx.commit().expect("commit private fixture mutation");
 }
 
 struct Screen {
@@ -2604,351 +2668,515 @@ impl Screen {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
-
-    fn rows(&mut self) -> Vec<String> {
-        self.text().split('\n').map(str::to_string).collect()
+    fn see(&mut self, marker: &str) -> String {
+        self.wait_for(WAIT, |text| text.contains(marker))
     }
+
+    fn send(&mut self, keys: &[u8]) {
+        self.session
+            .send(keys)
+            .expect("send installed terminal input");
+    }
+
+    fn exit(&mut self, keys: &[u8], code: u32) {
+        self.exit_restoring(keys, code, b"\x1b[?1049l");
+    }
+
+    fn exit_restoring(&mut self, keys: &[u8], code: u32, restored: &[u8]) {
+        let mark = self.session.collected().expect("mark before exit").len();
+        self.send(keys);
+        assert_eq!(
+            self.session.wait_exit(WAIT).expect("terminal exits"),
+            Some(code)
+        );
+        let bytes = self.session.collected().expect("read final terminal state");
+        assert!(
+            support::find_subsequence(&bytes[mark..], restored).is_some(),
+            "exit did not restore the terminal"
+        );
+        self.parser.process(&bytes[self.consumed..]);
+        assert!(!self.parser.screen().alternate_screen());
+        assert!(!self.parser.screen().bracketed_paste());
+    }
+}
+
+fn flat_scope(frame: &str) -> String {
+    frame
+        .lines()
+        .map(|row| row.trim().trim_matches('│').trim())
+        .collect()
+}
+
+#[test]
+fn ac090_installed_review_names_the_exact_seed_without_opening_state() {
+    let root = fixture_dir("ac090-review");
+    let data = root.path().join(".rivect");
+    let mut screen =
+        installed_terminal(root, &["--ui-review", "awaiting-permission"], data.clone());
+    let frame = screen.wait_for(Duration::from_secs(10), |frame| {
+        frame
+            .lines()
+            .map(|row| row.trim_end().trim_end_matches(['█', '▀', '▄']))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains(FOOTER)
+    });
+    for expected in [
+        "awaiting permission",
+        "decision: ask",
+        "effect: write",
+        "initiator: task-170-fixture",
+        "expiry: 2036-01-01T00:00:00Z",
+        "grant: grant-installed-tui",
+        DENY,
+    ] {
+        assert!(frame.contains(expected), "missing {expected}: {frame}");
+    }
+    screen.exit(b"\x1b", 0);
+    assert!(
+        !data.exists(),
+        "review may not open a store or record permission"
+    );
+    screen.session.finish().expect("review PTY teardown");
 }
 
 #[test]
 fn ac090_panel_default_focus_and_unsolicited_enter_never_grant() {
-    let root = tempfile::TempDir::with_prefix("rivect-permission-panel-pty-").expect("panel root");
-    let data_root = root.path().to_path_buf();
-    std::fs::create_dir_all(data_root.join("runtime")).expect("data root runtime dir");
-    let scope = format!(
-        "{}/workflow-scope/deep/nested/directory-tree/permission-grant-boundary-with-a-deliberately-long-tail-suffix",
-        data_root.display()
-    );
-    let child = match spawn_panel_child(root, &scope) {
-        Ok(child) => child,
-        Err(error) => {
-            eprintln!("NOT_RUN(AC-090): pty unavailable on this host: {error:?}");
-            return;
-        }
-    };
-    let mut screen = Screen {
-        session: child,
-        parser: vt100::Parser::new(PTY_ROWS, PTY_COLS, 0),
-        consumed: 0,
-    };
-
-    // Panel visible at 60x20 with verdict, effect class, initiator,
-    // expiry, the pinned footer hint, and wrapped scope.
-    // The footer can render a frame after the body; wait for the full panel.
-    let panel_up = screen.wait_for(Duration::from_secs(10), |text| {
-        text.contains("awaiting permission")
-            && text.contains("decision: ask")
-            && text.contains(PANEL_FOOTER_HINT)
-    });
-    assert!(panel_up.contains("effect: write"), "mandatory class line");
-    assert!(panel_up.contains("initiator: task-170-fixture"));
-    assert!(panel_up.contains("expiry: 2036-01-01T00:00:00Z"));
-    assert!(panel_up.contains(PANEL_FOOTER_HINT), "pinned footer hint");
-    // Scope wraps, never truncates: the full scope survives on screen with
-    // only wrap breaks inserted (it cannot fit one 60-column row).
+    let mut r = Request::open(false, false);
+    let frame = r.screen.see(FOOTER);
+    r.assert_header(&frame);
+    let scope = r.target.to_str().expect("fixture scope");
+    assert!(scope.len() > 58 && !frame.lines().any(|row| row.contains(scope)));
     assert!(
-        scope.len() > 58,
-        "scope must be long enough to exercise wrapping"
+        flat_scope(&frame).contains(scope),
+        "complete wrapped scope: {frame}"
     );
-    let rows = screen.rows();
-    // Border glyphs sit between wrapped segments; the scope itself has
-    // neither borders nor spaces, so dropping them reconstructs it exactly.
-    let flat = rows
-        .iter()
-        .map(|row| row.trim_end())
-        .collect::<String>()
-        .replace('│', "");
-    assert!(
-        flat.contains(&scope),
-        "scope must be fully visible across wrapped rows"
-    );
-    assert!(
-        !rows.iter().any(|row| row.contains(&scope)),
-        "the full scope cannot fit one 60-column row"
-    );
-
-    // Default focus is the non-destructive action (PRO-002 / EDGE-005).
-    let focused = screen.wait_for(Duration::from_secs(5), |text| text.contains("[deny]"));
-    assert!(
-        !focused.contains("[allow once]")
-            && !focused.contains("[allow with limited grant (10 min)]"),
-        "default focus must not sit on a granting action"
-    );
-
-    // Down moves focus forward and Up backward, wrapping like Tab/arrows.
-    screen.session.send(b"\x1b[B").expect("send down arrow");
-    screen.wait_for(Duration::from_secs(5), |text| text.contains("[allow once]"));
-    screen.session.send(b"\x1b[A").expect("send up arrow");
-    screen.wait_for(Duration::from_secs(5), |text| {
-        text.contains("[deny]") && !text.contains("[allow once]")
-    });
-
-    // Unsolicited Enter confirms the focused deny: no grant, no allow.
-    screen.session.send(b"\r").expect("send enter");
-    let denied = screen.wait_for(Duration::from_secs(5), |text| {
-        text.contains(PANEL_DENIED_NOTE)
-    });
-    assert!(!denied.contains("granted"), "no grant text may appear");
-
-    // Second panel: explicit focus move to the limited grant action; the
-    // label states the TTL the grant records (600 s = 10 minutes).
-    screen.session.send(b"\r").expect("reopen panel");
-    screen.wait_for(Duration::from_secs(5), |text| {
-        text.contains("awaiting permission") && text.contains("[deny]")
-    });
-    screen.session.send(b"\x1b[D").expect("send left arrow");
-    screen.wait_for(Duration::from_secs(5), |text| {
-        text.contains("[allow with limited grant (10 min)]") && !text.contains("[deny]")
-    });
-    screen.session.send(b"\r").expect("confirm limited grant");
-    screen.wait_for(Duration::from_secs(5), |text| {
-        text.contains(PANEL_LIMITED_NOTE)
-    });
-
-    // The recorded preapproval is what decide reads back (DEC-016).
-    screen
-        .session
-        .send(b"\r")
-        .expect("trigger decide read-back");
-    screen.wait_for(Duration::from_secs(5), |text| {
-        text.contains("preapproved-only write: allow")
-    });
-
-    // Terminal restored after exit (standards §12 PTY rule).
-    assert!(
-        screen
-            .session
-            .wait_for(b"\x1b[?1049l", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be left on exit"
-    );
-    let code = screen
-        .session
-        .wait_exit(Duration::from_secs(10))
-        .expect("pty wait");
-    assert_eq!(code, Some(0), "child must exit cleanly");
-    screen.session.finish().expect("pty teardown");
+    assert!(frame.contains(DENY) && !frame.contains(ONCE) && !frame.contains(LIMITED));
+    r.no_grant();
+    r.screen.send(b"\x1b[B");
+    r.screen.see(ONCE);
+    r.screen.send(b"\x1b[A");
+    let back = r.screen.see(DENY);
+    assert!(!back.contains(ONCE));
+    r.no_grant();
+    r.confirm();
+    let denied = r.screen.see("permission denied; no grant recorded");
+    assert!(!denied.contains("granted"));
+    r.no_grant();
+    r.screen.exit(b"/exit\r", 0);
+    r.screen.session.finish().expect("deny PTY teardown");
 }
 
-/// AC-090/F-UX-2: the panel is a three-region widget — pinned header,
-/// scrollable scope body, pinned actions footer. A scope that overflows
-/// the body region never hides the actions: PageDown scrolls the body
-/// until the whole scope is reachable while header, actions, and footer
-/// stay on screen.
+#[test]
+fn allow_once_note_states_only_what_is_true() {
+    let mut r = Request::open(false, false);
+    r.screen.see(DENY);
+    r.screen.send(b"\x1b[B");
+    r.screen.see(ONCE);
+    r.no_grant();
+    r.confirm();
+    let frame = r.screen.see("allowed once; no grant recorded");
+    assert!(
+        !frame.contains("permission applies") && !frame.contains("request consumed"),
+        "{frame}"
+    );
+    r.no_grant();
+    r.screen.exit(b"/exit\r", 0);
+    r.screen.session.finish().expect("allow-once PTY teardown");
+}
+
+#[test]
+fn limited_grant_records_exact_scope_grantor_and_ten_minute_ttl() {
+    exercise_limited_grant(RenderMode::Fullscreen);
+}
+
+#[test]
+fn inline_permission_is_private_and_restores_the_inline_surface_after_confirmation() {
+    exercise_limited_grant(RenderMode::Inline);
+}
+
+#[test]
+fn linear_permission_requires_a_typed_choice_and_an_independent_witness() {
+    exercise_limited_grant(RenderMode::Linear);
+}
+
+fn exercise_limited_grant(surface: RenderMode) {
+    let mut r = Request::open_on(surface, false, false);
+    let linear = surface == RenderMode::Linear;
+    if linear {
+        r.screen.see("/allow-limited (10 min)");
+    } else {
+        r.screen.see(DENY);
+    }
+    r.screen.send(b"\x1b[200~/allow-limited\r\x1b[201~");
+    if linear {
+        r.screen.see("Paste refused while permission is pending.");
+    } else {
+        let frame = r
+            .screen
+            .see("paste refused while the permission panel owns input");
+        assert!(
+            frame.contains(DENY) && !frame.contains(LIMITED),
+            "paste moved focus: {frame}"
+        );
+    }
+    r.no_grant();
+    if linear {
+        // Type only the command. The shared witness helper sends the single submitting Enter.
+        r.screen.send(b"/allow-limited");
+    } else {
+        r.screen.send(b"\x1b[D");
+        let focused = r.screen.see(LIMITED);
+        assert!(!focused.contains(DENY));
+    }
+    r.no_grant();
+    let observer = r.observe();
+    let before: i64 = observer
+        .query_row("SELECT unixepoch()", [], |row| row.get(0))
+        .expect("SQLite clock");
+    std::thread::sleep(rivect::ui::DECISION_CONSENT_DELAY);
+    support::confirm_witness_with(&mut r.screen.session, || {
+        let count: i64 = observer
+            .query_row("SELECT count(*) FROM preapprovals", [], |row| row.get(0))
+            .expect("read pending witness state");
+        assert_eq!(
+            count, 0,
+            "typing or focusing the choice cannot record a grant before its witness"
+        );
+    });
+    r.screen.see("limited grant recorded");
+    let (key, grantor, expires, after): (String, String, i64, i64) = observer
+        .query_row(
+            "SELECT scope,granted_by,unixepoch(expires_at),unixepoch() FROM preapprovals",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("confirmed grant row");
+    assert_eq!(
+        observer
+            .query_row("SELECT count(*) FROM preapprovals", [], |row| row
+                .get::<_, i64>(0))
+            .expect("preapproval count"),
+        1
+    );
+    assert_eq!(grantor, "human:tui-panel");
+    assert_eq!(key, format!("write:{}:{}", r.grant, r.target.display()));
+    assert!(
+        (before + 600..=after + 600).contains(&expires),
+        "expected 600-second TTL: {before}, {expires}, {after}"
+    );
+    drop(observer);
+    if surface == RenderMode::Inline {
+        r.screen.send(b"/tui\r");
+        r.screen.see("tui: inline");
+        assert!(
+            !r.screen.parser.screen().alternate_screen(),
+            "private prompt left inline in fullscreen"
+        );
+    }
+    if surface == RenderMode::Fullscreen {
+        r.screen.exit(b"/exit\r", 0);
+    } else {
+        if linear {
+            let bytes = r
+                .screen
+                .session
+                .collected()
+                .expect("linear permission stream");
+            assert!(
+                support::find_subsequence(&bytes, b"\x1b[?1049h").is_none(),
+                "linear entered alternate screen"
+            );
+        }
+        r.screen.exit_restoring(b"/exit\r", 0, b"\x1b[?2004l");
+    }
+    {
+        let store = TaskStore::open(&r.db).expect("reopen real installed store");
+        let ctx = rivect::executor::admission_context(
+            &store,
+            PermissionMode::PreapprovedOnly,
+            EffectClass::Write,
+            &r.grant,
+            &r.target,
+            &r.target,
+        )
+        .expect("assemble persisted permission context");
+        assert!(ctx.previously_approved);
+        assert_eq!(
+            Policy::default().decide(&r.target, EffectClass::Write, &ctx),
+            ModeDecision::Allow
+        );
+    }
+    r.screen
+        .session
+        .finish()
+        .expect("limited-grant PTY teardown");
+}
+
 #[test]
 fn ac090_panel_pins_actions_and_scrolls_an_overflowing_scope() {
-    let root =
-        tempfile::TempDir::with_prefix("rivect-permission-panel-scroll-").expect("panel root");
-    let data_root = root.path().to_path_buf();
-    std::fs::create_dir_all(data_root.join("runtime")).expect("data root runtime dir");
-    let long_segment = "scope-segment-with-a-deliberately-long-name-".repeat(14);
-    let scope = format!(
-        "{}/workflow-scope/{long_segment}tail-marker-end",
-        data_root.display()
-    );
-    let child = match spawn_panel_child(root, &scope) {
-        Ok(child) => child,
-        Err(error) => {
-            eprintln!("NOT_RUN(AC-090): pty unavailable on this host: {error:?}");
-            return;
-        }
-    };
-    let mut screen = Screen {
-        session: child,
-        parser: vt100::Parser::new(PTY_ROWS, PTY_COLS, 0),
-        consumed: 0,
-    };
-
-    // The footer can render a frame after the body; wait for the full panel.
-    let panel_up = screen.wait_for(Duration::from_secs(10), |text| {
-        text.contains("awaiting permission")
-            && text.contains("[deny]")
-            && text.contains(PANEL_FOOTER_HINT)
-    });
-    // Header fields stay pinned in scarce rows.
-    assert!(panel_up.contains("decision: ask"));
-    assert!(panel_up.contains("effect: write"));
-    assert!(panel_up.contains("initiator: task-170-fixture"));
-    assert!(panel_up.contains("expiry: 2036-01-01T00:00:00Z"));
-    assert!(panel_up.contains("grant: grant-pty-panel"));
-    // The overflowing body hides its tail at the scroll origin, but the
-    // actions and the footer hint never leave the screen. The scope is
-    // one long token, so wrap breaks are removed before matching.
-    let flat = |text: &str| {
-        text.split('\n')
-            .map(str::trim_end)
-            .collect::<String>()
-            .replace('│', "")
-    };
-    assert!(
-        !flat(&panel_up).contains("tail-marker-end"),
-        "the scope tail must start hidden"
-    );
-    assert!(panel_up.contains(PANEL_FOOTER_HINT));
-
-    let tail_on_screen = |screen: &mut Screen| {
-        screen.matches_within(Duration::from_secs(1), |text| {
-            flat(text).contains("tail-marker-end")
-        })
-    };
-    let mut scrolled_to_tail = false;
+    let mut r = Request::open(true, false);
+    let frame = r.screen.see(FOOTER);
+    r.assert_header(&frame);
+    assert!(frame.contains(DENY));
+    assert!(!flat_scope(&frame).contains("tail-marker-end"));
     for _ in 0..16 {
-        screen.session.send(b"\x1b[6~").expect("send page down");
-        if tail_on_screen(&mut screen) {
-            scrolled_to_tail = true;
+        r.screen.send(b"\x1b[6~");
+        if r.screen.matches_within(Duration::from_secs(1), |frame| {
+            flat_scope(frame).contains("tail-marker-end")
+        }) {
             break;
         }
     }
-    assert!(scrolled_to_tail, "paging down must reveal the scope tail");
-    let scrolled = screen.text();
-    assert!(scrolled.contains("[deny]"), "actions stay pinned");
-    assert!(scrolled.contains(PANEL_FOOTER_HINT), "footer stays pinned");
+    let scrolled = r.screen.text();
     assert!(
-        scrolled.contains("awaiting permission") && scrolled.contains("effect: write"),
-        "header stays pinned"
+        flat_scope(&scrolled).contains("tail-marker-end"),
+        "paging must reveal the scope tail: {scrolled}"
     );
-    assert!(
-        scrolled.contains("grant: grant-pty-panel"),
-        "grant stays pinned in the header"
-    );
-
-    screen.session.send(b"\x03").expect("send ctrl-c");
-    assert!(
-        screen
-            .session
-            .wait_for(b"\x1b[?1049l", Duration::from_secs(10))
-            .expect("pty read"),
-        "alternate screen must be left on exit"
-    );
-    assert_eq!(
-        screen
-            .session
-            .wait_exit(Duration::from_secs(10))
-            .expect("pty wait"),
-        Some(0)
-    );
-    screen.session.finish().expect("pty teardown");
+    r.assert_header(&scrolled);
+    assert!(scrolled.contains(DENY));
+    r.no_grant();
+    r.screen.exit(b"\x03", 130);
+    r.screen.session.finish().expect("overflow PTY teardown");
 }
 
-/// F-UX-4: a limited-grant recording that fails on the store resolves
-/// nothing — the panel survives, the failure is a typed transcript note,
-/// and focus returns to the non-destructive action.
+fn assert_failed_recording(r: &mut Request, cause: &str) {
+    r.screen.see(DENY);
+    r.screen.send(b"\x1b[D");
+    r.screen.see(LIMITED);
+    r.confirm();
+    let frame = r
+        .screen
+        .wait_for(WAIT, |frame| flat_scope(frame).contains(cause));
+    assert!(
+        frame.contains("awaiting permission") && frame.contains(DENY) && !frame.contains(LIMITED),
+        "{frame}"
+    );
+    assert!(
+        !flat_scope(&frame).contains("scope is not valid unicode"),
+        "{frame}"
+    );
+    r.no_grant();
+    // The terminal must still handle input; a stale last paint on a dead child is not recovery.
+    r.screen.send(b"\x1b[B");
+    r.screen.see(ONCE);
+}
+
 #[test]
 fn limited_grant_store_failure_keeps_the_panel_on_deny() {
-    let root = tempfile::TempDir::with_prefix("rivect-panel-grant-failure-").expect("fixture root");
-    let db = root.path().join("rivect.db");
-    let mut store = TaskStore::open(&db).expect("open store");
-    // Hold the single write slot with a second connection: the next
-    // preapproval insert loses it immediately (default busy timeout 0),
-    // the same real-writer contention the store documents.
-    let blocker = rusqlite::Connection::open(&db).expect("open blocker");
+    let mut r = Request::open(false, false);
+    let blocker = rusqlite::Connection::open(&r.db).expect("open contender");
     blocker
         .execute_batch("BEGIN IMMEDIATE")
         .expect("hold write slot");
-
-    let mut view = initial_view();
-    view.panel = Some(PermissionPanel::new(
-        ModeDecision::Ask,
-        EffectClass::Write,
-        "grant-failure",
-        "task-failure-fixture",
-        "2036-01-01T00:00:00Z",
-        "/scope",
-    ));
-    // Focus the limited-grant action (Left from the default deny focus).
-    assert!(handle_panel_key(
-        KeyCode::Left,
-        KeyModifiers::NONE,
-        &mut view,
-        &mut store.writer()
-    ));
-    assert_eq!(
-        view.panel.as_ref().map(PermissionPanel::confirm),
-        Some(PanelAction::LimitedGrant)
-    );
-
-    let keep_running = handle_panel_key(
-        KeyCode::Enter,
-        KeyModifiers::NONE,
-        &mut view,
-        &mut store.writer(),
-    );
-    assert!(keep_running, "a failed recording must not cancel the TUI");
-    let panel = view
-        .panel
-        .as_ref()
-        .expect("the panel survives the failed recording");
-    assert_eq!(
-        panel.confirm(),
-        PanelAction::Deny,
-        "focus returns to the non-destructive action"
-    );
-    assert!(
-        view.transcript
-            .iter()
-            .any(|line| line.contains("limited grant recording failed")),
-        "the failure is a typed note: {:?}",
-        view.transcript
-    );
+    assert_failed_recording(&mut r, "limited grant recording failed");
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("release write slot");
+    r.screen.exit(b"\x03", 130);
+    r.screen.session.finish().expect("contention PTY teardown");
 }
 
-/// A limited-grant recording that fails on grant_id charset reports a
-/// grant-id error, not a scope-unicode miss.
 #[test]
 fn limited_grant_invalid_grant_id_keeps_the_panel_on_deny() {
-    let root =
-        tempfile::TempDir::with_prefix("rivect-panel-grant-id-charset-").expect("fixture root");
-    let db = root.path().join("rivect.db");
-    let mut store = TaskStore::open(&db).expect("open store");
+    let mut r = Request::open(false, true);
+    assert_failed_recording(
+        &mut r,
+        "limited grant recording failed: grant id is not valid",
+    );
+    r.screen.exit(b"\x03", 130);
+    r.screen
+        .session
+        .finish()
+        .expect("malformed grant PTY teardown");
+}
 
-    let mut view = initial_view();
-    view.panel = Some(PermissionPanel::new(
-        ModeDecision::Ask,
-        EffectClass::Write,
-        "grant\rid",
-        "task-failure-fixture",
-        "2036-01-01T00:00:00Z",
-        "/scope",
-    ));
-    assert!(handle_panel_key(
-        KeyCode::Left,
-        KeyModifiers::NONE,
-        &mut view,
-        &mut store.writer()
-    ));
-    assert_eq!(
-        view.panel.as_ref().map(PermissionPanel::confirm),
-        Some(PanelAction::LimitedGrant)
-    );
+#[test]
+fn limited_grant_rechecks_the_pending_row_after_the_witness() {
+    for mutation in [
+        "UPDATE pending_permissions SET expires_at='2000-01-01T00:00:00Z' WHERE task_id=?1 AND grant_id=?2 AND scope=?3",
+        "DELETE FROM pending_permissions WHERE task_id=?1 AND grant_id=?2 AND scope=?3",
+    ] {
+        let mut r = Request::open(false, false);
+        r.screen.see(DENY);
+        r.screen.send(b"\x1b[D");
+        r.screen.see(LIMITED);
+        std::thread::sleep(rivect::ui::DECISION_CONSENT_DELAY);
+        let db = rusqlite::Connection::open(&r.db).expect("private race fixture");
+        support::confirm_witness_with(&mut r.screen.session, || {
+            let changed = db
+                .execute(
+                    mutation,
+                    rusqlite::params![r.task, r.grant, r.target.to_str().expect("fixture path")],
+                )
+                .expect("expire or consume selected request while challenge is open");
+            assert_eq!(changed, 1);
+        });
+        r.screen.wait_for(WAIT, |frame| {
+            flat_scope(frame)
+                .replace(char::is_whitespace, "")
+                .contains("permissionrequestisnolongerpending")
+        });
+        r.no_grant();
+        r.screen.exit(b"\x03", 130);
+        r.screen.session.finish().expect("stale witness teardown");
+    }
+}
 
-    let keep_running = handle_panel_key(
-        KeyCode::Enter,
-        KeyModifiers::NONE,
-        &mut view,
-        &mut store.writer(),
-    );
-    assert!(keep_running, "a failed recording must not cancel the TUI");
-    let panel = view
-        .panel
-        .as_ref()
-        .expect("the panel survives the failed recording");
-    assert_eq!(
-        panel.confirm(),
-        PanelAction::Deny,
-        "focus returns to the non-destructive action"
-    );
+#[test]
+fn cancelling_the_limited_grant_witness_returns_to_deny() {
+    let mut r = Request::open(false, false);
+    r.screen.see(DENY);
+    r.screen.send(b"\x1b[D");
+    r.screen.see(LIMITED);
+    std::thread::sleep(rivect::ui::DECISION_CONSENT_DELAY);
+    r.screen.send(b"\r");
     assert!(
-        view.transcript
-            .iter()
-            .any(|line| { line.contains("limited grant recording failed: grant id is not valid") }),
-        "grant_id charset miss is a grant-id error: {:?}",
-        view.transcript
+        r.screen
+            .session
+            .wait_for(b" to confirm, or press Enter to cancel:", WAIT)
+            .expect("first witness prompt")
     );
-    assert!(
-        view.transcript
-            .iter()
-            .all(|line| !line.contains("scope is not valid unicode")),
-        "grant_id charset miss must not be reported as a scope unicode error: {:?}",
-        view.transcript
-    );
+    r.screen.send(b"\r");
+    let frame = r.screen.see("permission not confirmed; no grant recorded");
+    assert!(frame.contains(DENY) && !frame.contains(LIMITED), "{frame}");
+    r.no_grant();
+    r.screen.exit(b"\x03", 130);
+    r.screen
+        .session
+        .finish()
+        .expect("cancelled witness teardown");
+}
+
+#[test]
+fn attached_machine_and_unpaired_terminal_cannot_inspect_or_confirm_permission() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let root = fixture_dir("ac090-unpaired");
+    let data = root.path().join(".rivect");
+    std::fs::create_dir(&data).expect("data root");
+    let directory = root.path().canonicalize().expect("canonical project");
+    let target = fixture_target(&directory);
+    let (session, task, grant) = seed_permission(&data, directory, &target);
+    let db = data.join("runtime/rivect.db");
+    let pending = || {
+        TaskStore::open(&db)
+            .expect("open after owner exit")
+            .pending_permission(&session)
+            .expect("current permission")
+            .expect("request remains pending")
+    };
+    let expected = pending();
+    assert_eq!(expected["initiator"], task.0);
+    assert_eq!(expected["grant"], grant);
+    assert_eq!(expected["scope"], target.to_str().expect("fixture scope"));
+    let id = expected["request_id"]
+        .as_str()
+        .expect("owner-issued request id");
+    let binary = support::release::baseline_bundle().join("rivect");
+
+    for flag in ["--headless", "--ui-wire-v1", "--ui-terminal-wire-v1"] {
+        let params = json!({"schema_version":1, "session_id":session.0});
+        let resolve = json!({"schema_version":1, "session_id":session.0, "request_id":id, "choice":"limited_grant"});
+        let mut spoof = resolve.clone();
+        spoof["scope"] = json!(target);
+        spoof["grantor"] = json!("human:tui-panel");
+        let frames = [
+            (
+                "session.attach",
+                json!({"schema_version":1, "session_id":session.0, "bootstrap_id":format!("attach-{flag}")}),
+            ),
+            ("operator.permission", params),
+            ("operator.permission.resolve", resolve),
+            ("operator.permission.resolve", spoof),
+        ];
+        let mut child = Command::new(&binary)
+            .arg(flag)
+            .env_clear()
+            .env("HOME", root.path())
+            .env("TMPDIR", root.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("RIVECT_DATA_ROOT", &data)
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn installed owner");
+        {
+            let mut stdin = child.stdin.take().expect("owner stdin");
+            for (index, (method, params)) in frames.iter().enumerate() {
+                let frame =
+                    json!({"jsonrpc":"2.0", "id":index+1, "method":method, "params":params});
+                writeln!(stdin, "{frame}").expect("send request");
+            }
+        }
+        let deadline = Instant::now() + WAIT;
+        while child.try_wait().expect("owner status").is_none() {
+            if Instant::now() >= deadline {
+                child.kill().expect("stop stalled owner");
+                child.wait().expect("reap stalled owner");
+                panic!("{flag} stalled; machine input must never open a terminal witness");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("read owner frames");
+        let public = flag == "--headless";
+        assert_eq!(
+            output.status.code(),
+            Some(if public { 2 } else { 0 }),
+            "{flag}"
+        );
+        let text = std::str::from_utf8(&output.stdout).expect("UTF-8 wire");
+        let mut responses = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("wire response"));
+        for index in 1..=frames.len() {
+            let reply = responses.next().expect("one response per request");
+            assert_eq!(reply["jsonrpc"], "2.0");
+            assert_eq!(reply["id"], json!(index));
+            if index == 1 {
+                assert_eq!(
+                    reply["result"]["session_id"], session.0,
+                    "attach must succeed before probing {flag}"
+                );
+                continue;
+            }
+            assert!(
+                reply.get("result").is_none(),
+                "{flag} exposed a private permission result"
+            );
+            if public {
+                assert_eq!(reply["error"]["code"], -32601);
+                assert_eq!(reply["error"]["data"]["code"], "unknown_method");
+            } else {
+                assert_eq!(reply["error"], json!({"code":"denied"}));
+            }
+        }
+        assert!(
+            responses.next().is_none(),
+            "{flag} emitted unsolicited data"
+        );
+        assert_eq!(
+            pending(),
+            expected,
+            "{flag} altered or consumed the pending request"
+        );
+        let reader =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("observe preapprovals");
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM preapprovals", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count grants"),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("asked target"),
+            b"fixture bytes"
+        );
+    }
 }

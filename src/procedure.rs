@@ -3,14 +3,14 @@
 //! parameters, and the one stop decision the control path applies between
 //! steps.
 //!
-//! A segment is never authored by hand: [`SegmentTemplate::derive`] reads the
-//! plan revision the plan owner recorded and the rows its handlers closed, so
-//! the steps, their tools and their expected outputs are what actually ran.
+//! Plan rows name the historical capabilities. Only a bounded trace of
+//! confirmed executor operations under that plan supplies replayable steps;
+//! a semantic result and a previous grant cannot authorize an effect.
 //! This module holds the types and the pure decisions only; every statement
 //! lives in [`crate::state`] (P-002) and every effect goes through
 //! [`crate::executor`] (INV-002).
 
-use crate::contracts::{ErrorCode, QuestionId, TaskId};
+use crate::contracts::{EffectClass, ErrorCode, QuestionId, TaskId};
 use crate::executor::EffectRequest;
 use crate::state::{PlanObligationRecord, PlanRevisionRecord, StoreError};
 use std::collections::BTreeMap;
@@ -18,11 +18,12 @@ use std::collections::BTreeMap;
 /// The version of the segment record this build writes and runs. A segment
 /// saved under another schema is refused before its first effect instead of
 /// being replayed as if its shape had not moved.
-pub const PROCEDURE_SCHEMA_VERSION: u64 = 1;
+pub const PROCEDURE_SCHEMA_VERSION: u64 = 2;
 
-/// The conditions a segment stops its remainder on (AC-053, EDGE-003,
-/// EDGE-004). Every run honours all three, and the saved template names them so
-/// a reader sees what it will not run past.
+/// Maximum effects in one replayable segment.
+pub(crate) const MAX_SEGMENT_STEPS: usize = 64;
+
+/// The durable reasons a segment stops its remainder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopTrigger {
     /// The step's attempt settled `unknown`: the effect may have landed.
@@ -32,15 +33,18 @@ pub enum StopTrigger {
     RevokedRight,
     /// The task waits on a fork the segment's snapshot never held.
     NewMaterialChoice,
+    /// The confirmed attempt returned an incompatible receipt.
+    ReceiptMismatch,
 }
 
 /// Every trigger a run honours, in the order a run reaches them: the fork is
 /// re-checked before the step, the right is re-checked at the effect and the
 /// effect's own settlement follows it.
-pub const STOP_CONDITIONS: [StopTrigger; 3] = [
+pub const STOP_CONDITIONS: [StopTrigger; 4] = [
     StopTrigger::NewMaterialChoice,
     StopTrigger::RevokedRight,
     StopTrigger::UnknownEffect,
+    StopTrigger::ReceiptMismatch,
 ];
 
 impl StopTrigger {
@@ -51,6 +55,7 @@ impl StopTrigger {
             Self::UnknownEffect => "unknown_effect",
             Self::RevokedRight => "revoked_right",
             Self::NewMaterialChoice => "new_material_choice",
+            Self::ReceiptMismatch => "receipt_mismatch",
         }
     }
 
@@ -63,16 +68,47 @@ impl StopTrigger {
     }
 }
 
-/// One step of an executed plan: the typed tool it called and the output the
-/// plan row kept for it, both read back from the store rather than authored.
+/// An executor trace step, or a history-only semantic plan row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentStep {
     /// 1-based position in the executed plan's own order.
     pub position: u64,
     /// The capability that performed the step: the tool the plan called.
     pub tool: String,
-    /// The output the executed step recorded; a later run's expected output.
+    /// Historical output, not an expected digest for a different input.
     pub expected_output: String,
+    /// First position using this input in the executor trace; absent for semantic and legacy steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_input: Option<u64>,
+}
+
+impl SegmentStep {
+    pub(crate) fn operation(&self) -> Option<EffectClass> {
+        self.source_input?;
+        match self.tool.as_str() {
+            "read_file" => Some(EffectClass::Read),
+            "write_file" => Some(EffectClass::Write),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn accepts(&self, request: &EffectRequest) -> bool {
+        self.operation() == Some(request.class())
+    }
+
+    pub(crate) fn accepts_receipt(&self, detail: &str) -> bool {
+        let prefix = match self.operation() {
+            Some(EffectClass::Read) => "read-performed sha256=",
+            Some(EffectClass::Write) => "write-performed sha256=",
+            _ => return false,
+        };
+        detail.strip_prefix(prefix).is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
 }
 
 /// A saved segment: one executed plan revision of one selection, ready to run
@@ -139,6 +175,7 @@ impl SegmentTemplate {
                 position,
                 tool: row.capability.clone(),
                 expected_output: expected_output.clone(),
+                source_input: None,
             });
         }
         if steps.is_empty() {
@@ -205,6 +242,20 @@ impl SegmentTemplate {
                 recorded: self.selection_revision,
                 current: snapshot.selection_revision,
             });
+        }
+        if self.steps.is_empty() || self.steps.len() > MAX_SEGMENT_STEPS {
+            return Err(ProcedureError::IncompatibleOperation { position: 1 });
+        }
+        for (index, step) in self.steps.iter().enumerate() {
+            let position = index as u64 + 1;
+            if step.position != position
+                || !step
+                    .source_input
+                    .is_some_and(|input| (1..=position).contains(&input))
+                || !step.accepts_receipt(&step.expected_output)
+            {
+                return Err(ProcedureError::IncompatibleOperation { position });
+            }
         }
         Ok(())
     }
@@ -289,21 +340,14 @@ impl PreparedStep {
     /// result against the attempt that produced it, so a settlement lost after
     /// the effect is completed instead of the effect being issued again.
     #[must_use]
-    pub fn settlement(&self) -> SettledStep {
+    pub fn settlement(self) -> SettledStep {
         SettledStep {
             position: self.position,
-            tool: self.tool.clone(),
-            attempt_id: self.attempt_id.clone(),
-            result: settled_result(&self.tool, self.result.as_deref()),
+            tool: self.tool,
+            attempt_id: self.attempt_id,
+            result: self.result.unwrap_or_default(),
         }
     }
-}
-
-/// The result a settled step reports: the durable detail the attempt's own
-/// settlement wrote, or the step's tool when it recorded none.
-#[must_use]
-pub fn settled_result(tool: &str, detail: Option<&str>) -> String {
-    detail.map_or_else(|| format!("{tool} settled"), str::to_string)
 }
 
 /// What the re-check or the settlement observed that ends the remainder.
@@ -333,6 +377,8 @@ pub enum StopCause {
     /// under; the carried value is the live state (absent when the fork the
     /// snapshot held was decided).
     NewMaterialChoice { pending: Option<PendingFork> },
+    /// The effect landed, but its receipt does not prove the recorded operation.
+    ReceiptMismatch { position: u64 },
 }
 
 /// The stop a segment reaches: the condition that fired and the detail it
@@ -357,6 +403,10 @@ pub fn stop_decision(cause: &StopCause) -> StopDecision {
         StopCause::PreparedStep { position, .. } => (
             StopTrigger::UnknownEffect,
             format!("step {position} was prepared and never settled; the remainder is not run"),
+        ),
+        StopCause::ReceiptMismatch { position } => (
+            StopTrigger::ReceiptMismatch,
+            format!("step {position} returned an incompatible receipt; the remainder is not run"),
         ),
         StopCause::RevokedRight { grant_id } => (
             StopTrigger::RevokedRight,
@@ -507,6 +557,10 @@ pub enum ProcedureError {
     ToolChanged { recorded: String, current: String },
     #[error("step {position} has no bound parameter")]
     UnboundParameter { position: u64 },
+    #[error("step {position} has no compatible operation contract")]
+    IncompatibleOperation { position: u64 },
+    #[error("procedure run {run_id} is stopped on an incompatible receipt")]
+    ReceiptMismatch { run_id: String },
     #[error("run cursor {cursor} is past the {steps} steps of {procedure_id}")]
     CursorPastSteps {
         procedure_id: String,
@@ -542,12 +596,14 @@ impl ProcedureError {
             Self::PlanMissing { .. }
             | Self::NoExecutedSteps { .. }
             | Self::UnboundParameter { .. }
+            | Self::IncompatibleOperation { .. }
             | Self::CursorPastSteps { .. } => ErrorCode::InvalidInput,
             Self::PlanSuperseded { .. } => ErrorCode::StaleIntent,
             Self::SchemaChanged { .. } | Self::ToolChanged { .. } => ErrorCode::UnsupportedVersion,
             Self::SegmentMissing { .. } | Self::RunMissing { .. } => ErrorCode::NotFound,
             Self::StepOutOfOrder { .. }
             | Self::RunNotOpen { .. }
+            | Self::ReceiptMismatch { .. }
             | Self::AlreadyCompleted { .. } => ErrorCode::Conflict,
             Self::Store(error) => error.code(),
         }

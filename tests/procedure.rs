@@ -156,7 +156,13 @@ impl ReadWorker for SinkWorker {
         scope_root: &Path,
         target: &Path,
     ) -> Result<ReadObservation, WorkerError> {
-        let observation = self.inner.read_once(scope_root, target)?;
+        let mut observation = self.inner.read_once(scope_root, target)?;
+        if target
+            .file_name()
+            .is_some_and(|name| name == "bad-receipt.txt")
+        {
+            observation.digest = "malformed-digest".to_string();
+        }
         *self
             .reads
             .lock()
@@ -206,7 +212,12 @@ impl ReadWorker for UnprovenReadWorker {
         scope_root: &Path,
         target: &Path,
     ) -> Result<ReadObservation, WorkerError> {
-        self.seen += 1;
+        if !target
+            .file_name()
+            .is_some_and(|name| name == "recording.txt")
+        {
+            self.seen += 1;
+        }
         if self.seen == self.unproven {
             return Err(WorkerError::WriteMutationFailed {
                 source: std::io::Error::other("fixture: the step ran and its answer was lost"),
@@ -385,7 +396,7 @@ fn close_row(fixture: &mut Fixture, selection: &Selection, capability: &str, out
 }
 
 /// Drives a real executed plan of three steps: frame, plan, assess.
-fn three_step_plan(fixture: &mut Fixture) -> Selection {
+fn semantic_plan(fixture: &mut Fixture) -> Selection {
     let task = fixture.task.clone();
     let plan = request(
         RequestKind::Change,
@@ -413,6 +424,49 @@ fn three_step_plan(fixture: &mut Fixture) -> Selection {
     selection
 }
 
+fn record_effects(fixture: &mut Fixture, classes: &[EffectClass]) {
+    let path = fixture.scope.join("recording.txt");
+    std::fs::write(&path, "original input").expect("create source input");
+    let task = fixture.task.clone();
+    for class in classes {
+        let request = match class {
+            EffectClass::Read => EffectRequest::Read {
+                grant_id: fixture.grant_read(),
+                path: path.clone(),
+            },
+            EffectClass::Write => {
+                let scope = fixture
+                    .scope
+                    .canonicalize()
+                    .expect("canonical source scope");
+                // The source and replay share this scope's one budget ledger.
+                let grant_id = fixture
+                    .world
+                    .runtime
+                    .policy_writer()
+                    .grant_classes(scope, vec![*class]);
+                EffectRequest::Write {
+                    grant_id,
+                    path: path.clone(),
+                    bytes: b"recorded write".to_vec(),
+                }
+            }
+            other => panic!("unexpected source operation: {other:?}"),
+        };
+        let mut executor = fixture.world.runtime.executor();
+        let admitted = executor
+            .admit(&task, request, PermissionMode::Auto)
+            .expect("source admission");
+        executor.execute(&admitted).expect("source effect");
+    }
+}
+
+fn three_step_plan(fixture: &mut Fixture) -> Selection {
+    let selection = semantic_plan(fixture);
+    record_effects(fixture, &[EffectClass::Read; 3]);
+    selection
+}
+
 /// Drives a real executed plan of one step: the contract is already approved,
 /// so the plan records its own revision and nothing else closes.
 fn one_step_plan(fixture: &mut Fixture) -> Selection {
@@ -429,6 +483,7 @@ fn one_step_plan(fixture: &mut Fixture) -> Selection {
         &fixture.session,
         ActionInput::PlanWork(plan),
     );
+    record_effects(fixture, &[EffectClass::Read]);
     selection
 }
 
@@ -486,7 +541,21 @@ fn settled_of(outcome: SegmentStepOutcome) -> (ProcedureRun, SettledStep) {
 #[test]
 fn unknown_effect_stops_the_remainder_p1() {
     let mut fixture = fixture("p1");
-    three_step_plan(&mut fixture);
+    let scope_key = fixture
+        .scope
+        .canonicalize()
+        .expect("the scope canonicalizes");
+    fixture
+        .world
+        .runtime
+        .store_writer()
+        .open_budget(scope_key.to_str().expect("scope is utf-8"), 8)
+        .expect("the source and replay write budget opens");
+    semantic_plan(&mut fixture);
+    record_effects(
+        &mut fixture,
+        &[EffectClass::Read, EffectClass::Write, EffectClass::Read],
+    );
     let segment = fixture.procedure();
     assert_eq!(segment.steps.len(), 3, "the executed plan has three steps");
     assert_eq!(
@@ -495,8 +564,8 @@ fn unknown_effect_stops_the_remainder_p1() {
             .iter()
             .map(|step| step.tool.as_str())
             .collect::<Vec<_>>(),
-        vec!["frame_goal", "plan_work", "assess_plan"],
-        "the steps are the plan rows that closed, in selection order"
+        vec!["read_file", "write_file", "read_file"],
+        "the steps are the confirmed executor operations, in dispatch order"
     );
     // The saved record names what a later run must honour: the tool and schema
     // it ran under, the conditions it stops on, and each step's expected output.
@@ -510,7 +579,8 @@ fn unknown_effect_stops_the_remainder_p1() {
         vec![
             StopTrigger::NewMaterialChoice,
             StopTrigger::RevokedRight,
-            StopTrigger::UnknownEffect
+            StopTrigger::UnknownEffect,
+            StopTrigger::ReceiptMismatch
         ],
         "the saved segment names every condition it stops on"
     );
@@ -520,21 +590,12 @@ fn unknown_effect_stops_the_remainder_p1() {
         .expect("the saved segment reads back");
     assert_eq!(saved, segment, "the saved segment is the derived one");
     assert_eq!(
-        saved.steps[2].expected_output, "{\"semantic\":\"pass\"}",
-        "every step kept the output the executed plan produced"
+        saved.steps[2].expected_output,
+        fixture.digest(&fixture.scope.join("recording.txt")),
+        "the last read keeps its original receipt"
     );
-    assert_eq!(saved.steps[0].tool, "frame_goal");
-    assert_eq!(saved.steps[1].tool, "plan_work");
-    let scope_key = fixture
-        .scope
-        .canonicalize()
-        .expect("the scope canonicalizes");
-    fixture
-        .world
-        .runtime
-        .store_writer()
-        .open_budget(scope_key.to_str().expect("scope is utf-8"), 8)
-        .expect("the write step's budget opens");
+    assert_eq!(saved.steps[0].tool, "read_file");
+    assert_eq!(saved.steps[1].tool, "write_file");
     let (read_one, read_three) = (fixture.grant_read(), fixture.grant_read());
     let write_scope = fixture.scope.clone();
     let write_grant = fixture
@@ -880,7 +941,7 @@ fn single_step_segment_has_no_remainder_p5() {
     one_step_plan(&mut fixture);
     let segment = fixture.procedure();
     assert_eq!(segment.steps.len(), 1, "the executed plan has one step");
-    assert_eq!(segment.steps[0].tool, "plan_work");
+    assert_eq!(segment.steps[0].tool, "read_file");
     assert!(
         segment.remainder_after(0).len() == 1,
         "the single step is the whole segment"
@@ -1496,4 +1557,245 @@ fn scheduler_runs_every_step_of_the_saved_segment() {
         matches!(pass, Err(ControllerError::Store(_))),
         "the completion guard answers for the finished segment, got {pass:?}"
     );
+}
+
+#[test]
+fn semantic_plan_never_replays_as_three_file_reads() {
+    let mut fixture = fixture("semantic-not-read");
+    semantic_plan(&mut fixture);
+    let segment = fixture.procedure();
+    assert_eq!(
+        segment
+            .steps
+            .iter()
+            .map(|step| step.tool.as_str())
+            .collect::<Vec<_>>(),
+        ["frame_goal", "plan_work", "assess_plan"]
+    );
+    assert_eq!(segment.steps[2].expected_output, "{\"semantic\":\"pass\"}");
+    let target = fixture.targets[0].clone();
+    fixture
+        .world
+        .runtime
+        .set_read_scope(fixture.scope.clone(), target.clone());
+    // The ordinary executor may perform its one permitted read, but the
+    // semantic plan rows cannot pre-empt it with an invented read sequence.
+    let _pass = scheduler_pass(&mut fixture);
+    assert_eq!(fixture.dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.reads(&target), 1);
+}
+
+#[test]
+fn incompatible_binding_issues_no_prefix_effect() {
+    let mut fixture = fixture("wrong-binding");
+    three_step_plan(&mut fixture);
+    let segment = fixture.procedure();
+    let targets = fixture.targets.clone();
+    let binding = three_reads(&mut fixture).bind(
+        2,
+        EffectRequest::Write {
+            grant_id: fixture.grant_read(),
+            path: targets[1].clone(),
+            bytes: b"not a read".to_vec(),
+        },
+    );
+    let attempts = fixture
+        .store()
+        .snapshot(&fixture.task)
+        .expect("snapshot")
+        .attempts;
+    let error = fixture
+        .world
+        .runtime
+        .run_procedure_step(
+            &fixture.task,
+            &segment.procedure_id,
+            &binding,
+            PermissionMode::Manual,
+            RunStart::Resume,
+        )
+        .expect_err("wrong operation");
+    assert!(matches!(
+        error,
+        ControllerError::Procedure(ProcedureError::IncompatibleOperation { position: 2 })
+    ));
+    assert_eq!(
+        fixture
+            .store()
+            .snapshot(&fixture.task)
+            .expect("snapshot")
+            .attempts,
+        attempts
+    );
+    assert!(targets.iter().all(|target| fixture.reads(target) == 0));
+}
+
+#[test]
+fn incompatible_receipt_survives_restart_without_a_second_effect() {
+    for (interrupted, scheduler_recovers) in [(false, false), (true, false), (true, true)] {
+        let mut fixture = fixture("bad-receipt");
+        three_step_plan(&mut fixture);
+        let segment = fixture.procedure();
+        let bad = fixture.scope.join("bad-receipt.txt");
+        std::fs::write(&bad, "new bytes").expect("create current input");
+        fixture.targets[1] = bad.clone();
+        let binding = three_reads(&mut fixture);
+        let (run, _) =
+            settled_of(fixture.step(&segment.procedure_id, &binding, PermissionMode::Manual));
+        if interrupted {
+            // Drop the controller between the executor's confirmed receipt and cursor commit.
+            fixture
+                .world
+                .runtime
+                .executor()
+                .run_segment_step(
+                    &fixture.task,
+                    &segment,
+                    &run,
+                    &binding,
+                    PermissionMode::Manual,
+                )
+                .expect("worker returned a receipt");
+        } else {
+            let stopped =
+                stop_of(fixture.step(&segment.procedure_id, &binding, PermissionMode::Manual));
+            assert_eq!(
+                stopped.stop.expect("live stop").trigger,
+                StopTrigger::ReceiptMismatch
+            );
+        }
+        assert_eq!(fixture.reads(&bad), 1);
+        assert_eq!(fixture.reads(&fixture.targets[2]), 0);
+        fixture.world.reopen();
+        let rebound = three_reads(&mut fixture);
+        if scheduler_recovers {
+            fixture
+                .world
+                .runtime
+                .set_read_scope(fixture.scope.clone(), bad.clone());
+            let grant = fixture.world.runtime.scoped_grant.clone();
+            let error = fixture
+                .world
+                .runtime
+                .run_decision_step(
+                    &fixture.session,
+                    &fixture.task,
+                    &AnswerSelection::Custom {
+                        text: "a different input after restart".to_string(),
+                    },
+                    &grant,
+                    false,
+                )
+                .expect_err("ordinary dispatch must inspect the interrupted receipt");
+            assert!(matches!(
+                error,
+                ControllerError::Procedure(ProcedureError::ReceiptMismatch { .. })
+            ));
+        } else if interrupted {
+            let stopped =
+                stop_of(fixture.step(&segment.procedure_id, &rebound, PermissionMode::Manual));
+            assert_eq!(
+                stopped.stop.expect("recovered stop").trigger,
+                StopTrigger::ReceiptMismatch
+            );
+        }
+        let stopped = fixture
+            .store()
+            .procedure_run(&run.run_id)
+            .expect("durable run");
+        assert_eq!(stopped.cursor, 2);
+        assert_eq!(stopped.state, RunState::Stopped);
+        let steps = fixture.steps(&stopped);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].result, "read-performed sha256=malformed-digest");
+        let (_, state, detail) = fixture
+            .store()
+            .attempt_record(&steps[1].attempt_id)
+            .expect("attempt journal")
+            .expect("current attempt");
+        assert_eq!(state, "confirmed");
+        assert_eq!(detail.as_deref(), Some(steps[1].result.as_str()));
+        let error = fixture
+            .world
+            .runtime
+            .run_procedure_step(
+                &fixture.task,
+                &segment.procedure_id,
+                &rebound,
+                PermissionMode::Manual,
+                RunStart::Resume,
+            )
+            .expect_err("resume is fenced");
+        assert!(matches!(
+            error,
+            ControllerError::Procedure(ProcedureError::ReceiptMismatch { .. })
+        ));
+        fixture
+            .world
+            .runtime
+            .set_read_scope(fixture.scope.clone(), bad);
+        let error =
+            scheduler_pass(&mut fixture).expect_err("scheduler cannot dispatch past the stop");
+        assert!(matches!(
+            error,
+            ControllerError::Procedure(ProcedureError::ReceiptMismatch { .. })
+        ));
+        assert_eq!(fixture.world.provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.world.worker_reads(), 0);
+    }
+}
+
+#[test]
+fn legacy_steps_decode_as_history_but_cannot_resume() {
+    let mut fixture = fixture("legacy-replay");
+    three_step_plan(&mut fixture);
+    let mut segment = fixture.procedure();
+    let snapshot = rivect::procedure::SegmentSnapshot {
+        selection_revision: segment.selection_revision,
+        plan_revision: segment.plan_revision,
+        tool_version: segment.tool_version.clone(),
+        pending: None,
+    };
+    segment.steps = serde_json::from_str(r#"[{"position":1,"tool":"read_file","expected_output":"read-performed sha256=0000000000000000000000000000000000000000000000000000000000000000"}]"#)
+        .expect("legacy steps remain readable");
+    segment.schema_version = 1;
+    assert!(matches!(
+        segment.prepare(&snapshot),
+        Err(ProcedureError::SchemaChanged { recorded: 1, .. })
+    ));
+    segment.schema_version = rivect::procedure::PROCEDURE_SCHEMA_VERSION;
+    assert!(matches!(
+        segment.prepare(&snapshot),
+        Err(ProcedureError::IncompatibleOperation { position: 1 })
+    ));
+}
+
+#[test]
+fn scheduler_cannot_collapse_distinct_source_inputs_to_one_read_parameter() {
+    let mut fixture = fixture("distinct-sources");
+    semantic_plan(&mut fixture);
+    for name in ["original-a", "original-b"] {
+        let path = fixture.scope.join(name);
+        std::fs::write(&path, name).expect("source input");
+        let grant_id = fixture.grant_read();
+        let mut executor = fixture.world.runtime.executor();
+        let admitted = executor
+            .admit(
+                &fixture.task,
+                EffectRequest::Read { grant_id, path },
+                PermissionMode::Manual,
+            )
+            .expect("read admitted");
+        executor.execute(&admitted).expect("source read settles");
+    }
+    let segment = fixture.procedure();
+    assert_eq!(segment.steps.len(), 2);
+    let target = fixture.targets[0].clone();
+    fixture
+        .world
+        .runtime
+        .set_read_scope(fixture.scope.clone(), target.clone());
+    let _outcome = scheduler_pass(&mut fixture);
+    assert_eq!(fixture.dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.reads(&target), 1);
 }

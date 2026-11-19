@@ -1,0 +1,10 @@
+{
+  "name": "read_file",
+  "description": "one admitted file read in the current scope",
+  "input_schema": {
+    "type": "object",
+    "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+    "required": ["path"],
+    "additionalProperties": false
+  }
+}

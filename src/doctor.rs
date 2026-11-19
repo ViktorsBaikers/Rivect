@@ -191,10 +191,8 @@ fn exe_check() -> DoctorCheck {
     }
 }
 
-/// The packaged release identity beside the running executable. A build that
-/// ships no manifest is a checkout binary, not an installed release; one that
-/// does ship a manifest must pass the same exact-inventory and digest check
-/// activation uses, so a broken bundle answers degraded instead of ready.
+/// Managed installs require a manifest even when every other package marker
+/// is gone. Standalone bundles with a manifest are checked too.
 fn release_check() -> DoctorCheck {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -214,12 +212,26 @@ fn release_check() -> DoctorCheck {
         };
     };
     match std::fs::symlink_metadata(directory.join(RELEASE_MANIFEST_NAME)) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => DoctorCheck {
-            name: "release",
-            state: CheckState::Ready,
-            detail: "no release manifest beside the executable; this is not a packaged install"
-                .to_string(),
-        },
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && !rivect_sandbox_helper::is_managed_release_dir(directory)
+                && [
+                    directory.with_added_extension("manifest.sha256"),
+                    directory.join("libexec"),
+                ]
+                .iter()
+                .all(|path| {
+                    std::fs::symlink_metadata(path)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                }) =>
+        {
+            DoctorCheck {
+                name: "release",
+                state: CheckState::Ready,
+                detail: "no release manifest beside the executable; this is not a packaged install"
+                    .to_string(),
+            }
+        }
         Err(error) => DoctorCheck {
             name: "release",
             state: CheckState::Degraded,

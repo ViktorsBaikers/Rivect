@@ -36,6 +36,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::time::{Duration, Instant};
 
+/// A private-pipe admission, bound to one durable goal and an explicit local route.
+pub struct UiMessage {
+    session: SessionId,
+    task: TaskId,
+    revision: u64,
+    intent: u64,
+    image: Option<crate::model::PendingImage>,
+    goal: String,
+    config: config::Config,
+}
+
+/// Only produced after the independently witnessed answer transaction commits.
+pub struct UiAnswer {
+    session: SessionId,
+    task: TaskId,
+    selection: AnswerSelection,
+    intent: u64,
+    image: Option<crate::model::PendingImage>,
+}
+
+struct TerminalResult {
+    session: SessionId,
+    task: TaskId,
+    revision: u64,
+    result: Result<String, ErrorCode>,
+}
+
 /// The scoped local sharing boundary (AC-083b): the socket, the token
 /// digest and the observer gate live beside the dispatcher that admits
 /// their methods, so the share module needs no crate-root declaration.
@@ -167,6 +194,7 @@ pub struct Runtime {
     pub config_path: PathBuf,
     pub provider_calls: u64,
     pub(crate) foreground: Option<ForegroundWork>,
+    terminal_result: Option<TerminalResult>,
     pub(crate) file_share: Option<crate::controller::PendingFileShare>,
     pub(crate) file_write: Option<crate::controller::PendingFileWrite>,
     pub(crate) project_check: Option<crate::controller::PendingProjectCheck>,
@@ -330,6 +358,7 @@ pub struct IndexSeam {
 pub struct IndexWorker {
     pub program: PathBuf,
     pub helper: PathBuf,
+    pub(crate) symbols: crate::context::SymbolSession,
 }
 
 impl IndexWorker {
@@ -640,6 +669,117 @@ impl Runtime {
 }
 
 impl Runtime {
+    pub fn begin_terminal_answer(
+        &mut self,
+        params: Value,
+        pin: Option<&crate::executor::ImageReadPin>,
+    ) -> Result<UiAnswer, ErrorCode> {
+        if params["kind"] != "answer" || params["schema_version"] != 1 {
+            return Err(ErrorCode::InvalidInput);
+        }
+        if params.get("image").is_some() != pin.is_some() {
+            return Err(ErrorCode::Denied);
+        }
+        let mut work = None;
+        let receipt = submit_task(
+            self,
+            Ingress::TrustedHuman,
+            params,
+            Value::Null,
+            Some((&mut work, pin)),
+        );
+        if let Some(error) = receipt.error {
+            return Err(error.data.code);
+        }
+        work.ok_or(ErrorCode::OutcomeUnknown)
+    }
+
+    pub fn finish_terminal_answer(
+        &mut self,
+        work: UiAnswer,
+        stop: Arc<AtomicBool>,
+        pending: &AtomicBool,
+        preview: &dyn Fn(&str),
+    ) -> Result<Option<crate::resources::OutputSettlement>, StoreError> {
+        let UiAnswer {
+            session,
+            task,
+            selection,
+            image,
+            intent,
+        } = work;
+        let row = self
+            .store()
+            .projection_page(&session, Some(&task))?
+            .0
+            .pop()
+            .ok_or_else(|| StoreError::NotFound(crate::state::Missing::Task(task.0.clone())))?;
+        if row.origin == crate::state::UI_MESSAGE_PRINCIPAL {
+            let mut goal = row.goal;
+            if let AnswerSelection::Custom { text } = selection {
+                goal.push('\n');
+                goal.push_str(&text);
+            }
+            let message = UiMessage {
+                session,
+                task,
+                goal,
+                config: self.config_for_broker(),
+                image,
+                revision: row.revision,
+                intent,
+            };
+            return self.finish_ui_message(message, &stop, pending, preview);
+        }
+        if stop.load(Ordering::Acquire) {
+            self.owner.store.cancel_task(
+                &session,
+                &task,
+                intent,
+                Some(crate::executor::TASK_CANCELLED),
+            )?;
+            return Ok(None);
+        }
+        self.foreground = Some(ForegroundWork {
+            task_id: task.clone(),
+            cancel: stop,
+            reply: None,
+            share_reads: false,
+        });
+        let resumed = self.resume_answered_with_image(&session, &task, selection, image);
+        let reply = self.foreground.take().and_then(|work| work.reply);
+        let result = match resumed {
+            Ok(_) => reply.map(Ok),
+            Err(error) => {
+                self.owner.store.mark_no_ready(&task)?;
+                Some(Err(error.error_code()))
+            }
+        };
+        self.terminal_result = if let Some(result) = result {
+            let revision = self.owner.store.snapshot(&task)?.revision;
+            Some(TerminalResult {
+                session,
+                task,
+                revision,
+                result,
+            })
+        } else {
+            None
+        };
+        Ok(None)
+    }
+
+    pub fn terminal_result(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+        revision: u64,
+    ) -> Option<Result<&str, ErrorCode>> {
+        self.terminal_result
+            .as_ref()
+            .filter(|r| &r.session == session && &r.task == task && r.revision == revision)
+            .map(|r| r.result.as_deref().map_err(|code| *code))
+    }
     /// The election owner. Read-only: the binding it carries is never
     /// rebound from outside the crate.
     #[must_use]
@@ -663,6 +803,178 @@ impl Runtime {
     /// The one write surface of the runtime's task store.
     pub fn store_writer(&mut self) -> crate::state::StoreWriter<'_> {
         self.owner.store.writer()
+    }
+
+    /// Reads this project's most recent attachment without creating a session.
+    ///
+    /// # Errors
+    /// Propagates lookup errors from the task store.
+    pub fn previous_project_session(&self) -> Result<Option<SessionId>, StoreError> {
+        self.store()
+            .tui_project_session(&tui_project_marker(&self.scope_root), None)
+    }
+
+    /// Returns the task preventing a session switch, if any.
+    ///
+    /// # Errors
+    /// Propagates task store read errors.
+    pub fn session_switch_blocker(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<TaskId>, StoreError> {
+        running_task(self.store(), session)
+    }
+
+    /// Opens the project's last conversation, or marks a newly created one current.
+    ///
+    /// # Errors
+    /// Propagates attachment lookup and write-fence failures.
+    pub fn open_project_conversation(
+        &mut self,
+        new: Option<&SessionId>,
+    ) -> Result<SessionId, StoreError> {
+        let marker = tui_project_marker(&self.scope_root);
+        let previous = match new {
+            Some(session) => Some(session.clone()),
+            None => self.store().tui_project_session(&marker, None)?,
+        };
+        self.store_writer()
+            .open_session(
+                &format!("{marker}{}", CommandId::generate()),
+                "tui",
+                previous.as_ref(),
+            )
+            .map(|(session, _, _, _)| session)
+    }
+
+    /// Durably accepts an ordinary message. An absent local route retains the
+    /// existing first-question workflow; a receipt never authorizes a second send.
+    pub fn begin_ui_message(
+        &mut self,
+        session: &SessionId,
+        command: &str,
+        goal: &str,
+    ) -> Result<(CommandResult, Option<UiMessage>), crate::controller::ControllerError> {
+        let config = self.config_for_broker();
+        let local = if config.models.defaults.is_some() {
+            let selected = config
+                .resolve_purpose(&self.purpose)
+                .map_err(crate::model::ModelError::from)?;
+            matches!(&selected.model, config::ModelAssign::Fixed(model)
+                if selected.fallback == config::FallbackAssign::Off &&
+                config.connections.get(&model.connection).is_some_and(|entry|
+                    crate::providers::ui_local_endpoint(&model.connection, entry)))
+        } else {
+            false
+        };
+        let prior = self.owner.store.receipt(command)?;
+        let first_question = match &prior {
+            Some((_, receipt)) => {
+                serde_json::from_str::<CommandResult>(receipt)?
+                    .snapshot
+                    .lifecycle
+                    == Lifecycle::Waiting
+            }
+            None => !local,
+        };
+        let principal = crate::state::UI_MESSAGE_PRINCIPAL;
+        let receipt = if first_question {
+            self.start_task(session, command, principal, goal, (&[], &[]))?
+        } else {
+            self.owner
+                .store
+                .create_task(session, command, principal, goal, (&[], &[]))?
+        };
+        let work = (local && prior.is_none()).then(|| UiMessage {
+            session: session.clone(),
+            task: receipt.task_id.clone(),
+            goal: goal.to_owned(),
+            revision: receipt.task_revision,
+            intent: receipt.intent_revision,
+            image: None,
+            config,
+        });
+        Ok((receipt, work))
+    }
+
+    /// Runs the admitted provider once, with no tools and no fallback. Only
+    /// the owning session/task can receive its text, failure or cancellation.
+    pub fn finish_ui_message(
+        &mut self,
+        work: UiMessage,
+        cancel: &AtomicBool,
+        pending: &AtomicBool,
+        preview: &dyn Fn(&str),
+    ) -> Result<Option<crate::resources::OutputSettlement>, StoreError> {
+        use crate::controller::ControllerError;
+        let mut attempted = None;
+        let mut send = || -> Result<_, ControllerError> {
+            let scopes = self.budget_scopes(&work.task)?;
+            let manifest = self.broker.prepare_ui_chat(
+                &self.purpose,
+                &work.config,
+                &work.session.0,
+                &work.goal,
+                work.image.as_ref(),
+            )?;
+            let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
+            ledger.observe_pending(pending);
+            let reply = self.broker.dispatch_with_preview(
+                &mut ledger,
+                &work.session.0,
+                &manifest,
+                Some(cancel),
+                Some(preview),
+            );
+            attempted = Some(manifest);
+            Ok(reply?)
+        };
+        let result = if cancel.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(send())
+        };
+        let settlement = if let Some(result) = result.filter(|_| !cancel.load(Ordering::Acquire)) {
+            let reply = result
+                .map_err(|error| error.error_code())
+                .and_then(|reply| {
+                    if !reply.tool_calls.is_empty() {
+                        Err(ErrorCode::Denied)
+                    } else {
+                        preview(&reply.text);
+                        if reply.text.len() > crate::contracts::TEXT_MAX_BYTES {
+                            Err(ErrorCode::OutputLimit)
+                        } else {
+                            Ok(reply.text)
+                        }
+                    }
+                });
+            self.owner.store.settle_ui_message(
+                &work.session,
+                &work.task,
+                work.revision,
+                reply.as_deref().map_err(|code| *code),
+            )?;
+            Some(match reply {
+                Err(code) => crate::resources::OutputSettlement::Failed {
+                    cause: code.as_str().replace('_', " "),
+                },
+                Ok(_) => crate::resources::OutputSettlement::Complete,
+            })
+        } else {
+            self.owner.store.cancel_task_with_origin(
+                &work.session,
+                &work.task,
+                work.intent,
+                None,
+                "ui-message",
+            )?;
+            None
+        };
+        if let Some(manifest) = attempted.as_ref() {
+            self.refresh_economy(Some(manifest))?;
+        }
+        Ok(settlement)
     }
 
     /// Prepares one delivery of this runtime's exact serving base: the
@@ -1305,6 +1617,10 @@ impl Runtime {
         // never blind-resent, and the spend it may have caused is not
         // released as zero.
         let reconciled = owner.store.reconcile_sends().map_err(OwnerError::from)?;
+        owner
+            .store
+            .reconcile_ui_messages()
+            .map_err(OwnerError::from)?;
         if reconciled > 0 {
             diagnostics.push(format!(
                 "settlement recovery: {reconciled} interrupted send(s) closed unknown at the retained bound"
@@ -1567,6 +1883,7 @@ impl Runtime {
             config_path,
             provider_calls: 0,
             foreground: None,
+            terminal_result: None,
             file_share: None,
             file_write: None,
             project_check: None,
@@ -1594,6 +1911,7 @@ impl Runtime {
                 watch_refusal: None,
                 worker: IndexWorker {
                     program: worker_program(),
+                    symbols: Default::default(),
                     // A helper that does not resolve is not an open
                     // failure: the run answers `helper_unavailable`
                     // typed when it is made, and no in-process
@@ -1932,6 +2250,23 @@ impl Runtime {
         }
     }
 
+    /// Returns the same bounded preview as `read_file`, after an exact, physically pinned terminal admission.
+    pub fn read_terminal_file(
+        &mut self,
+        task: &TaskId,
+        pin: &crate::executor::FileReadPin,
+    ) -> Result<Value, crate::executor::ExecutorError> {
+        let grant = self.scoped_grant.clone();
+        let outcome = crate::tools::invoke_bound_read(
+            self,
+            task,
+            grant,
+            pin.target.clone(),
+            Some((pin, None)),
+        )?;
+        Ok(render_effect_outcome(&outcome))
+    }
+
     /// One image the public answer path read through the scoped executor
     /// (TD-20): the bytes and the media the caller declared, ready for the
     /// task's next model-carrying step to freeze through
@@ -1942,11 +2277,12 @@ impl Runtime {
     /// The executor's typed admission denial (a canonicalized target outside
     /// the grant, a symlink escape, an unavailable sandbox), or
     /// [`AnswerImageError::Denied`] for a shell-level refusal.
-    pub(crate) fn read_answer_image(
+    fn read_answer_image_pinned(
         &mut self,
         task: &TaskId,
         path: &Path,
         declared: crate::model::ImageMedia,
+        pin: Option<&crate::executor::ImageReadPin>,
     ) -> Result<crate::model::PendingImage, AnswerImageError> {
         let grant = self.scoped_grant.clone();
         // The executor's read leg opens the path it is handed after its
@@ -1957,7 +2293,8 @@ impl Runtime {
         // absolute path and a symlink escape or out-of-scope target stays
         // its typed denial.
         let target = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        match crate::tools::invoke_read(self, task, &grant, target)? {
+        let pin = pin.map(|pin| (&pin.location, Some(pin.sha256.as_str())));
+        match crate::tools::invoke_bound_read(self, task, grant, target, pin)? {
             crate::executor::EffectOutcome::Read { bytes, .. } => {
                 Ok(crate::model::PendingImage { declared, bytes })
             }
@@ -5766,7 +6103,7 @@ fn handle_method(
             };
             RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
         }
-        "task.submit" => submit_task(rt, ingress, params, id),
+        "task.submit" => submit_task(rt, ingress, params, id, None),
         "long_work.start" => long_work_start(rt, &params, id),
         "long_work.stop" => long_work_stop(rt, &params, id),
         "auth.login.begin" => auth_login_begin(rt, ingress, &params, id),
@@ -7076,7 +7413,16 @@ fn status_cursor(params: &Value) -> Result<Option<(u64, u64)>, RequestError> {
     Ok(Some((generation, offset)))
 }
 
-fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> RpcResponse {
+fn submit_task(
+    rt: &mut Runtime,
+    ingress: Ingress,
+    params: Value,
+    id: Value,
+    deferred: Option<(
+        &mut Option<UiAnswer>,
+        Option<&crate::executor::ImageReadPin>,
+    )>,
+) -> RpcResponse {
     let Some(session) = session_param(&params) else {
         return missing_session(id);
     };
@@ -7311,7 +7657,12 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                             return request_error(id, denial);
                         }
                     };
-                    match rt.read_answer_image(&task, &path, declared) {
+                    match rt.read_answer_image_pinned(
+                        &task,
+                        &path,
+                        declared,
+                        deferred.as_ref().and_then(|(_, pin)| *pin),
+                    ) {
                         Ok(pending) => Some(pending),
                         Err(error) => {
                             let code = match &error {
@@ -7402,6 +7753,16 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 "human",
             ) {
                 Ok(result) => {
+                    if let Some((slot, _)) = deferred {
+                        *slot = Some(UiAnswer {
+                            session,
+                            task,
+                            selection,
+                            image: pending_image,
+                            intent: result.intent_revision,
+                        });
+                        return RpcResponse::ok(id, Value::Null);
+                    }
                     // The frozen answer builds the task's runnable
                     // scheduler node through the production path; a
                     // settled tree grows nothing runnable — the answer
@@ -11404,30 +11765,45 @@ mod tests {
             note.contains("resolution:"),
             "the note names the manual resolution: {note}"
         );
-        let mut view = crate::ui::LocalView::default();
-        view.extend_transcript(&runtime.boot_diagnostics);
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
-        crate::ui::render(&mut terminal, &view)?;
-        let buffer = terminal.backend().buffer();
-        let width = usize::from(buffer.area.width);
-        let painted: String = buffer
-            .content
-            .chunks(width)
-            .map(|row| {
-                row.iter()
-                    .map(ratatui::buffer::Cell::symbol)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\r\n");
-        let mut parser = vt100::Parser::new(40, 120, 0);
-        parser.process(painted.as_bytes());
-        let screen = parser.screen().contents();
-        assert!(
-            screen.contains("check recovery: cleanup refused"),
-            "the rendered transcript paints the recovery note: {screen}"
-        );
         drop(runtime);
+        // A second open must deliver the same still-unresolved verdict into a real
+        // terminal frame, not only print it to stderr before the alternate screen.
+        let kit = tempfile::tempdir()?;
+        let bundle = if let Some(path) = std::env::var_os("RIVECT_V2_TEST_BUNDLE")
+            .or_else(|| std::env::var_os("RIVECT_TEST_BUNDLE"))
+        {
+            std::fs::canonicalize(path)?
+        } else {
+            let path = kit.path().join("release");
+            let status = crate::test_packaging::candidate_command(&path).status()?;
+            assert!(status.success(), "v2 packaging failed: {status}");
+            path
+        };
+        use crate::ui::pty_support::{PtySession, pty_command, squashed, wait_for_screen_text};
+        let mut command = pty_command(bundle.join("rivect"));
+        command.arg("--data-root");
+        command.arg(data_root.path());
+        command.cwd(kit.path());
+        command.env("HOME", kit.path());
+        command.env("TERM", "xterm-256color");
+        let mut pty = PtySession::spawn(command, 40, 120, kit, data_root.path().to_owned())?;
+        let timeout = std::time::Duration::from_secs(10);
+        let screen = wait_for_screen_text(&pty, 40, 120, "Message", timeout)?;
+        assert!(
+            screen.contains("Message") && screen.contains("check recovery: cleanup refused"),
+            "missing recovery frame: {screen}"
+        );
+        pty.resize(32, 100)?;
+        let resized = wait_for_screen_text(&pty, 32, 100, "Message", timeout)?;
+        assert!(
+            squashed(&resized).contains("check recovery: cleanup refused"),
+            "{resized}"
+        );
+        let reopened_root = pty.data_root();
+        pty.send(b"\x03")?;
+        assert_eq!(pty.wait_exit(timeout)?, Some(130));
+        pty.finish()?;
+        drop(crate::owner::Owner::elect(&reopened_root)?);
         drop_sealed_root(&allocated.canonical_root);
         Ok(())
     }

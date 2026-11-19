@@ -15,6 +15,8 @@
 
 mod cli;
 mod doctor;
+mod ui_launch;
+mod ui_wire;
 
 use crossterm::tty::IsTty;
 use rivect::commands::{DispatchStep, Ingress, LoopEvent, OpenError, Runtime};
@@ -32,6 +34,8 @@ enum CliError {
     Stdin(#[source] io::Error),
     #[error("stdout failed")]
     Stdout(#[source] io::Error),
+    #[error("private pipe failed")]
+    PrivatePipe(#[source] io::Error),
     #[error("stdin request exceeds {limit} bytes")]
     RequestTooLarge { limit: usize },
     #[error("index worker failed")]
@@ -65,6 +69,33 @@ fn main() {
         std::process::exit(0);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, state] = args.as_slice()
+        && flag == "--ui-review-data"
+    {
+        let Some(view) = rivect::ui::review::projection(state) else {
+            eprintln!("unknown review state");
+            std::process::exit(2);
+        };
+        if let Err(source) = write_stdout(&view.to_string()) {
+            report_cli_error(&CliError::Stdout(source));
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args == ["--ui-wire-v1"] || args == ["--ui-terminal-wire-v1"] {
+        if io::stdin().is_tty() || io::stdout().is_tty() {
+            eprintln!("private ui wire requires pipes");
+            std::process::exit(2);
+        }
+        // A requested internal mode without the pinned live parent stays machine-only.
+        let pipe =
+            if args == ["--ui-terminal-wire-v1"] && ui_launch::paired_terminal_parent().is_ok() {
+                Pipe::TerminalUi
+            } else {
+                Pipe::PrivateUi
+            };
+        std::process::exit(run_headless(&default_data_root(), pipe));
+    }
     let invocation = match cli::parse(&args, default_data_root()) {
         Ok(invocation) => invocation,
         Err(error) => {
@@ -104,13 +135,9 @@ fn main() {
                 );
                 std::process::exit(2);
             }
-            match rivect::ui::review::ReviewState::run(&state) {
-                Ok(code) => std::process::exit(code),
-                Err(source) => {
-                    eprintln!("ui review failed: {source}");
-                    std::process::exit(2);
-                }
-            }
+            let source = ui_launch::exec(&["--ui-review", &state], None);
+            report_cli_error(&CliError::Tui(source));
+            std::process::exit(1);
         }
         cli::Invocation::Run {
             headless,
@@ -132,15 +159,11 @@ fn main() {
                 std::process::exit(2);
             }
             if !headless && stdin_tty {
-                match rivect::ui::run_tui_with_mode(&data_root, render) {
-                    Ok(code) => std::process::exit(code),
-                    Err(source) => {
-                        report_cli_error(&CliError::Tui(source));
-                        std::process::exit(1);
-                    }
-                }
+                let source = ui_launch::exec(&["--surface", render.label()], Some(&data_root));
+                report_cli_error(&CliError::Tui(source));
+                std::process::exit(1);
             }
-            let code = run_headless(&data_root);
+            let code = run_headless(&data_root, Pipe::Headless);
             std::process::exit(code);
         }
     }
@@ -308,7 +331,14 @@ fn run_command(data_root: &Path, kind: &str) -> i32 {
     code
 }
 
-fn run_headless(data_root: &Path) -> i32 {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pipe {
+    Headless,
+    PrivateUi,
+    TerminalUi,
+}
+
+fn run_headless(data_root: &Path, pipe: Pipe) -> i32 {
     let (events, inbox) = sync_channel::<LoopEvent>(LOOP_CHANNEL_CAPACITY);
     let runtime_events = events.clone();
     // Doctor is answered before any runtime open: the request diagnoses the
@@ -322,7 +352,14 @@ fn run_headless(data_root: &Path) -> i32 {
     // The pre-open pass serves only frames that arrive. End of input with no
     // doctor frame is not an answer: the runtime still opens and reports its
     // own boot diagnostics, exactly as it did before this pass existed.
-    let first = match answer_doctor_frames(&inbox, data_root, &mut exit) {
+    let first = match if pipe != Pipe::Headless {
+        inbox.recv().map_err(|source| {
+            report_cli_error(&CliError::Stdin(io::Error::other(source)));
+            1
+        })
+    } else {
+        answer_doctor_frames(&inbox, data_root, &mut exit)
+    } {
         Ok(event) => event,
         // A run that answered its doctor frames needs no runtime, and a reader
         // blocked in `read_until` on a live stdin owns no runtime state:
@@ -330,7 +367,16 @@ fn run_headless(data_root: &Path) -> i32 {
         // The process exit ends it.
         Err(status) => return status,
     };
-    let mut runtime = match open_headless(data_root) {
+    let opened = match pipe {
+        Pipe::Headless => open_headless(data_root),
+        Pipe::PrivateUi => {
+            Runtime::open_configured(data_root, rivect::providers::private_ui_provider)
+        }
+        Pipe::TerminalUi => {
+            Runtime::open_configured(data_root, rivect::providers::terminal_ui_provider)
+        }
+    };
+    let mut runtime = match opened {
         Ok(runtime) => runtime,
         // The failed open already emitted the collected verdicts to
         // stderr and carries them for surfaces that need their own
@@ -339,6 +385,14 @@ fn run_headless(data_root: &Path) -> i32 {
         // stdin keeps it in `read_until`, and the failure must exit 1
         // instead of hanging on a client that holds its pipe open.
         Err(carrier) => {
+            if pipe != Pipe::Headless {
+                if let LoopEvent::Frame(raw) = &first
+                    && let Err(source) = ui_wire::boot::failed_open(raw, &carrier)
+                {
+                    report_cli_error(&CliError::PrivatePipe(source));
+                }
+                return 1;
+            }
             report_cli_error(&CliError::Owner(carrier.into_source()));
             return 1;
         }
@@ -347,8 +401,10 @@ fn run_headless(data_root: &Path) -> i32 {
     // discovery walks that root's ancestors, so the project's own instruction
     // files reach the assembled request. A working directory that cannot be
     // read hands no root and discovers nothing — never a failed boot.
-    runtime.set_instructions_root(std::env::current_dir().ok());
     if let Ok(cwd) = std::env::current_dir() {
+        if pipe != Pipe::Headless {
+            runtime.set_project_root(cwd.clone());
+        }
         runtime.set_instructions_root(Some(cwd.clone()));
         // The same directory is the declared read scope a shipped `read_file`
         // addresses: the entry binds it here, so a real binary's read is
@@ -368,13 +424,18 @@ fn run_headless(data_root: &Path) -> i32 {
     // The index owner and the watch backend ping this same channel, so a
     // run answering or a batch arriving is noticed by a loop blocked on
     // input rather than by a poll.
-    if !runtime.set_loop_wake(runtime_events) {
+    if !runtime.set_loop_wake(runtime_events.clone()) {
         report_cli_error(&CliError::Stdin(io::Error::other(
             "the runtime already holds a loop wake",
         )));
         release_runtime(runtime);
         return 1;
     }
+    let mut private_session = if pipe == Pipe::TerminalUi {
+        ui_wire::PipeSession::terminal()
+    } else {
+        ui_wire::PipeSession::default()
+    };
     let mut pending = Some(first);
     let mut input_ended = false;
     loop {
@@ -406,6 +467,25 @@ fn run_headless(data_root: &Path) -> i32 {
             &event,
             LoopEvent::InputClosed | LoopEvent::InputFailed(_) | LoopEvent::FrameTooLarge
         );
+        if pipe != Pipe::Headless
+            && let LoopEvent::Frame(request) = &event
+        {
+            match ui_wire::serve(
+                &mut runtime,
+                &mut private_session,
+                request,
+                &inbox,
+                &runtime_events,
+            ) {
+                Ok(next) => pending = next,
+                Err(source) => {
+                    report_cli_error(&CliError::PrivatePipe(source));
+                    exit.note(1);
+                    break;
+                }
+            }
+            continue;
+        }
         if let Step::Stop = handle_event(event, &mut runtime, data_root, &mut exit) {
             break;
         }

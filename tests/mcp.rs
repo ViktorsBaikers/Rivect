@@ -99,7 +99,7 @@ def reply(payload):
     sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
-container = {"resultType": "complete", "content": [{"type": "text", "text": "done"}]}
+container = {"content": [{"type": "text", "text": "done"}]}
 
 with open(PID, "w", encoding="utf-8") as handle:
     handle.write(str(os.getpid()))
@@ -132,13 +132,16 @@ for line in sys.stdin:
         if MODE == "bad_version":
             served = "2099-01-01"
         reply({"jsonrpc": "2.0", "id": identity,
-               "result": {"protocolVersion": served, "capabilities": {},
-                          "serverInfo": {"name": "rivect-fixture"}}})
+               "result": {"protocolVersion": served,
+                          "capabilities": {} if MODE == "no_tools" else {"tools": {}},
+                          "serverInfo": {"name": "rivect-fixture", "version": "1"}}})
         if MODE == "stall":
             # The handshake answered, and this server never reads its stdin
             # again: a frame the client keeps writing has nowhere to go.
             time.sleep(30)
             os._exit(0)
+        continue
+    if method == "notifications/initialized" and "id" not in request:
         continue
     if method != "tools/call":
         reply({"jsonrpc": "2.0", "id": identity,
@@ -185,6 +188,22 @@ for line in sys.stdin:
     if MODE == "protocol_error":
         reply({"jsonrpc": "2.0", "id": identity,
                "error": {"code": -32601, "message": "no such tool"}})
+        continue
+    if MODE == "malformed_block":
+        reply({"jsonrpc": "2.0", "id": identity,
+               "result": {"content": [{"type": "text"}]}})
+        continue
+    if MODE == "conflicting_verdict":
+        reply({"jsonrpc": "2.0", "id": identity, "result": container,
+               "error": {"code": -32603, "message": "conflicting verdict"}})
+        continue
+    if MODE == "bad_error_flag":
+        reply({"jsonrpc": "2.0", "id": identity,
+               "result": {"content": [], "isError": "false"}})
+        continue
+    if MODE == "tool_error":
+        reply({"jsonrpc": "2.0", "id": identity,
+               "result": {"content": [], "isError": True}})
         continue
     if MODE == "unknown_result":
         reply({"jsonrpc": "2.0", "id": identity,
@@ -330,6 +349,19 @@ impl Fixture {
 /// The operator's document: the two declared servers, the fixture program and
 /// the arguments that select its mode.
 fn config_document(fixture: &Fixture, mode: &str) -> String {
+    let (program, args) = if mode == "sdk" {
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-sdk/server.mjs");
+        (
+            PathBuf::from("/usr/bin/env"),
+            json!(["node", script, fixture.root().join("sdk.events")]),
+        )
+    } else {
+        (
+            fixture.program(),
+            json!(["--mode", mode, "--root", fixture.root()]),
+        )
+    };
     format!(
         "config_version = 1\n\
          [connections.local]\n\
@@ -341,13 +373,14 @@ fn config_document(fixture: &Fixture, mode: &str) -> String {
          fallback = {{ mode = \"auto\" }}\n\
          [mcp.servers.{SERVER_NAME}]\n\
          origin = \"{SERVER_ORIGIN}\"\n\
-         program = \"{program}\"\n\
-         args = [\"--mode\", \"{mode}\", \"--root\", \"{root}\"]\n\
+         program = {program}\n\
+         args = {args}\n\
          [mcp.servers.{OTHER_SERVER}]\n\
          origin = \"{OTHER_ORIGIN}\"\n\
-         program = \"{program}\"\n\
+         program = \"{relay}\"\n\
          args = [\"--mode\", \"success\", \"--root\", \"{root}\"]\n",
-        program = fixture.program().display(),
+        program = json!(program),
+        relay = fixture.program().display(),
         root = fixture.root().display(),
     )
 }
@@ -539,6 +572,78 @@ impl Bench {
             .as_str()
             .unwrap_or_else(|| panic!("the call names its logical operation: {response}"))
             .to_string()
+    }
+}
+
+#[test]
+#[ignore = "requires Node and npm ci --offline in tests/fixtures/mcp-sdk"]
+fn official_sdk_stdio_contract() {
+    let mut denied = Bench::without_consent("sdk-denied", "sdk");
+    let response = denied.call(None);
+    assert_eq!(response["error"]["data"]["code"], "denied", "{response}");
+    assert!(!denied.fixture.root().join("sdk.events").exists());
+
+    let mut bench = Bench::open("sdk-contract", "sdk");
+    let journal = bench.fixture.root().join("sdk.events");
+    let mut events = String::new();
+    for (tool, state, reason) in [
+        ("fixture.echo", "succeeded", None),
+        ("fixture.fail", "failed", Some("tool_error")),
+        ("fixture.unknown", "failed", Some("protocol_error")),
+    ] {
+        let response = bench.call_with(None, tool, json!({ "text": "sdk round trip" }));
+        assert_eq!(response["result"]["state"], state, "{response}");
+        assert_eq!(response["result"]["reason_code"].as_str(), reason);
+        if reason.is_none() {
+            assert_eq!(
+                response["result"]["result"],
+                json!([{ "type": "text", "text": "sdk round trip" }])
+            );
+            assert_eq!(
+                response["result"]["structured_content"],
+                json!({ "echo": "sdk round trip" })
+            );
+        } else {
+            assert!(response["result"]["result"].is_null(), "{response}");
+            assert!(!response.to_string().contains("private"), "{response}");
+            assert!(
+                !bench
+                    .artifact(&response)
+                    .iter()
+                    .any(|line| line.to_string().contains("private"))
+            );
+        }
+        let operation = Bench::operation_of(&response);
+        let replay = bench.call_with(Some(&operation), tool, json!({ "text": "sdk round trip" }));
+        assert_eq!(replay["result"]["state"], state, "{replay}");
+        events.push_str("started\ninitialized\n");
+        events.push_str(tool);
+        events.push('\n');
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), events);
+    }
+}
+
+#[test]
+fn missing_tools_capability_prevents_call() {
+    let mut bench = Bench::open("mcp-no-tools", "no_tools");
+    let response = bench.call(None);
+    assert_eq!(response["result"]["state"], "failed", "{response}");
+    assert_eq!(bench.fixture.calls(), 0);
+}
+
+#[test]
+fn tool_failure_and_malformed_answers_are_not_success() {
+    for (mode, state, reason) in [
+        ("tool_error", "failed", "tool_error"),
+        ("bad_error_flag", "outcome_unknown", "unknown_result_type"),
+        ("malformed_block", "outcome_unknown", "unknown_result_type"),
+        ("conflicting_verdict", "outcome_unknown", "malformed_frame"),
+    ] {
+        let mut bench = Bench::open("mcp-error-flag", mode);
+        let response = bench.call(None);
+        assert_eq!(response["result"]["state"], state, "{response}");
+        assert_eq!(response["result"]["reason_code"], reason, "{response}");
+        assert_eq!(bench.fixture.calls(), 1);
     }
 }
 
@@ -2035,7 +2140,7 @@ fn boundary_map_is_injective_and_rejects_a_collision_mutant_p19() {
     let expected: [(&str, usize); 6] = [
         ("MCP-1", 8),
         ("MCP-2", 9),
-        ("MCP-3", 8),
+        ("MCP-3", 9),
         ("MCP-4", 2),
         ("MCP-5", 7),
         ("MCP-6", 1),
@@ -2327,7 +2432,14 @@ fn files_under(root: &Path, extension: &str) -> Vec<PathBuf> {
         for entry in std::fs::read_dir(&directory).expect("read source directory") {
             let path = entry.expect("read directory entry").path();
             if path.is_dir() {
-                stack.push(path);
+                if extension == "rs"
+                    || !matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("node_modules" | "build" | ".git")
+                    )
+                {
+                    stack.push(path);
+                }
             } else if path.extension().is_some_and(|found| found == extension) {
                 files.push(path);
             }
@@ -2442,29 +2554,7 @@ fn hostile_returned_content_grants_no_effects_ac079() {
     assert_eq!(bench.fixture.effects(), 1, "the one `tools/call` effect");
     // The same bytes through the production display path stay inert: the real
     // renderer is the oracle, not a copy read back from a private buffer.
-    let mut view = rivect::ui::initial_view();
-    view.output.push_chunk(returned.as_bytes());
-    assert!(
-        view.panel.is_none(),
-        "returned content must not open the permission panel"
-    );
-    let screen = {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
-            .expect("test terminal");
-        rivect::ui::render(&mut terminal, &view).expect("render the view");
-        let buffer = terminal.backend().buffer();
-        let width = usize::from(buffer.area.width);
-        buffer
-            .content
-            .chunks(width)
-            .map(|row| {
-                row.iter()
-                    .map(ratatui::buffer::Cell::symbol)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let screen = support::hostile_local_read_screen(&returned, "^[]52;c;aGVsbG8=^G");
     assert!(
         !screen.as_bytes().contains(&0x1b),
         "an escape byte from returned content reached the terminal"
@@ -2493,11 +2583,8 @@ fn hostile_returned_content_grants_no_effects_ac079() {
         Ok(_) => panic!("returned content reached a foreign destination"),
     }
 
-    // No approval came out of returned text: no consent row, no live consent for
-    // the write it names, and no attempt beyond the one the call owned. The
-    // approval surface itself is a decision-surface claim: the panel has no
-    // production constructor at all, asserted by the pinned scan at the end of
-    // this case, so "no approval frame" never rests on a UI observation.
+    // A forged line cannot create consent at either owner: the runtime counters below
+    // and the installed terminal's own store are independent of the painted frame.
     assert_eq!(
         before.preapprovals, after.preapprovals,
         "returned text recorded no consent"
@@ -2582,14 +2669,22 @@ fn hostile_returned_content_grants_no_effects_ac079() {
         "the read counter counts a permitted read, so its zero above means none"
     );
 
-    // Clipboard has no channel to count: the assertion is a source scan over
-    // `src/` and the manifest, the same way `tests/code_conventions.rs` reads
-    // them. The approval surface is pinned the same way: no production call
-    // site constructs the panel, so the claim above is about the decision
-    // surface and never about a UI the product cannot reach.
+    // Keep the source-level clipboard-channel ban as well as the active PTY check.
+    // The public client lives outside src/ in v2.
     let manifest_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let sources = files_under(&manifest_root.join("src"), "rs");
-    assert!(!sources.is_empty(), "the source scan read no file");
+    let mut sources = files_under(&manifest_root.join("src"), "rs");
+    assert!(!sources.is_empty(), "the Rust source scan read no file");
+    let ui = manifest_root.join("tui");
+    let mut frontend = Vec::new();
+    for extension in ["ts", "tsx"] {
+        frontend.extend(files_under(&ui, extension));
+    }
+    assert!(
+        frontend.contains(&ui.join("index.tsx")),
+        "the renderer source was not scanned"
+    );
+    sources.extend(frontend);
+    sources.push(ui.join("package.json"));
     let manifest =
         std::fs::read_to_string(manifest_root.join("Cargo.toml")).expect("read the manifest");
     let scanned = sources
@@ -2603,10 +2698,8 @@ fn hostile_returned_content_grants_no_effects_ac079() {
         .chain(std::iter::once(("Cargo.toml".to_string(), manifest)))
         .collect::<Vec<_>>();
     for (label, source) in &scanned {
-        // The `--ui-review` entry renders the awaiting-permission fixture
-        // through the production renderer without a store or a routed approval
-        // key; `installed_ui_review_keys_stay_passive_and_ctrl_c_restores`
-        // pins that passivity. Every other production file keeps the ban.
+        // The old Rust permission constructor must not return at any live ingress.
+        // An installed decision surface also needs a real owner-issued request.
         let review_fixture = Path::new(label).ends_with("src/ui/review.rs");
         if !label.ends_with("Cargo.toml") && !review_fixture {
             for (line_no, line) in source.lines().enumerate() {
@@ -2618,6 +2711,16 @@ fn hostile_returned_content_grants_no_effects_ac079() {
             }
         }
     }
+    // The passive review must be reachable as a positive control; live forged text
+    // left the composer's input ownership and both consent ledgers unchanged.
+    let mut review = support::EffectTerminal::open(
+        tempfile::tempdir().expect("review home"),
+        24,
+        120,
+        &["--ui-review", "awaiting-permission"],
+    );
+    let permission = review.see("awaiting permission");
+    assert!(permission.contains("grant-installed-tui"), "{permission}");
     for token in CLIPBOARD_TOKENS {
         let hits = scanned
             .iter()
@@ -2625,7 +2728,15 @@ fn hostile_returned_content_grants_no_effects_ac079() {
                 source
                     .lines()
                     .enumerate()
-                    .filter(|(_, line)| line.contains(token))
+                    .filter(|(_, line)| {
+                        let line = line.trim();
+                        let ts_doc = (label.ends_with(".ts") || label.ends_with(".tsx"))
+                            && line.starts_with("/**")
+                            && line
+                                .split_once("*/")
+                                .is_some_and(|(_, rest)| rest.is_empty());
+                        !ts_doc && line.to_ascii_lowercase().contains(token)
+                    })
                     .map(move |(line_no, _)| format!("{label}:{}", line_no + 1))
             })
             .collect::<Vec<_>>();

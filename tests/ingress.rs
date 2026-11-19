@@ -159,8 +159,10 @@ for line in sys.stdin:
     if method == "initialize":
         served = request.get("params", {}).get("protocolVersion")
         reply({"jsonrpc": "2.0", "id": identity,
-               "result": {"protocolVersion": served, "capabilities": {},
-                          "serverInfo": {"name": "rivect-ingress-fixture"}}})
+               "result": {"protocolVersion": served, "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "rivect-ingress-fixture", "version": "1"}}})
+        continue
+    if method == "notifications/initialized" and "id" not in request:
         continue
     if method != "tools/call":
         reply({"jsonrpc": "2.0", "id": identity,
@@ -1063,7 +1065,7 @@ fn egress_ingress_runs_a_declared_mcp_call_with_a_bound_and_cancellation() {
     }
 
     // Positive: the declared-scope call succeeds and answers the peer's own
-    // content; the fixture served exactly one handshake and one call frame.
+    // content after the standard initialization exchange.
     let call = world.dispatch(&support::command_execute(
         &session,
         "mcp.call",
@@ -1082,9 +1084,12 @@ fn egress_ingress_runs_a_declared_mcp_call_with_a_bound_and_cancellation() {
     );
     assert_eq!(fixture.calls(), 1, "the peer served one tools/call");
     assert_eq!(
-        fixture.frames().lines().count(),
-        2,
-        "one handshake and one call frame"
+        fixture
+            .frames()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["method"].clone())
+            .collect::<Vec<_>>(),
+        ["initialize", "notifications/initialized", "tools/call"]
     );
 
     // Output bound: a peer answer past the bounded frame never becomes the
@@ -1369,7 +1374,11 @@ fn the_pty_tui_paints_and_restores_the_terminal() {
     support::not_run::reset("ingress.pty");
     let root = tempfile::TempDir::with_prefix("rivect-ingress-pty-").expect("pty root");
     let data_root = root.path().to_path_buf();
-    let mut command = support::pty_command(support::rivect_binary());
+    let mut command = support::pty_command(support::release::baseline_bundle().join("rivect"));
+    command.env("HOME", root.path());
+    command.env("TMPDIR", root.path());
+    command.env("TERM", "xterm-256color");
+    command.cwd(root.path());
     command.env("RIVECT_DATA_ROOT", &data_root);
     command.arg("--data-root");
     command.arg(&data_root);
@@ -1384,21 +1393,16 @@ fn the_pty_tui_paints_and_restores_the_terminal() {
             return;
         }
     };
+    let rendered =
+        support::visible_text(&session, 24, 80, "Message → Main", Duration::from_secs(10));
     assert!(
-        session
-            .wait_for(b"Rivect", Duration::from_secs(10))
-            .expect("pty read"),
-        "the TUI paints its status line"
+        rendered.contains("RIVECT") && rendered.contains("Session not connected"),
+        "missing status on painted terminal: {rendered}"
     );
     session.send(b"\x1b").expect("send quit");
     let code = session.wait_exit(Duration::from_secs(10)).expect("exit");
     assert_eq!(code, Some(0), "Esc leaves cleanly");
     let collected = session.collected().expect("pty read");
-    let rendered = support::reconstruct_screen(&collected, 24, 80);
-    assert!(
-        rendered.contains("Rivect"),
-        "the painted screen carried the status line:\n{rendered}"
-    );
     assert!(
         support::find_subsequence(&collected, b"\x1b[?1049l").is_some(),
         "the alternate screen is left on exit"

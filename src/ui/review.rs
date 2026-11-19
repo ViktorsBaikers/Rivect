@@ -1,19 +1,8 @@
-//! Seed views for the packaged `--ui-review` entry (TD-14). The nineteen
-//! inherited design-brief states are rendered through the production
-//! renderer; this module owns only their view data, so the release entry and
-//! the installed PTY matrix read one source. It opens no runtime, store or
-//! provider and routes no decision or permission key.
+//! Passive seed data for the packaged review surface. No terminal, store, or provider.
 
-use super::{
-    DecisionPanel, LocalView, PermissionPanel, RenderMode, TerminalGuard, initial_view, render,
-    task_dock,
-};
-use crate::contracts::{EffectClass, Question, TaskId};
-use crate::policy::ModeDecision;
-use crate::resources::{OutputSettlement, OutputStream};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use super::{DOCK_EMPTY, STATUS_DISCONNECTED, TRANSCRIPT_INPUT, TRANSCRIPT_NO_PROJECT, task_dock};
+use crate::contracts::{Availability, Question, TaskId};
 use serde_json::{Value, json};
-use std::time::Duration;
 
 /// The nineteen inherited states in design-brief order.
 pub const STATES: [&str; 19] = [
@@ -38,271 +27,178 @@ pub const STATES: [&str; 19] = [
     "non-tty",
 ];
 
-/// The seeded views of the release review entry.
-pub struct ReviewState;
-
-impl ReviewState {
-    /// The view one inherited state id names; an unknown id answers `None`.
-    #[must_use]
-    pub fn view(state: &str) -> Option<LocalView> {
-        Some(match state {
-            // Both start ids name the same production frame: the runtime
-            // projects no project or index fact, so the design brief's two
-            // states share one seeded view.
-            "start-no-connection" => initial_view(),
-            "no-project-index" => initial_view(),
-            "ready-for-input" => {
-                let mut view = initial_view();
-                view.composer = "draft a change".to_string();
-                view
-            }
-            "streaming-long-output" => {
-                let mut view = initial_view();
-                let mut output = OutputStream::new();
-                output.push_chunk(b"streaming marker line\n");
-                for _ in 0..120 {
-                    output.push_chunk(b"long tool output line\n");
-                }
-                view.replace_output(output);
-                view
-            }
-            "parallel-work" => {
-                let mut view = initial_view();
-                view.dock = task_dock(&status_with_tasks(
-                    &[
-                        ("task-1", "running", None),
-                        ("task-2", "waiting", None),
-                        ("task-3", "blocked", Some("plan gate")),
-                        ("task-4", "completed", None),
-                    ],
-                    Value::Null,
-                ));
-                view
-            }
-            "awaiting-decision" => {
-                let mut view = initial_view();
-                view.decision = Some(DecisionPanel::new(Question::fixture(
-                    &TaskId("task-1".to_string()),
-                    1,
-                )));
-                view
-            }
-            "awaiting-permission" => {
-                // Renderer-only: no production approval/decision path opens
-                // the panel (the Ask verdict carries no class or target); the
-                // sole constructor is the passive `--ui-review` renderer,
-                // here — DEC-017. The frame proves the renderer paints the
-                // state, never a production open.
-                let mut view = initial_view();
-                let scope = format!(
-                    "{}/workflow-scope/deep/nested/directory-tree/permission-grant-boundary-with-a-deliberately-long-tail-suffix",
-                    "/tmp/installed-tui"
-                );
-                view.panel = Some(PermissionPanel::new(
-                    ModeDecision::Ask,
-                    EffectClass::Write,
-                    "grant-installed-tui",
-                    "task-170-fixture",
-                    "2036-01-01T00:00:00Z",
-                    scope,
-                ));
-                view
-            }
-            "fullscreen-inline" => {
-                let mut view = initial_view();
-                view.transcript = vec![
-                    "tui: switched to inline".to_string(),
-                    "tui: switched to fullscreen".to_string(),
+/// Projects a seeded review without opening a runtime, provider, or terminal.
+#[must_use]
+pub fn projection(state: &str) -> Option<Value> {
+    let mut lines = vec![TRANSCRIPT_INPUT, TRANSCRIPT_NO_PROJECT];
+    let mut dock = vec![DOCK_EMPTY.to_owned()];
+    let mut composer = "";
+    let mut panel = Vec::new();
+    let stream;
+    match state {
+        "start-no-connection" | "no-project-index" => {}
+        "ready-for-input" => composer = "draft a change",
+        "streaming-long-output" => {
+            stream = format!(
+                "streaming marker line\n{}",
+                "long tool output line\n".repeat(120)
+            );
+            lines.extend(["PgUp/PgDn scroll · output · streaming", &stream]);
+        }
+        "parallel-work" => {
+            dock = rows(
+                &[
+                    ("task-1", "running", None),
+                    ("task-2", "waiting", None),
+                    ("task-3", "blocked", Some("plan gate")),
+                    ("task-4", "completed", None),
+                ],
+                Value::Null,
+            )
+        }
+        "awaiting-decision" => {
+            composer = "[input paused: answer the decision card]";
+            panel = decision_rows();
+        }
+        "awaiting-permission" => {
+            composer = "[input paused: answer the permission panel]";
+            panel = [
+                "awaiting permission\ndecision: ask\neffect: write\ninitiator: task-170-fixture\nexpiry: 2036-01-01T00:00:00Z\ngrant: grant-installed-tui",
+                "scope: /tmp/installed-tui/workflow-scope/deep/nested/directory-tree/permission-grant-boundary-with-a-deliberately-long-tail-suffix",
+                "allow once | allow with limited grant (10 min) | [deny]\narrows move, PgUp/PgDn scroll, Enter confirms, Esc denies",
+            ].map(str::to_owned).into();
+        }
+        "fullscreen-inline" => {
+            lines = vec!["tui: switched to inline", "tui: switched to fullscreen"];
+            composer = "draft survives";
+        }
+        "pause-cancel" => {
+            dock = rows(
+                &[
+                    ("task-1", "cancelled", Some("operator stop")),
+                    ("task-2", "blocked", Some("unknown external effect")),
+                ],
+                Value::Null,
+            )
+        }
+        "quota-fallback" => {
+            dock = rows(
+                &[(
+                    "task-1",
+                    "paused",
+                    Some("quota exhausted; fallback unknown"),
+                )],
+                json!({
+                    "project":"/tmp/installed-tui", "cwd":"/tmp/installed-tui", "settled_tokens":10,
+                    "settled_source":"exact", "charged_units":1, "cost_source":"estimated", "agents":0,
+                    "agents_source":"stale", "reset_at":"2026-11-10T00:00:00Z", "reset_source":"exact",
+                    "quota_remaining":null, "quota_source":"unknown: no quota endpoint reports remaining units",
+                    "context_tokens":5, "context_source":"exact", "cache_source":"stale", "model":"fixture-model",
+                    "source":"recorded", "effort":"high", "effort_source":"recorded", "purpose":"main", "connection":"primary"
+                }),
+            )
+        }
+        "error-offline-partial" => lines.extend([
+            "PgUp/PgDn scroll · output · partial: connection lost",
+            "partial body\n",
+            "dock refresh failed: offline",
+        ]),
+        "success" | "resume-compaction-upgrade" => {
+            dock = rows(&[("task-1", "completed", None)], Value::Null);
+            if state == "resume-compaction-upgrade" {
+                lines = vec![
+                    "Resumed session: session-1",
+                    "Context compacted: 4096 → 1024 bytes, 3 records folded",
+                    "upgrade: active generation 1; pending generation 2",
                 ];
-                view.composer = "draft survives".to_string();
-                view
-            }
-            "pause-cancel" => {
-                let mut view = initial_view();
-                view.dock = task_dock(&status_with_tasks(
-                    &[
-                        ("task-1", "cancelled", Some("operator stop")),
-                        ("task-2", "blocked", Some("unknown external effect")),
-                    ],
-                    Value::Null,
-                ));
-                view
-            }
-            "quota-fallback" => {
-                let mut view = initial_view();
-                view.dock = task_dock(&status_with_tasks(
-                    &[(
-                        "task-1",
-                        "paused",
-                        Some("quota exhausted; fallback unknown"),
-                    )],
-                    json!({
-                        "project": "/tmp/installed-tui",
-                        "cwd": "/tmp/installed-tui",
-                        "settled_tokens": 10,
-                        "settled_source": "exact",
-                        "charged_units": 1,
-                        "cost_source": "estimated",
-                        "agents": 0,
-                        "agents_source": "stale",
-                        "reset_at": "2026-11-10T00:00:00Z",
-                        "reset_source": "exact",
-                        "quota_remaining": null,
-                        "quota_source": "unknown: no quota endpoint reports remaining units",
-                        "context_tokens": 5,
-                        "context_source": "exact",
-                        "cache_source": "stale",
-                        "model": "fixture-model",
-                        "source": "recorded",
-                        "effort": "high",
-                        "effort_source": "recorded",
-                        "purpose": "main",
-                        "connection": "primary",
-                    }),
-                ));
-                view
-            }
-            "error-offline-partial" => {
-                let mut view = initial_view();
-                let mut output = OutputStream::new();
-                output.push_chunk(b"partial body\n");
-                output.settle(OutputSettlement::Partial {
-                    cause: "connection lost".to_string(),
-                });
-                view.replace_output(output);
-                view.dock_stale = Some("dock refresh failed: offline".to_string());
-                view
-            }
-            "success" => {
-                // Completion shows as the dock lifecycle row only: the
-                // production renderer has no completion transcript line.
-                let mut view = initial_view();
-                view.dock = task_dock(&status_with_tasks(
-                    &[("task-1", "completed", None)],
-                    Value::Null,
-                ));
-                view
-            }
-            "settings-default-modified-locked-pending" => {
-                let mut view = initial_view();
-                view.transcript = vec![
-                    "Settings:".to_string(),
-                    "model = auto (default)".to_string(),
-                    "effort = high (modified)".to_string(),
-                    "workflow.enabled = false (locked)".to_string(),
-                    "profile = next (pending)".to_string(),
-                ];
-                view
-            }
-            "settings-invalid-conflict" => {
-                let mut view = initial_view();
-                view.transcript = vec![
-                    "config.set refused: conflict at models.defaults.model; the other writer's draft is kept"
-                        .to_string(),
-                    "config.validate: invalid_input at context.auto_compact".to_string(),
-                ];
-                view
-            }
-            "resume-compaction-upgrade" => {
-                let mut view = initial_view();
-                view.transcript = vec![
-                    "Resumed session: session-1".to_string(),
-                    "Context compacted: 4096 → 1024 bytes, 3 records folded".to_string(),
-                    "upgrade: active generation 1; pending generation 2".to_string(),
-                ];
-                view.dock = task_dock(&status_with_tasks(
-                    &[("task-1", "completed", None)],
-                    Value::Null,
-                ));
-                view
-            }
-            "rewind-preview-conflict-partial" => {
-                let mut view = initial_view();
-                view.transcript = vec![
-                    "Rewind preview: task task-1, 4096 assembled bytes".to_string(),
-                    "no rollback applied; apply is a separate action".to_string(),
-                    "Checkpoint: cp-1 folded 3 records".to_string(),
-                    "checkpoint.apply refused: conflict: stale intent".to_string(),
-                ];
-                view
-            }
-            "big-list-narrow-window" => {
-                let mut view = initial_view();
-                view.dock = task_dock(&status_with_tasks(
-                    &[
-                        ("task-1", "running", None),
-                        ("task-2", "waiting", None),
-                        ("task-3", "blocked", Some("plan gate")),
-                        ("task-4", "running", None),
-                        ("task-5", "waiting", None),
-                        ("task-6", "blocked", Some("plan gate")),
-                        ("task-7", "running", None),
-                        ("task-8", "completed", None),
-                    ],
-                    Value::Null,
-                ));
-                view
-            }
-            "workflow-off" => {
-                let mut view = initial_view();
-                view.transcript = vec!["workflow: off; custom task state".to_string()];
-                view.dock = task_dock(&status_with_tasks(
-                    &[("task-1", "custom", Some("workflow off"))],
-                    Value::Null,
-                ));
-                view
-            }
-            "non-tty" => {
-                let mut view = initial_view();
-                view.transcript =
-                    vec!["non-tty: structured events on stdout; diagnostics on stderr".to_string()];
-                view
-            }
-            _ => return None,
-        })
-    }
-
-    /// Renders one state until Esc (0) or Ctrl-C (130). Unknown states are
-    /// refused before a terminal is entered; the entry opens nothing else.
-    ///
-    /// # Errors
-    /// The terminal guard, render or input failure.
-    pub fn run(state: &str) -> std::io::Result<i32> {
-        let Some(view) = Self::view(state) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unknown ui review state {state}"),
-            ));
-        };
-        // Resolve before the alternate screen so the unknown-theme note is
-        // visible in the terminal's own scrollback, not painted over.
-        let _palette = super::theme::Palette::resolve();
-        let mut guard = TerminalGuard::enter_mode(RenderMode::Fullscreen)?;
-        render(guard.terminal_mut(), &view)?;
-        loop {
-            if !crossterm::event::poll(Duration::from_millis(250))? {
-                continue;
-            }
-            match crossterm::event::read()? {
-                Event::Key(KeyEvent {
-                    code: KeyCode::Esc,
-                    kind: KeyEventKind::Press,
-                    ..
-                }) => return Ok(0),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers,
-                    kind: KeyEventKind::Press,
-                    ..
-                }) if modifiers.contains(KeyModifiers::CONTROL) => return Ok(130),
-                Event::Resize(_, _) => render(guard.terminal_mut(), &view)?,
-                _ => {}
             }
         }
+        "settings-default-modified-locked-pending" => {
+            lines = vec![
+                "Settings:",
+                "model = auto (default)",
+                "effort = high (modified)",
+                "workflow.enabled = false (locked)",
+                "profile = next (pending)",
+            ]
+        }
+        "settings-invalid-conflict" => {
+            lines = vec![
+                "config.set refused: conflict at models.defaults.model; the other writer's draft is kept",
+                "config.validate: invalid_input at context.auto_compact",
+            ]
+        }
+        "rewind-preview-conflict-partial" => {
+            lines = vec![
+                "Rewind preview: task task-1, 4096 assembled bytes",
+                "no rollback applied; apply is a separate action",
+                "Checkpoint: cp-1 folded 3 records",
+                "checkpoint.apply refused: conflict: stale intent",
+            ]
+        }
+        "big-list-narrow-window" => {
+            dock = rows(
+                &[
+                    ("task-1", "running", None),
+                    ("task-2", "waiting", None),
+                    ("task-3", "blocked", Some("plan gate")),
+                    ("task-4", "running", None),
+                    ("task-5", "waiting", None),
+                    ("task-6", "blocked", Some("plan gate")),
+                    ("task-7", "running", None),
+                    ("task-8", "completed", None),
+                ],
+                Value::Null,
+            )
+        }
+        "workflow-off" => {
+            lines = vec!["workflow: off; custom task state"];
+            dock = rows(&[("task-1", "custom", Some("workflow off"))], Value::Null);
+        }
+        "non-tty" => lines = vec!["non-tty: structured events on stdout; diagnostics on stderr"],
+        _ => return None,
     }
+    Some(
+        json!({"state":state,"status":STATUS_DISCONNECTED,"dock":dock,"lines":lines,"composer":composer,"panel":panel}),
+    )
 }
 
-fn status_with_tasks(tasks: &[(&str, &str, Option<&str>)], economy: Value) -> Value {
+fn decision_rows() -> Vec<String> {
+    let q = Question::fixture(&TaskId("task-1".to_owned()), 1);
+    let mut rows = vec![
+        "awaiting decision\ntask: task-1\nquestion: 00000000-0000-4000-8000-000000000001 rev 1"
+            .to_owned(),
+        format!(
+            "question: {}\nrecommended: {} — {}\n",
+            q.prompt, q.recommended_option_id.0, q.recommendation_basis
+        ),
+    ];
+    for (i, option) in q.options.iter().enumerate() {
+        let prefix = if i == 0 { "> " } else { "  " };
+        let mut row = format!(
+            "{prefix}{}. {} — {}",
+            i + 1,
+            option.label,
+            option.consequences
+        );
+        if option.option_id == q.recommended_option_id {
+            row.push_str(" (recommended)");
+        }
+        if let Availability::Disabled { reason } = &option.availability {
+            row.push_str(" — unavailable: ");
+            row.push_str(reason);
+        }
+        rows.push(row);
+    }
+    let count = q.options.len() + 1;
+    rows.push(format!("  {count}. custom answer — type your own answer"));
+    rows.push(format!(
+        "focus 1/{count}\narrows move, PgUp/PgDn scroll, Enter selects, Esc returns"
+    ));
+    rows
+}
+
+fn rows(tasks: &[(&str, &str, Option<&str>)], economy: Value) -> Vec<String> {
     let items: Vec<Value> = tasks
         .iter()
         .map(|(task, lifecycle, reason)| {
@@ -313,50 +209,9 @@ fn status_with_tasks(tasks: &[(&str, &str, Option<&str>)], economy: Value) -> Va
             })
         })
         .collect();
-    json!({ "todo": { "items": items }, "economy": economy })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::theme::{Capability, Palette};
-    use std::ffi::OsString;
-
-    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
+    let mut dock = task_dock(&json!({"todo":{"items":items},"economy":economy}));
+    if tasks.len() > 3 {
+        dock.insert(2, format!("+{} more", tasks.len() - 2));
     }
-
-    /// The run's prologue resolves the palette before the alternate screen, so
-    /// an unknown-value note lands where restore leaves it visible.
-    #[test]
-    fn unknown_theme_note_precedes_the_alternate_screen() {
-        let mut out = Vec::new();
-        let palette = Palette::resolve_reporting(
-            &|name| (name == "RIVECT_THEME").then(|| OsString::from("sepia")),
-            true,
-            &mut out,
-        );
-        assert_eq!(palette.capability(), Capability::Mono);
-        out.extend_from_slice(b"\x1b[?1049h");
-        let note_at =
-            find(&out, b"rivect: unknown RIVECT_THEME").expect("the unknown value writes one note");
-        let alt_at = find(&out, b"\x1b[?1049h").expect("the alternate screen marker");
-        assert!(
-            note_at < alt_at,
-            "the note is on stderr before the alternate-screen escape"
-        );
-    }
-
-    #[test]
-    fn a_known_theme_writes_no_note_before_the_alternate_screen() {
-        let mut out = Vec::new();
-        let palette = Palette::resolve_reporting(
-            &|name| (name == "RIVECT_THEME").then(|| OsString::from("dark")),
-            true,
-            &mut out,
-        );
-        assert_eq!(palette.capability(), Capability::Indexed);
-        assert!(out.is_empty(), "a known theme writes no note: {out:?}");
-    }
+    dock
 }

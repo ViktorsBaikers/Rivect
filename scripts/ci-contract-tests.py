@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline checks for evidence reuse and release failure boundaries."""
+from contextlib import ExitStack, suppress
 import hashlib
 import io
 import json
@@ -19,6 +20,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class ReleaseTag(unittest.TestCase):
+    def test_tag_must_match_current_package_version(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("- name: verify release tag matches package version", 1)[1]
+        script = textwrap.dedent(step.split("run: |\n", 1)[1].split("      - ", 1)[0])
+        cargo = r'''cargo() {
+    test "$*" = 'metadata --locked --no-deps --format-version 1' || return 2
+    printf '%s\n' '{"packages":[{"name":"rivect","version":"0.2.0"}]}'
+}
+'''
+        for ref, tag, expected in [("refs/heads/main", "main", 0),
+                                   ("refs/tags/v0.2.0", "v0.2.0", 0),
+                                   ("refs/tags/v0.1.0", "v0.1.0", 1)]:
+            with self.subTest(ref=ref):
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", cargo + script],
+                    env={"PATH": os.environ["PATH"], "GITHUB_REF": ref, "GITHUB_REF_NAME": tag},
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
 
 
 class EvidenceReuse(unittest.TestCase):
@@ -89,6 +110,37 @@ class EvidenceReuse(unittest.TestCase):
         self.status.unlink()
         self.assertNotEqual(self.produce().returncode, 0)
 
+    def test_a36_requires_current_package_measurement_not_a_frozen_budget_pass(self):
+        rows = json.loads(self.manifest.read_text())["rows"][:3]
+        selector = "v2_installed_package_measurement"
+        marker = "PACKAGE_SIZE_MEASUREMENT"
+        rows.append({"case_id": "A36", "provider": "offline", "marker": marker,
+                     "expected": "unserved", "observation": "missing v2 budget",
+                     "oracle": ["measurement::" + selector]})
+        self.manifest.write_text(json.dumps({"schema_version": 1, "family": "acceptance", "rows": rows}))
+        current = self.record["candidate_manifest_sha256"]
+        prerequisite = "v2 has no approved AC-003 budget"
+        for digest_value, status, reason, accepted in [
+            (current, "NOT_RUN", prerequisite, True),
+            ("f" * 64, "NOT_RUN", prerequisite, False),
+            (current, "PASS", prerequisite, False),
+            (current, "NOT_RUN", "", False),
+        ]:
+            with self.subTest(digest_value=digest_value, status=status, reason=reason):
+                sample = {"schema_version": 1, "v2": {"manifest_sha256": digest_value},
+                          "ac003": {"status": status, "prerequisite": reason}}
+                log = self.logs / "measurement.log"
+                log.write_text(f"test {selector} ... ok\n{marker} {json.dumps(sample)}\n"
+                               "test result: ok. 1 passed; 0 failed; 0 ignored\n")
+                (self.logs / "measurement.json").write_text(json.dumps({**self.record,
+                    "output_sha256": digest(log), "command": "cargo test --locked --test measurement -- --show-output"}))
+                result = self.produce()
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if accepted:
+                    self.assertEqual(json.loads(self.receipt.read_text())["counts"], {"rows": 4, "pass": 3, "unserved": 1})
+                else:
+                    self.assertFalse(self.receipt.exists())
+
     def test_ignored_or_missing_oracle_never_serves_rows(self):
         for text in ["test probe ... ignored\n", "test another ... ok\n"]:
             self.log.write_text(text)
@@ -106,18 +158,25 @@ class CrossHostBinding(unittest.TestCase):
         self.bundle = self.root / "bundle"
         self.bundle.mkdir()
         self.receipts = {}
+        self.make_candidates(2)
+
+    def make_candidates(self, version):
         for platform, legs in [
-            ("linux", ["auth.secret_service", "measurement.offline_corpus"]),
+            ("linux", ["auth.secret_service"]),
             ("macos", ["auth.keychain"]),
         ]:
             files = {"rivect": f"{platform} executable".encode(),
                      "rivect-sandbox-helper": f"{platform} helper".encode()}
-            manifest = {"schema_version": 1, "build": "rivect 0.1.0 (same-source)"}
-            for key, name in [("executable", "rivect"), ("helper", "rivect-sandbox-helper")]:
+            manifest = {"schema_version": version, "build": "rivect 0.1.0 (same-source)"}
+            components = [("executable", "rivect"), ("helper", "rivect-sandbox-helper")]
+            library = "libexec/libopentui." + ("so" if platform == "linux" else "dylib")
+            components.extend([("ui", "libexec/rivect-tui"), ("library", library)])
+            files.update({name: name.encode() for _, name in components[2:]})
+            for key, name in components:
                 manifest[key] = {"name": name, "sha256": hashlib.sha256(files[name]).hexdigest()}
             files["rivect.manifest.json"] = json.dumps(manifest).encode()
             host = self.root / f"xhost/xhost-{platform}"
-            host.mkdir(parents=True)
+            host.mkdir(parents=True, exist_ok=True)
             with tarfile.open(host / "candidate.tar.gz", "w:gz") as archive:
                 for name, content in files.items():
                     info = tarfile.TarInfo(name)
@@ -126,11 +185,17 @@ class CrossHostBinding(unittest.TestCase):
             receipt = {"schema_version": 2, "commit": "same-commit", "run_id": "42",
                        "platform": platform, "served_legs": legs,
                        "candidate_manifest_sha256": hashlib.sha256(files["rivect.manifest.json"]).hexdigest()}
+            (host / 'candidate.manifest.sha256').write_text(receipt['candidate_manifest_sha256'] + '\n')
+            bom = host / 'candidate.cdx.json'
+            bom.write_text(json.dumps({'bomFormat':'CycloneDX','components':[{'type':'file','name':name,
+                'hashes':[{'alg':'SHA-256','content':hashlib.sha256(content).hexdigest()}]} for name, content in files.items()]}))
+            receipt['sbom_sha256'] = digest(bom)
             path = host / "xhost-receipt.json"
             path.write_text(json.dumps(receipt))
             self.receipts[platform] = (path, receipt)
             if platform == "linux":
                 for name, content in files.items():
+                    (self.bundle / name).parent.mkdir(parents=True, exist_ok=True)
                     (self.bundle / name).write_bytes(content)
 
     def bind(self):
@@ -144,8 +209,20 @@ class CrossHostBinding(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = json.loads((self.root / "target/rivect-not-run-xhost/served.json").read_text())
         self.assertEqual(receipt["served_legs"],
-                         ["auth.keychain", "auth.secret_service", "measurement.offline_corpus"])
+                         ["auth.keychain", "auth.secret_service"])
         self.assertEqual(receipt["candidate_sha256"], digest(self.bundle / "rivect.manifest.json"))
+
+    def test_unsupported_package_schema_never_binds(self):
+        self.make_candidates(1)
+        self.assertNotEqual(self.bind().returncode, 0)
+
+    def test_changed_receipt_or_sbom_cannot_bind(self):
+        for name in ['candidate.manifest.sha256', 'candidate.cdx.json']:
+            target = self.root / 'xhost/xhost-macos' / name
+            previous = target.read_bytes()
+            target.write_bytes(previous + b'x')
+            self.assertNotEqual(self.bind().returncode, 0)
+            target.write_bytes(previous)
 
     def test_same_commit_cannot_rescue_wrong_run_platform_candidate_or_legs(self):
         path, original = self.receipts["linux"]
@@ -176,7 +253,7 @@ class ReleaseGate(unittest.TestCase):
         shutil.copyfile(ROOT / "scripts/release-gate.sh", self.root / "scripts/release-gate.sh")
         self.bundle = self.root / "bundle"
         self.bundle.mkdir()
-        (self.bundle / "rivect.manifest.json").write_text("{}")
+        (self.bundle / "rivect.manifest.json").write_text('{"schema_version":2}')
         self.cargo = self.root / "cargo"
         self.cargo.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, sys
@@ -212,6 +289,10 @@ sys.exit(int(os.environ['TEST_EXIT']))
             "final_acceptance_passes_the_installed_rows_and_prints_the_verdict",
             "--", "--exact", "--show-output",
         ]])
+
+    def test_v1_never_becomes_a_native_release_gate(self):
+        (self.bundle / "rivect.manifest.json").write_text('{"schema_version":1}')
+        self.assertNotEqual(self.gate(True).returncode, 0)
 
     def test_not_ready_is_distinct_from_crash_and_ready_cannot_hide_failure(self):
         for ready, retained, code, omit, expected in [
@@ -258,6 +339,8 @@ class TargetOwnership(unittest.TestCase):
         self.cargo.write_text("""#!/usr/bin/env python3
 import json, os, socket, sys
 from pathlib import Path
+parallel_targets = ['provider_openai', 'provider_local']
+phase_port = os.environ.get('CI_CONTRACT_PHASE_GATE_PORT')
 if sys.argv[1] == 'metadata':
     with open('metadata-entries.jsonl','a') as stream:
         stream.write(json.dumps(sys.argv[1:])+'\\n')
@@ -271,23 +354,41 @@ if sys.argv[1] == 'metadata':
         {'id':'root','name':'rivect','targets':[
             {'name':'rivect','kind':['lib'],'test':True},
             *[{'name':name,'kind':['test'],'test':True}
-              for name in ['search_text','new_target','final_acceptance']]]},
+              for name in ['search_text','new_target','final_acceptance']
+              + (parallel_targets if phase_port else [])]]},
         {'id':'helper','name':'rivect-sandbox-helper','targets':[
             {'name':'rivect_sandbox_helper','kind':['lib'],'test':True},
             {'name':'rivect-sandbox-helper','kind':['bin'],'test':True},
             {'name':'launch','kind':['test'],'test':True}]},
     ]}))
     sys.exit(0)
+target = sys.argv[sys.argv.index('--test')+1] if '--test' in sys.argv else None
+if phase_port:
+    import fcntl
+    parallel = target in parallel_targets
+    # Hold the phase lock until process exit, including while a worker waits at the gate.
+    active = open('cargo-active.lock', 'a')
+    mode = fcntl.LOCK_SH if parallel else fcntl.LOCK_EX
+    fcntl.flock(active, mode | fcntl.LOCK_NB)
+    if sys.argv[1] == 'record-evidence':
+        commands = Path('commands.jsonl').read_text().splitlines()
+        with open('evidence-entries.jsonl', 'a') as stream:
+            stream.write(json.dumps(commands)+'\\n')
+        sys.exit(0)
 with open('commands.jsonl','a') as stream:
     stream.write(json.dumps(sys.argv[1:])+'\\n')
+if phase_port and target in parallel_targets:
+    with socket.create_connection(('127.0.0.1', int(phase_port)), timeout=30) as gate:
+        gate.sendall((target+'\\n').encode())
+        if gate.recv(1) != b'G':
+            raise RuntimeError('parallel target gate closed without release')
 if sys.argv[1] == 'build':
     Path('native-helper').touch()
     sys.exit(0)
 if '--lib' in sys.argv and 'rivect-sandbox-helper' in sys.argv and not Path('native-helper').exists():
     print('native helper executable is missing before unit tests')
     sys.exit(101)
-if '--test' in sys.argv:
-    target = sys.argv[sys.argv.index('--test')+1]
+if target is not None:
     if target == os.environ.get('FAIL_TARGET'):
         print('test probe ... FAILED')
         sys.exit(101)
@@ -461,6 +562,100 @@ print('test result: ok. 1 passed; 0 failed; 0 ignored')
         self.assertEqual(status["exit"], 101)
         self.assertFalse((self.root / "target/provider-trials.json").exists())
 
+    def _run_bounded_targets(self, fail=""):
+        script = self.root / "scripts/offline-evidence.sh"
+        script.rename(script.with_name("offline-evidence-real.sh"))
+        script.write_text(
+            '#!/bin/sh\nset -eu\ncargo record-evidence\n'
+            'exec sh scripts/offline-evidence-real.sh "$@"\n')
+        targets = ["provider_openai", "provider_local"]
+        command = ["python3", str(self.root / "scripts/ci-test.py"), "--jobs", "2"]
+        output_path = self.root / "runner.log"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener, \
+                output_path.open("w+") as output, ExitStack() as stack:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(2)
+            listener.settimeout(10)
+            env = {key: self.env[key] for key in ("PATH", "HOME", "LANG", "TMPDIR", "CARGO",
+                                                  "RIVECT_TEST_BUNDLE") if key in self.env}
+            env.update(FAIL_TARGET=fail, GITHUB_REF="refs/heads/ci-contract-tests",
+                       CI_CONTRACT_PHASE_GATE_PORT=str(listener.getsockname()[1]))
+            with subprocess.Popen(command, cwd=self.root, env=env, stdout=output,
+                                  stderr=subprocess.STDOUT, start_new_session=True) as runner:
+                try:
+                    gates = []
+                    for _ in targets:
+                        gate, _ = listener.accept()
+                        stack.enter_context(gate)
+                        gate.settimeout(10)
+                        with gate.makefile("rb") as ready:
+                            gates.append((ready.readline(64).decode().strip(), gate))
+                    self.assertCountEqual([name for name, _ in gates], targets)
+                    self.assertEqual(self._bounded_receipts(), [])
+                    # Unblock the peer before the failing target can trigger cancellation.
+                    for _, gate in sorted(gates, key=lambda entry: entry[0] == fail):
+                        gate.sendall(b"G")
+                    result = runner.wait(timeout=60)
+                except (TimeoutError, subprocess.TimeoutExpired) as error:
+                    output.seek(0)
+                    self.fail(f"bounded runner did not finish its handshake or run: {error}\n{output.read()}")
+                finally:
+                    if runner.returncode is None:
+                        with suppress(ProcessLookupError):
+                            os.killpg(runner.pid, signal.SIGKILL)
+                        runner.wait(timeout=10)
+            output.seek(0)
+            return result, output.read()
+
+    def _bounded_receipts(self):
+        target = self.root / "target"
+        return [path.name for pattern in ("*trials.json", "acceptance-rows-*.json")
+                for path in target.glob(pattern)]
+
+    def test_bounded_targets_overlap_in_isolation_before_receipts(self):
+        result, output = self._run_bounded_targets()
+        self.assertEqual(result, 0, output)
+        commands = (self.root / "commands.jsonl").read_text().splitlines()
+        checks = [args[args.index("--test") + 1] if "--test" in args
+                  else (args[0], args[args.index("-p") + 1])
+                  for args in map(json.loads, commands)]
+        self.assertCountEqual(checks, [
+            "final_acceptance", "launch", "new_target", "provider_local", "provider_openai",
+            "search_text", ("build", "rivect-sandbox-helper"), ("test", "rivect-sandbox-helper"),
+            ("test", "rivect"),
+        ])
+        receipts = self._bounded_receipts()
+        self.assertCountEqual(receipts, [
+            "provider-trials.json", "search-trials.json",
+            "acceptance-rows-a01-a12.json", "acceptance-rows-a13-a24.json",
+            "acceptance-rows-a25-a36.json", "acceptance-rows-sections.json",
+        ])
+        evidence_entries = (self.root / "evidence-entries.jsonl").read_text().splitlines()
+        self.assertEqual(list(map(json.loads, evidence_entries)), [commands] * len(receipts))
+
+    def _assert_bounded_failure(self, failed):
+        result, output = self._run_bounded_targets(fail=failed)
+        self.assertNotEqual(result, 0, output)
+        logs = self.root / "target/ci-logs"
+        log = logs / f"{failed}.log"
+        status = json.loads((logs / f"{failed}.json").read_text())
+        self.assertEqual(status["exit"], 101)
+        self.assertIn("test probe ... FAILED", log.read_text())
+        self.assertEqual(status["output_sha256"], digest(log))
+        self.assertEqual(self._bounded_receipts(), [])
+        commands = (self.root / "commands.jsonl").read_text().splitlines()
+        targets = [args[args.index("--test") + 1] for args in map(json.loads, commands)
+                   if "--test" in args]
+        for name in ("provider_openai", "provider_local"):
+            self.assertEqual(targets.count(name), 1, targets)
+        self.assertFalse((self.root / "evidence-entries.jsonl").exists())
+
+    def test_failed_bounded_openai_target_keeps_diagnostics_without_receipts(self):
+        self._assert_bounded_failure("provider_openai")
+
+    def test_failed_bounded_local_target_keeps_diagnostics_without_receipts(self):
+        self._assert_bounded_failure("provider_local")
+
 
 class ReleasePublisher(unittest.TestCase):
     def test_publication_boundaries(self):
@@ -472,7 +667,7 @@ class ReleasePublisher(unittest.TestCase):
         targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
         scenarios = ["ready", "not-ready", "missing", "tampered", "foreign",
                      "moved-tag", "upload-fails", "malformed", "moved-during-upload",
-                     "tampered-installer", "missing-installer", "mismatched-installer"]
+                     "tampered-installer", "missing-installer", "mismatched-installer", "tampered-sbom", "tampered-receipt"]
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -480,7 +675,7 @@ class ReleasePublisher(unittest.TestCase):
                 dist.mkdir()
                 installer_bytes = (ROOT / "install.sh").read_bytes()
                 for target in targets:
-                    manifest = json.dumps({"schema_version": 1, "build": target}).encode()
+                    manifest = json.dumps({"schema_version": 2, "build": target}).encode()
                     archive = dist / f"rivect-v0.1.1-{target}.tar.gz"
                     with tarfile.open(archive, "w:gz") as output:
                         info = tarfile.TarInfo("rivect.manifest.json")
@@ -488,6 +683,12 @@ class ReleasePublisher(unittest.TestCase):
                         output.addfile(info, io.BytesIO(manifest))
                     (dist / f"{target}.sha256").write_text(
                         f"{digest(archive)}  ./{archive.name}\n")
+                    base = f'rivect-v0.1.1-{target}'
+                    candidate = hashlib.sha256(manifest).hexdigest()
+                    (dist / f'{base}.manifest.sha256').write_text(candidate + '\n')
+                    bom = dist / f'{base}.cdx.json'
+                    bom.write_text(json.dumps({'components':[{'type':'file', 'name':'rivect.manifest.json',
+                        'hashes':[{'alg':'SHA-256', 'content':candidate}]}]}))
                     installer = dist / f"install-{target}.sh"
                     installer.write_bytes(installer_bytes)
                     if scenario == "mismatched-installer" and target == targets[0]:
@@ -497,6 +698,7 @@ class ReleasePublisher(unittest.TestCase):
                         "schema_version": 1, "target": target, "commit": sha, "run_id": "7",
                         "candidate_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
                         "installer_sha256": digest(installer),
+                        "sbom_sha256": digest(bom),
                         "gate_exit": 0 if ready else 5, "release_ready": ready,
                         "blockers": {"retained_legs": 0 if ready else 1},
                     }
@@ -504,7 +706,11 @@ class ReleasePublisher(unittest.TestCase):
                         verdict["commit"] = "d" * 40
                     if scenario == "malformed":
                         verdict["release_ready"] = "true"
-                    (dist / f"{target}.json").write_text(json.dumps(verdict))
+                    (dist / f"report-{target}.json").write_text(json.dumps(verdict))
+                    if target == targets[0] and scenario == 'tampered-sbom':
+                        bom.write_bytes(bom.read_bytes() + b' ')
+                    if target == targets[0] and scenario == 'tampered-receipt':
+                        (dist / f'{base}.manifest.sha256').write_text('0'*64 + '\n')
                 first = dist / f"rivect-v0.1.1-{targets[0]}.tar.gz"
                 if scenario == "missing":
                     first.unlink()
@@ -522,6 +728,8 @@ class ReleasePublisher(unittest.TestCase):
                     with open(os.environ['CALLS'], 'a') as stream:
                         stream.write(json.dumps(sys.argv[1:])+'\\n')
                     if sys.argv[1] == 'api':
+                        if not sys.argv[2].endswith('/commits/' + os.environ['GITHUB_REF_NAME']):
+                            sys.exit(2)
                         prior = pathlib.Path(os.environ['CALLS']).read_text()
                         moved = os.environ['SCENARIO'] == 'moved-during-upload' and 'create' in prior
                         print('d' * 40 if moved else os.environ['TAG_SHA'])
@@ -544,6 +752,9 @@ class ReleasePublisher(unittest.TestCase):
                 mutations = [call for call in calls if call[0] == "release"]
                 creates = [call for call in mutations if call[:2] == ["release", "create"]]
                 for create in creates:
+                    for target in targets:
+                        for suffix in ['cdx.json', 'manifest.sha256', 'tar.gz']:
+                            self.assertIn(f'./rivect-v0.1.1-{target}.{suffix}', create)
                     self.assertEqual(create.count("install.sh"), 1, create)
                     self.assertEqual(create.count("./install.sh.sha256"), 1, create)
                     self.assertFalse(any(arg.startswith("install-") for arg in create), create)

@@ -1111,6 +1111,71 @@ mod pty;
 pub mod ws_peer;
 
 pub use pty::*;
+/// Wait for actual UTF-8 glyphs on the current terminal grid, never stale stream bytes.
+pub fn visible_text(
+    pty: &PtySession,
+    rows: u16,
+    cols: u16,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut screen = vt100::Parser::new(rows, cols, 0);
+    let mut consumed = 0;
+    loop {
+        let bytes = pty.collected().expect("PTY output");
+        screen.process(&bytes[consumed..]);
+        consumed = bytes.len();
+        let text = screen.screen().contents();
+        if text.contains(needle) || squashed(&text).contains(&squashed(needle)) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "missing {needle:?}: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Accept only the fresh challenge painted after this deliberate selection.
+pub fn confirm_witness(pty: &mut PtySession) {
+    confirm_witness_with(pty, || {});
+}
+
+pub fn confirm_witness_with(pty: &mut PtySession, before_confirm: impl FnOnce()) {
+    let mark = pty.collected().expect("witness mark").len();
+    pty.send(b"\r").expect("select option");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let suffix = b" to confirm, or press Enter to cancel:";
+    loop {
+        let bytes = pty.collected().expect("witness output");
+        let fresh = &bytes[mark..];
+        if let Some(at) = find_subsequence(fresh, suffix) {
+            let banner = &fresh[..at];
+            let (prefix, nonce) =
+                banner.split_at(banner.len().checked_sub(6).expect("six-digit witness"));
+            assert!(
+                prefix.ends_with(b"Type ")
+                    && nonce
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b)),
+                "unexpected witness prompt"
+            );
+            before_confirm();
+            let mut reply = [b'\r'; 7];
+            reply[..6].copy_from_slice(nonce);
+            pty.send(&reply).expect("confirm witnessed selection");
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fresh witness did not paint"
+        );
+        pty.pump_for(Duration::from_millis(10))
+            .expect("pump witness");
+    }
+}
 
 /// A real PTY child over `program` with a fresh session-owned root that is
 /// both the data and the env root.
@@ -1312,6 +1377,264 @@ mod helper;
 pub mod release;
 
 pub use helper::ensure_helper;
+
+pub struct EffectTerminal {
+    pty: PtySession,
+    terminal: vt100::Parser,
+    consumed: usize,
+}
+
+impl EffectTerminal {
+    pub fn open(root: tempfile::TempDir, rows: u16, cols: u16, args: &[&str]) -> Self {
+        let data = root.path().to_path_buf();
+        let mut cmd = portable_pty::CommandBuilder::new(release::baseline_bundle().join("rivect"));
+        cmd.env_clear();
+        cmd.cwd(&data);
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("HOME", &data);
+        cmd.env("TMPDIR", &data);
+        cmd.env("RIVECT_DATA_ROOT", &data);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        Self {
+            pty: PtySession::spawn(cmd, rows, cols, root, data).expect("installed effect PTY"),
+            terminal: vt100::Parser::new(rows, cols, 0),
+            consumed: 0,
+        }
+    }
+
+    pub fn resume(world: World, session: &SessionId) -> Self {
+        let mut world = world;
+        let root = world.directory.take().expect("fixture owns root");
+        drop(world); // Release the single writer before the installed process attaches.
+        let mut tui = Self::open(root, 24, 120, &[]);
+        tui.see("Message");
+        tui.send(format!("/resume {}\r", session.0).as_bytes());
+        tui
+    }
+
+    pub fn send(&mut self, keys: &[u8]) {
+        self.pty.send(keys).expect("write PTY input");
+    }
+
+    pub fn until(&mut self, why: &str, check: impl Fn(&str) -> bool) -> String {
+        self.until_screen(why, |screen| check(&screen.contents()))
+    }
+
+    pub fn until_screen(&mut self, why: &str, check: impl Fn(&vt100::Screen) -> bool) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            self.read_screen();
+            let screen = self.terminal.screen();
+            if check(screen) {
+                return screen.contents();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing {why}; current screen:\n{}",
+                screen.contents()
+            );
+            self.pty
+                .pump_for(Duration::from_millis(15))
+                .expect("wait for paint");
+        }
+    }
+
+    pub fn see(&mut self, text: &str) -> String {
+        self.until(text, |screen| screen.contains(text))
+    }
+
+    pub fn confirm_permission(&mut self) {
+        std::thread::sleep(rivect::ui::DECISION_CONSENT_DELAY);
+        confirm_witness(&mut self.pty);
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.read_screen();
+        self.pty
+            .resize(rows, cols)
+            .expect("resize installed terminal");
+        self.terminal.screen_mut().set_size(rows, cols);
+    }
+
+    fn read_screen(&mut self) {
+        let bytes = self.pty.collected().expect("read installed PTY");
+        self.terminal.process(&bytes[self.consumed..]);
+        self.consumed = bytes.len();
+    }
+
+    pub fn raw(&self) -> Vec<u8> {
+        self.pty.collected().expect("read terminal bytes")
+    }
+
+    pub fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(
+            self.pty.data_root().join("runtime/rivect.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("observe installed owner database")
+    }
+}
+
+/// The installed client calls one local HTTP peer. The test controls its SSE boundary,
+/// never the task state, text projection or renderer.
+pub struct EffectSend {
+    pub tui: EffectTerminal,
+    pub peer: std::net::TcpStream,
+    pub listener: std::net::TcpListener,
+}
+
+impl EffectSend {
+    pub fn open(rows: u16, cols: u16, goal: &str) -> Self {
+        Self::start(rows, cols, goal, None)
+    }
+
+    pub fn open_with_blocked(rows: u16, cols: u16, goal: &str, reason: &str) -> Self {
+        Self::start(rows, cols, goal, Some(reason))
+    }
+
+    fn start(rows: u16, cols: u16, goal: &str, blocker: Option<&str>) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local provider");
+        let addr = listener.local_addr().expect("local endpoint");
+        let root = tempfile::tempdir().expect("private terminal root");
+        std::fs::write(root.path().join("config.toml"), format!(
+            "config_version = 1\n[connections.vllm]\nkind = \"local\"\nendpoint = \"http://{addr}/v1\"\n[models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"vllm\", model_id = \"offline\" }}\neffort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+        )).expect("configure local provider");
+        let session = blocker.map(|reason| {
+            let mut world = open_world_at(root.path(), None);
+            let session = world.open_session("blocked-parent");
+            let task = world.create_task(&session, "retained-blocker");
+            let mut owner = world.runtime.store_writer();
+            let attempt = owner
+                .plan_attempt(&task, rivect::contracts::EffectClass::Read, "fixture read")
+                .expect("plan read");
+            owner
+                .attempt_unknown(&attempt, reason)
+                .expect("record unresolved read");
+            owner.mark_outcome_unknown(&task).expect("block task");
+            session
+        });
+        let mut tui = EffectTerminal::open(root, rows, cols, &[]);
+        tui.see("Message");
+        if let Some(session) = &session {
+            tui.send(format!("/resume {}\r", session.0).as_bytes());
+            tui.see("Resumed session:");
+        }
+        tui.send(goal.as_bytes());
+        tui.send(b"\r");
+        let peer = effect_peer(&listener, &mut tui);
+        Self {
+            tui,
+            peer,
+            listener,
+        }
+    }
+
+    pub fn chunk(&mut self, text: &str) {
+        use std::io::Write;
+        let frame = json!({"id":"r1", "choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
+        write!(self.peer, "data: {frame}\n\n").expect("send real provider chunk");
+    }
+
+    pub fn finish(&mut self) {
+        use std::io::Write;
+        self.peer.write_all(b"data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").expect("finish SSE");
+        self.peer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("finish HTTP response");
+    }
+}
+
+pub fn effect_peer(
+    listener: &std::net::TcpListener,
+    tui: &mut EffectTerminal,
+) -> std::net::TcpStream {
+    use std::io::Write;
+    listener.set_nonblocking(true).expect("bounded accept");
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut peer = loop {
+        match listener.accept() {
+            Ok((peer, _)) => break peer,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                tui.pty
+                    .pump_for(Duration::from_millis(15))
+                    .expect("pump until provider POST");
+            }
+            Err(error) => panic!("installed provider request missing: {error}"),
+        }
+    };
+    // Darwin inherits the listener's nonblocking mode on accept.
+    peer.set_nonblocking(false)
+        .expect("honor the fixture request deadline");
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound request read");
+    peer.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("bound response write");
+    read_fixture_request(&mut peer);
+    peer.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+    )
+    .expect("start SSE response");
+    peer
+}
+
+/// The only effect requested here is a local read of the test-owned file. Its contents
+/// must never become an operator command, a model request, or an attempted second read.
+pub fn hostile_local_read_screen(text: &str, marker: &str) -> String {
+    let mut world = open_world("hostile-output", None);
+    let session = world.open_session("hostile-output");
+    world.create_task(&session, "output-owner");
+    std::fs::write(world.root.join("returned.txt"), text)
+        .expect("put exact returned bytes in scope");
+    let mut tui = EffectTerminal::resume(world, &session);
+    tui.see("Resumed session:");
+    tui.send(b"/read returned.txt\r");
+    tui.see(marker);
+    tui.send(b"still editing");
+    let frame = tui.see("still editing");
+    assert!(
+        frame.contains(marker)
+            && !frame.contains("awaiting permission")
+            && !frame.contains("Esc returns · Enter selects"),
+        "{frame}"
+    );
+    assert!(
+        frame.chars().all(|ch| ch == '\n' || !ch.is_control()),
+        "{frame}"
+    );
+    let raw = tui.raw();
+    assert!(
+        !raw.windows(5).any(|s| s == b"\x1b]52;"),
+        "clipboard control emitted"
+    );
+    let db = tui.db();
+    for (query, count) in [
+        (
+            "SELECT count(*) FROM attempts WHERE effect_class = 'read'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM attempts WHERE effect_class IN ('model','exec','write','egress')",
+            0,
+        ),
+        ("SELECT count(*) FROM usage_settlements", 0),
+        ("SELECT count(*) FROM preapprovals", 0),
+        ("SELECT count(*) FROM answer_attempts", 0),
+    ] {
+        assert_eq!(
+            db.query_row(query, [], |r| r.get::<_, i64>(0))
+                .expect("observed installed owner"),
+            count,
+            "{query}"
+        );
+    }
+    frame
+}
 
 /// Marker appended by the T9 shim after copying fd0→stdout. A host-side
 /// read of the target never produces this line.
@@ -1935,4 +2258,17 @@ pub fn drop_sealed_attempt_root(root: &Path) {
         unseal_all(root);
     }
     drop(std::fs::remove_dir_all(root));
+}
+
+/// Make the private owner's assembled-context read fail until observation completes.
+pub fn with_unavailable_evidence(root: &Path, observe: impl FnOnce()) {
+    let fixture = rusqlite::Connection::open(root.join("runtime/rivect.db"))
+        .expect("private store fault fixture");
+    fixture
+        .execute_batch("ALTER TABLE evidence RENAME TO temporarily_unavailable_evidence")
+        .expect("interrupt real status projection");
+    observe();
+    fixture
+        .execute_batch("ALTER TABLE temporarily_unavailable_evidence RENAME TO evidence")
+        .expect("restore real status projection");
 }

@@ -714,8 +714,13 @@ async fn anthropic_valid_control_yields_one_outcome_and_one_physical_usage() {
         body["tools"],
         json!([{
             "name": "read_file",
-            "description": "",
-            "input_schema": {"type": "object"},
+            "description": "one admitted file read in the current scope",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+                "required": ["path"],
+                "additionalProperties": false,
+            },
         }]),
         "the declared client tool carries the Messages input_schema"
     );
@@ -1028,6 +1033,50 @@ async fn anthropic_wrong_credential_profile_or_region_denies_without_secrets() {
 }
 
 // ----- TP-PROVIDER-RECOVERY::anthropic --------------------------------
+
+#[tokio::test]
+async fn tool_arguments_survive_wire_decode() {
+    let server = MockServer::start().await;
+    let mut stream = message_start(3);
+    for (index, (name, args)) in [
+        ("write_file", json!({"path": "a", "text": "two\nlines"})),
+        ("run_check", json!({"test": "case::exact"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        stream.push_str(&sse_block("content_block_start", &json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "tool_use", "id": format!("call_{index}"), "name": name, "input": {}}
+        })));
+        stream.push_str(&sse_block(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": args.to_string()}
+            }),
+        ));
+        stream.push_str(&sse_block(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": index}),
+        ));
+    }
+    stream.push_str(&sse_block("message_delta", &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}})));
+    stream.push_str(&sse_block("message_stop", &json!({"type": "message_stop"})));
+    mount_messages(&server, stream).await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _) = anthropic_provider(&config);
+    let mut manifest = prepared_manifest(&config);
+    manifest.tools = vec!["write_file".into(), "run_check".into()];
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let calls = outcome.expect("typed tool calls").tool_calls;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].path.as_deref(), Some("a"));
+    assert_eq!(calls[0].text.as_deref(), Some("two\nlines"));
+    assert_eq!(calls[1].test.as_deref(), Some("case::exact"));
+    drop_blocking(provider);
+}
 
 #[tokio::test]
 async fn anthropic_rejects_partial_tool_block_and_unknown_terminal() {
@@ -5388,8 +5437,13 @@ async fn custom_messages_keeps_top_level_system_and_max_tokens() {
         body["tools"],
         json!([{
             "name": "read_file",
-            "description": "",
-            "input_schema": {"type": "object"},
+            "description": "one admitted file read in the current scope",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+                "required": ["path"],
+                "additionalProperties": false,
+            },
         }])
     );
 }

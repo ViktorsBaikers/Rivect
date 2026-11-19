@@ -2764,17 +2764,34 @@ pub const EXIT_LAUNCH_EXEC: i32 = 126;
 /// `launch` could not find the target program to execute.
 pub const EXIT_LAUNCH_NOT_FOUND: i32 = 127;
 
+/// Recognizes the installer's release directory without trusting bundle contents or `HOME`.
+#[must_use]
+pub fn is_managed_release_dir(dir: &std::path::Path) -> bool {
+    dir.parent()
+        .is_some_and(|parent| parent.ends_with(".local/share/rivect/releases"))
+        && dir.file_name().is_some_and(|name| {
+            let bytes = name.as_encoded_bytes();
+            bytes.len() == 64
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        })
+}
+
 /// Resolves the confined helper binary that performs admitted fd I/O.
-/// Cargo sets `CARGO_BIN_EXE_rivect_sandbox_helper` for this crate's binary
-/// in test builds; a `RIVECT_SANDBOX_HELPER` override pins an explicit
-/// install; and the production layout expects the helper installed beside
-/// the rivect executable (or one level up from a `deps/` test harness).
+/// An explicit override is checkout-only. Installed releases always use
+/// their own sibling.
 ///
 /// # Errors
 /// Returns an `io::Error` naming the resolution rule when no candidate
 /// exists — the executor surfaces that as the mechanism being unavailable,
 /// never as an ambient in-process fallback.
 pub fn helper_binary() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let dir = executable_dir(&exe)?;
+    if is_managed_release_dir(dir) {
+        return sibling_helper(dir);
+    }
     if let Some(path) =
         HELPER_BINARY_OVERRIDE.with(|slot| slot.try_borrow().ok().and_then(|guard| guard.clone()))
     {
@@ -2783,7 +2800,7 @@ pub fn helper_binary() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("RIVECT_SANDBOX_HELPER") {
         return Ok(PathBuf::from(path));
     }
-    owned_helper_binary()
+    sibling_helper(dir)
 }
 
 /// Resolves the installed native owner independently of payload helper overrides.
@@ -2792,15 +2809,28 @@ pub fn helper_binary() -> io::Result<PathBuf> {
 /// Returns the original resolution failure when the installed helper is absent.
 pub fn owned_helper_binary() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let dir = exe.parent().ok_or_else(|| {
+    sibling_helper(executable_dir(&exe)?)
+}
+
+fn executable_dir(exe: &std::path::Path) -> io::Result<&std::path::Path> {
+    exe.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "cannot resolve the current executable directory",
         )
-    })?;
+    })
+}
+
+fn sibling_helper(dir: &std::path::Path) -> io::Result<PathBuf> {
     let beside = dir.join("rivect-sandbox-helper");
     if beside.is_file() {
         return Ok(beside);
+    }
+    if is_managed_release_dir(dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "managed release sandbox helper is missing",
+        ));
     }
     // A `target/debug/deps/rivect-<hash>` test harness keeps the helper at
     // `target/debug/rivect-sandbox-helper`; one level up from `deps/`.

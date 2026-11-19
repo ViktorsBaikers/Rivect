@@ -419,7 +419,7 @@ impl VertexProvider {
         let location = self.location(credential)?;
         let project = self.project(credential)?;
         let binding = self.messages.binding(manifest, &fixed.model_id);
-        let mut body = self.messages.request_body(manifest, fixed, &binding);
+        let mut body = self.messages.request_body(manifest, fixed, &binding)?;
         if let Some(object) = body.as_object_mut() {
             // `streamRawPredict` names the model in the resource path; a
             // body copy would be a second, unread model claim.

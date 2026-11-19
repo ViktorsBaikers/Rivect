@@ -175,6 +175,7 @@ const O_NOFOLLOW: i32 = 0x0100;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadObservation {
+    pub identity: FileIdentity,
     pub bytes: Vec<u8>,
     pub digest: String,
 }

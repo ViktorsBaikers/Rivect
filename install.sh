@@ -21,9 +21,10 @@ case ${HOME:-} in
     /*) ;;
     *) fail 'HOME must be an absolute path' ;;
 esac
-for command in curl tar awk sort cmp mktemp mkdir mv ln chmod grep rm rmdir; do
+for command in curl python3 awk cmp mktemp mkdir ln grep rm rmdir; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+gh=$(command -v gh) || fail 'GitHub CLI with attestation verify is required'
 if command -v sha256sum >/dev/null 2>&1; then
     hash_command=sha256sum
 elif command -v shasum >/dev/null 2>&1; then
@@ -33,6 +34,9 @@ else
 fi
 
 root=$HOME/.local/share/rivect
+for dir in "$HOME/.local" "$HOME/.local/share" "$root" "$root/releases"; do
+    [ ! -L "$dir" ] || fail "installation directory is a symlink: $dir"
+done
 mkdir -p "$root/releases" || fail 'cannot create installation directory'
 mkdir "$root/.install-lock" 2>/dev/null || fail "installation locked: $root/.install-lock (remove only if no installer is running)"
 work=
@@ -49,11 +53,17 @@ trap 'exit 143' TERM
 work=$(mktemp -d "$root/.download.XXXXXX") || fail 'cannot create download directory'
 
 releases=https://github.com/ViktorsBaikers/Rivect/releases
-resolved=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 -fsSL -o /dev/null -w '%{url_effective}' "$releases/latest") || fail 'cannot resolve latest release'
-case $resolved in
-    "$releases/tag/"*) tag=${resolved#"$releases/tag/"} ;;
-    *) fail 'latest release did not resolve to a repository release tag' ;;
-esac
+if [ "$#" -eq 0 ]; then
+    resolved=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 -fsSL -o /dev/null -w '%{url_effective}' "$releases/latest") || fail 'cannot resolve latest release'
+    case $resolved in
+        "$releases/tag/"*) tag=${resolved#"$releases/tag/"} ;;
+        *) fail 'latest release did not resolve to a repository release tag' ;;
+    esac
+elif [ "$#" -eq 2 ] && [ "$1" = --rollback ]; then
+    tag=$2
+else
+    fail 'usage: install.sh [--rollback vMAJOR.MINOR.PATCH]'
+fi
 printf '%s\n' "$tag" | awk '/^v[0-9]+[.][0-9]+[.][0-9]+$/ {valid=1} END {exit (!valid || NR != 1)}' || fail 'invalid release tag'
 archive=rivect-$tag-$target.tar.gz
 url=$releases/download/$tag
@@ -68,36 +78,89 @@ fi
 read -r actual _remainder < "$work/hash" || fail 'cannot read archive hash'
 [ "$actual" = "$expected" ] || fail 'archive checksum mismatch'
 
-# Validate names, duplicates and entry types before tar can write anything.
-tar -tzf "$work/$archive" > "$work/names" || fail 'cannot list archive'
-printf '%s\n' rivect rivect-sandbox-helper rivect.manifest.json > "$work/expected"
-sort "$work/names" > "$work/sorted" || fail 'cannot sort archive inventory'
-cmp -s "$work/expected" "$work/sorted" || fail 'archive must contain exactly rivect, rivect-sandbox-helper and rivect.manifest.json'
-tar -tvzf "$work/$archive" > "$work/types" || fail 'cannot inspect archive types'
-awk 'substr($0, 1, 1) != "-" {bad=1} END {exit (bad || NR != 3)}' "$work/types" || fail 'archive entries must be regular files, not links or directories'
 staging=$(mktemp -d "$root/releases/.staging.XXXXXX") || fail 'cannot stage installation'
-tar -xzf "$work/$archive" --no-same-owner --no-same-permissions -C "$staging" || fail 'archive extraction failed'
-for name in rivect rivect-sandbox-helper rivect.manifest.json; do
-    if [ ! -f "$staging/$name" ] || [ -L "$staging/$name" ]; then
-        fail 'extracted bundle is not regular files'
-    fi
-done
-chmod 0755 "$staging" "$staging/rivect" "$staging/rivect-sandbox-helper" || fail 'cannot set executable permissions'
-chmod 0644 "$staging/rivect.manifest.json" || fail 'cannot set manifest permissions'
-env -i HOME="$HOME" PATH="$PATH" "$staging/rivect" --version >/dev/null || fail 'release binary cannot run on this system'
 release=$root/releases/$expected
-if [ -e "$release" ] || [ -L "$release" ]; then
-    if [ ! -d "$release" ] || [ -L "$release" ]; then
-        fail 'existing bundle path is not a directory'
+if [ "$#" -ne 0 ] && [ ! -d "$release" ]; then
+    fail 'archive was not previously installed'
+fi
+python3 -I - "$work/$archive" "$staging" "$release" "$work/receipt" "$target" <<'PY' || fail 'bundle verification failed'
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tarfile
+
+archive, stage, release, receipt = map(Path, sys.argv[1:5])
+library = "libexec/libopentui." + ("dylib" if sys.argv[5].endswith("darwin") else "so")
+names = {"executable": "rivect", "helper": "rivect-sandbox-helper",
+         "ui": "libexec/rivect-tui", "library": library}
+manifest = "rivect.manifest.json"
+allowed = {manifest, *names.values()}
+
+def unique(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        sys.exit("duplicate manifest key")
+    return result
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# Never extract archive-controlled paths or apply archive modes, links or ownership.
+seen = set()
+libexec_dir = False
+with tarfile.open(archive, "r|gz") as tar:
+    for entry in tar:
+        if entry.name == "libexec" and entry.isdir() and not libexec_dir:
+            libexec_dir = True
+            continue
+        if entry.name == manifest and entry.size > 64 * 1024:
+            sys.exit("release manifest exceeds the size limit")
+        if entry.name not in allowed or entry.name in seen or entry.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
+            sys.exit("invalid archive entry")
+        seen.add(entry.name)
+        dest = stage / entry.name
+        dest.parent.mkdir(exist_ok=True)
+        with tar.extractfile(entry) as src, dest.open("xb") as out:
+            shutil.copyfileobj(src, out)
+        dest.chmod(0o644 if entry.name in (manifest, library) else 0o755)
+
+raw = (stage / manifest).read_bytes()
+data = json.loads(raw, object_pairs_hook=unique)
+if type(data["schema_version"]) is not int or data["schema_version"] != 2:
+    sys.exit("unsupported manifest version; Rivect requires a v2 package")
+if (set(data) != {"schema_version", "build", *names} or not isinstance(data["build"], str)
+        or not data["build"] or seen != {manifest, *names.values()}):
+    sys.exit("invalid bundle inventory")
+for role, name in names.items():
+    if data[role] != {"name": name, "sha256": digest(stage / name)}:
+        sys.exit("manifest entry mismatch: " + role)
+
+if os.path.lexists(release):
+    for directory in ("", "libexec"):
+        current = release / directory
+        if current.is_symlink() or not current.is_dir() or set(os.listdir(current)) != set(os.listdir(stage / directory)):
+            sys.exit("existing bundle inventory differs")
+    for name in seen:
+        path = release / name
+        if (path.is_symlink() or not path.is_file() or digest(path) != digest(stage / name)
+                or (name not in (manifest, library) and not os.access(path, os.X_OK))):
+            sys.exit("existing bundle differs from verified archive")
+receipt.write_text(hashlib.sha256(raw).hexdigest() + "\n", encoding="ascii")
+PY
+receipt=$release.manifest.sha256
+if [ -e "$receipt" ] || [ -L "$receipt" ]; then
+    if [ ! -f "$receipt" ] || [ -L "$receipt" ] || ! cmp -s "$work/receipt" "$receipt"; then
+        fail 'existing manifest receipt differs'
     fi
-    for name in rivect rivect-sandbox-helper rivect.manifest.json; do
-        if [ ! -f "$release/$name" ] || [ -L "$release/$name" ] || ! cmp -s "$staging/$name" "$release/$name"; then
-            fail 'existing bundle differs from verified archive'
-        fi
-    done
-else
-    mv "$staging" "$release" || fail 'cannot publish verified bundle'
-    staging=
+elif [ "$#" -ne 0 ]; then
+    fail 'previous manifest receipt missing'
 fi
 
 IFS= read -r path_line <<'PROFILE'
@@ -105,6 +168,7 @@ case ":$PATH:" in *":$HOME/.local/share/rivect/bin:"*) ;; *) export PATH="$HOME/
 PROFILE
 add_profile() {
     profile=$1
+    [ ! -L "$profile" ] || fail "shell profile is a symlink: $profile"
     if [ -e "$profile" ] && [ ! -f "$profile" ]; then fail "shell profile is not a regular file: $profile"; fi
     if [ -f "$profile" ]; then
         if grep -Fqx "$path_line" "$profile"; then return; else
@@ -141,10 +205,173 @@ PROFILE
 esac
 
 [ ! -e "$root/bin" ] || [ -L "$root/bin" ] || fail 'installation bin path is not a symlink'
-ln -s "$release" "$work/bin" || fail 'cannot stage bundle selection'
-# GNU and BSD mv need different flags to replace, not follow, directory symlinks.
-if mv -fT "$work/bin" "$root/bin" 2>/dev/null; then :
-else mv -fh "$work/bin" "$root/bin" || fail 'cannot activate verified bundle'
-fi
+# Publish immutable objects first; only the final rename changes the active bundle.
+python3 -I - "$staging" "$release" "$work/receipt" "$receipt" "$work/bin" "$root/bin" "$tag" "$target" "$#" "$gh" "$work/$archive" <<'PY' || fail 'cannot activate verified bundle'
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+
+stage, release, candidate, receipt, link, active = map(Path, sys.argv[1:7])
+tag, target, argc, gh, archive = sys.argv[7:]
+rollback = argc != "0"
+commands = release.with_suffix(".commands")
+published = received = created_commands = False
+key = f"{tag}-{target}-"
+binding = key + release.name + "-" + candidate.read_text(encoding="ascii").strip()
+
+# Only records reached through the active link are history. An interrupted publication is not.
+history = None
+if active.is_symlink():
+    selected = Path(os.readlink(active))
+    if selected.parent.parent == active.parent and selected.parent.name.startswith(".activation."):
+        history = selected.parent
+        if history.is_symlink() or not history.is_dir() or not selected.is_symlink():
+            sys.exit("invalid active selection")
+bound = history is not None and (history / binding).is_symlink() and os.readlink(history / binding) == str(commands)
+if rollback and not bound:
+    sys.exit("release was not previously activated for this tag and target")
+
+def require_library_mapping(pid, env, deadline):
+    library = release / "libexec" / ("libopentui.dylib" if target.endswith("darwin") else "libopentui.so")
+    if sys.platform == "darwin":
+        subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-d", "txt", "-p", str(pid), "--", library],
+                       env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       timeout=max(0, deadline - time.monotonic()), check=True)
+    else:
+        st = library.stat()
+        device = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}".encode()
+        inode = str(st.st_ino).encode()
+        with open(f"/proc/{pid}/maps", "rb") as maps:
+            for line in maps:
+                _, perms, _, dev, ino, *_ = line.split(maxsplit=5)
+                if b"x" in perms and dev == device and ino == inode:
+                    return
+        raise ValueError("renderer did not map the installed library")
+
+def probe_renderer(work, env):
+    master, slave = pty.openpty()
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        deadline = time.monotonic() + 8
+        with subprocess.Popen([release / "libexec/rivect-tui"], cwd=work,
+                              env=dict(env, TERM="xterm-256color", TMPDIR=str(work)),
+                              stdin=slave, stdout=slave, stderr=slave, start_new_session=True) as ui:
+            def wait_for(marker):
+                tail = b""
+                while time.monotonic() < deadline:
+                    if select.select([master], [], [], .1)[0]:
+                        tail += os.read(master, 65536)
+                        if marker in tail:
+                            return
+                        tail = tail[-len(marker):]
+                    elif ui.poll() is not None:
+                        break
+                raise ValueError("renderer did not complete terminal startup and shutdown")
+            try:
+                wait_for(b"Message")
+                require_library_mapping(ui.pid, env, deadline)
+                os.write(master, b"\x03")
+                wait_for(b"\x1b[?1049l")
+                # Terminal restoration can still fill the PTY after the alt-screen marker.
+                while ui.poll() is None and time.monotonic() < deadline:
+                    if select.select([master], [], [], .05)[0]:
+                        os.read(master, 65536)
+                if ui.wait(timeout=max(0, deadline - time.monotonic())) not in (0, 130):
+                    raise ValueError("renderer exited unsuccessfully")
+            except BaseException:
+                try:
+                    os.killpg(ui.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # The process group already exited.
+                raise
+    finally:
+        os.close(slave)
+        os.close(master)
+
+def probe_bundle():
+    work = link.parent
+    env = {"HOME": str(work), "PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    doctor = subprocess.run([release / "rivect", "doctor", "--data-root", work / "fresh"],
+                            env=env, cwd=work, capture_output=True, timeout=30)
+    report = json.loads(doctor.stdout)
+    fresh = {"exe": "ready", "release": "ready", "config": "ready",
+             "runtime_dir": "missing", "owner_lock": "missing", "state_db": "missing"}
+    if (doctor.returncode != 3 or report.get("kind") != "doctor"
+            or {c["name"]: c["state"] for c in report["checks"]} != fresh):
+        raise ValueError("candidate doctor refused fresh installation")
+
+    # Establish that this fresh path is writable without the sandbox.
+    target = work / "forbidden-write"
+    target.touch(exist_ok=False)
+    target.unlink()
+    platform, policy = (("macos", "(version 1)(allow default)(deny file-write*)")
+                        if (release / "libexec/libopentui.dylib").exists() else ("linux", ""))
+    probe = subprocess.run([release / "rivect-sandbox-helper", "probe-write", platform, policy, target],
+                           env=env, cwd=work, capture_output=True, timeout=30)
+    if (probe.returncode != 20 or os.path.lexists(target)
+            or not probe.stderr.startswith(b"rivect-sandbox-helper: probe-write open denied:")
+            or not any(errno in probe.stderr for errno in (b"(os error 1)", b"(os error 13)"))):
+        raise ValueError("sandbox did not deny the forbidden write")
+    probe_renderer(work, env)
+
+try:
+    verifier_env = {k: os.environ[k] for k in ("HOME", "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN") if k in os.environ}
+    verifier_env.update(PATH="/usr/bin:/bin", GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1")
+    subprocess.run([gh, "attestation", "verify", archive, "--repo", "github.com/ViktorsBaikers/Rivect",
+                    "--signer-workflow", "github.com/ViktorsBaikers/Rivect/.github/workflows/ci.yml",
+                    "--source-ref", f"refs/tags/{tag}"],
+                   env=verifier_env, stdin=subprocess.DEVNULL, check=True, timeout=90)
+    subprocess.run([stage / "rivect", "--version"], env={"HOME": str(link.parent), "PATH": "/usr/bin:/bin"},
+                   cwd=link.parent, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True, timeout=10)
+    if not release.exists():
+        stage.rename(release)
+        published = True
+    if not rollback and not receipt.exists():
+        os.link(candidate, receipt)
+        received = True
+    probe_bundle()
+    if not rollback and not os.path.lexists(commands):
+        commands.mkdir()
+        created_commands = True
+        (commands / "rivect").symlink_to(release / "rivect")
+    if (commands.is_symlink() or not commands.is_dir() or os.listdir(commands) != ["rivect"]
+            or os.readlink(commands / "rivect") != str(release / "rivect")):
+        raise ValueError("invalid release command directory")
+    if not bound:
+        # Build a private snapshot. The same rename commits both selection and its receipt history.
+        snapshot = Path(tempfile.mkdtemp(prefix=".activation.", dir=link.parent))
+        if history is not None:
+            for record in history.iterdir():
+                historical = Path(os.readlink(record))
+                if not record.name.startswith(key) and historical.suffix == ".commands":
+                    (snapshot / record.name).symlink_to(historical)
+        (snapshot / binding).symlink_to(commands)
+        history = active.parent / snapshot.name
+        snapshot.rename(history)
+    link.symlink_to(history / binding)
+    os.replace(link, active)
+except BaseException:
+    # A signal can arrive after rename already committed. Never remove the active selection.
+    if history is not None and active.is_symlink() and os.readlink(active) == str(history / binding):
+        raise
+    if created_commands:
+        shutil.rmtree(commands)
+    if received:
+        receipt.unlink()
+    if published:
+        shutil.rmtree(release)
+    raise
+PY
 printf 'Installed Rivect %s for %s in %s\n' "$tag" "$target" "$root/bin" >&2
 printf '%s\n' 'Open a new terminal, or source your shell profile, then run rivect.' 'A piped installer cannot change PATH in its parent shell.' >&2

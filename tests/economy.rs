@@ -4146,3 +4146,248 @@ fn matched_strategies_charge_context_cache_repair_and_proof() {
         "one declared connection serves the matched send"
     );
 }
+
+/// Wait on the *current* terminal, retaining the emulator across real kernel resizes.
+fn await_economy_frame(
+    pty: &support::PtySession,
+    vt: &mut vt100::Parser,
+    consumed: &mut usize,
+    condition: impl Fn(&str) -> bool,
+) -> String {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let bytes = pty.collected().expect("read installed terminal");
+        vt.process(&bytes[*consumed..]);
+        *consumed = bytes.len();
+        let frame = vt.screen().contents();
+        if condition(&frame) {
+            return frame;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "unmet dock condition:\n{frame}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+}
+
+#[test]
+fn installed_live_three_todo_dock_keeps_measured_economy_across_refresh_failure() {
+    use std::time::Duration;
+    let home = tempfile::TempDir::with_prefix("rivect-economy-pty-").expect("private home");
+    let data = home.path().join(".rivect");
+    let cwd = home.path().join("Rivect/src");
+    std::fs::create_dir_all(&cwd).expect("workspace");
+    std::fs::create_dir(&data).expect("private state");
+    let config = format!("{}\n[context]\nauto_compact = false\n", config_text());
+    let mut world = support::open_world_at(&data, Some(&config));
+    let session = world.open_session("live-economy");
+    let tasks = ["first", "second", "third"].map(|key| world.create_task(&session, key));
+    world
+        .runtime
+        .store_writer()
+        .mark_no_ready(&tasks[0])
+        .expect("first task blocked on unavailable dependency");
+    let unreported = settle_through_runtime(&mut world, "missing-total", UsageDelta::Unknown);
+    let measured = settle_through_runtime(
+        &mut world,
+        "last-measured",
+        UsageDelta::Exact {
+            prompt_tokens: 9,
+            completion_tokens: 3,
+            total_tokens: 12,
+        },
+    );
+    let charge = format!(
+        "charged {} units",
+        unreported.cost_bound + measured.cost_bound.min(12)
+    );
+    let totals = world
+        .runtime
+        .store()
+        .settlement_totals()
+        .expect("seeded settlement ledger");
+    assert_eq!(
+        (
+            totals.total_tokens,
+            totals.latest_prompt_tokens,
+            totals.settled_without_total
+        ),
+        (Some(12), Some(9), 1)
+    );
+    world
+        .runtime
+        .refresh_economy(Some(&measured))
+        .expect("refresh routed economy after actual settlement");
+    let status = status(&mut world, &session);
+    let dock = rivect::ui::task_dock(&status);
+    let selection = dock.last().expect("owner economy row after three tasks");
+    for required in [
+        "model fixture-model",
+        "fixed pin",
+        "effort high",
+        "context 9 tok",
+        "purpose main",
+        "scope local",
+    ] {
+        assert!(
+            selection.contains(required),
+            "absent routed value {required}: {selection}"
+        );
+    }
+    drop(world);
+    let mut command = support::pty_command(support::release::baseline_bundle().join("rivect"));
+    command.env_clear();
+    command.env("HOME", home.path());
+    command.env("TMPDIR", home.path());
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("TERM", "xterm-256color");
+    command.env("NO_COLOR", "1");
+    command.cwd(cwd);
+    command.arg("--tui");
+    command.arg("fullscreen");
+    let database = data.join("runtime/rivect.db");
+    let mut pty =
+        support::PtySession::spawn(command, 20, 60, home, data).expect("installed 60x20 PTY");
+    let mut vt = vt100::Parser::new(20, 60, 0);
+    let mut consumed = 0;
+    await_economy_frame(&pty, &mut vt, &mut consumed, |frame| {
+        frame.contains("Message")
+    });
+    pty.send(format!("/resume {}\r", session.0).as_bytes())
+        .expect("attach three saved tasks");
+    let [blocked, second, third] = tasks;
+    let task_rows = [
+        format!("task {}: blocked (dependency_blocked)", blocked.0),
+        format!("task {}: running", second.0),
+        format!("task {}: running", third.0),
+    ];
+    let timeline = |frame: &str| {
+        let content = frame
+            .lines()
+            .filter_map(|row| {
+                row.split_once('│')
+                    .map(|(_, text)| text.trim_end_matches([' ', '█', '▄', '▀']))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        support::squashed(&content)
+    };
+    let contains_totals = |text: &str| {
+        ["settled 12 tok", "partial: 1 of 2", &charge]
+            .iter()
+            .all(|value| text.contains(value))
+    };
+    let full = |frame: &str| {
+        let text = timeline(frame);
+        task_rows.iter().all(|row| text.contains(row))
+            && contains_totals(&text)
+            && [
+                "project ",
+                "cwd ",
+                "Rivect",
+                "the bound is retained",
+                "agents 0 slots",
+                "scheduler's running",
+                "reset unknown",
+                "the quota surface repo",
+                "quota unknown",
+                "no quota endpoint repo",
+                "context 9 tok",
+                "latest settled attempt's",
+                "cache unknown",
+            ]
+            .iter()
+            .all(|label| text.contains(label))
+    };
+    let compact = await_economy_frame(&pty, &mut vt, &mut consumed, |frame| {
+        frame.lines().any(|row| {
+            row.contains("/accounting") && row.contains("context 9 tok") && row.contains("running")
+        })
+    });
+    assert!(
+        compact.contains("Message → Main") && !compact.contains(&charge),
+        "{compact}"
+    );
+    pty.send(b"/accounting\r")
+        .expect("open the full accounting view");
+    await_economy_frame(&pty, &mut vt, &mut consumed, |frame| {
+        contains_totals(&timeline(frame))
+    });
+    // The warning reduces the narrow history height. Widen while the real
+    // failure is still active to inspect every retained row together.
+    support::with_unavailable_evidence(&pty.data_root(), || {
+        await_economy_frame(&pty, &mut vt, &mut consumed, |frame| {
+            frame.contains("dock refresh failed:")
+                && frame.contains("context 9 tok")
+                && timeline(frame).contains(&charge)
+        });
+        vt.screen_mut().set_size(40, 120);
+        pty.resize(40, 120).expect("widen during failed refresh");
+        pty.send(b"/accounting\r")
+            .expect("read full accounting during failed refresh");
+        await_economy_frame(&pty, &mut vt, &mut consumed, |frame| {
+            frame.contains("dock refresh failed:") && full(frame)
+        });
+    });
+    await_economy_frame(&pty, &mut vt, &mut consumed, |frame| {
+        full(frame) && !frame.contains("dock refresh failed:")
+    });
+    vt.screen_mut().set_size(30, 180);
+    pty.resize(30, 180).expect("real terminal resize");
+    await_economy_frame(&pty, &mut vt, &mut consumed, |frame| {
+        frame.lines().any(|line| line.chars().count() > 120) && full(frame)
+    });
+    pty.send(b"/exit\r").expect("quit");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("exit status"),
+        Some(0)
+    );
+    let raw = pty.collected().expect("restoration");
+    assert!(support::find_subsequence(&raw, b"\x1b[?1049l").is_some());
+    let fixture =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("observe final ledger");
+    assert_eq!(
+        fixture
+            .query_row("SELECT count(*) FROM usage_settlements", [], |row| row
+                .get::<_, i64>(0))
+            .expect("durable ledger"),
+        2,
+        "passive inspection never sends"
+    );
+    drop(fixture);
+    pty.finish().expect("teardown");
+}
+
+// Negative/mistyped counters cannot come from the typed SQLite owner. The public
+// status formatter still names faults instead of treating them as zero or unknown.
+#[test]
+fn malformed_dock_counter_is_not_a_measurement_or_an_unknown() {
+    let rows = rivect::ui::task_dock(&json!({"todo":{"items":[]},"economy":{
+        "project":"/srv/Rivect", "cwd":"/srv/Rivect/src", "settled_tokens":"not-a-counter",
+        "settled_source":"partial: 1 of 2 settled attempts reported no total", "charged_units":2,
+        "cost_source":"the bound is retained unless a reported total is lower", "quota_remaining":-1,
+        "quota_source":"unknown: no quota endpoint reports remaining units", "reset_at":"2026-11-05",
+        "reset_source":"unknown: the quota surface reports no reset", "agents":1,
+        "agents_source":"scheduler's running slots", "cache_rate":[5,10],
+        "cache_source":"settled frozen cohort w-1 of 2026-11-05 over fixture-model"
+    }}));
+    let projected = rows.last().expect("economy");
+    for fact in [
+        "project /srv/Rivect",
+        "cwd /srv/Rivect/src",
+        "settled malformed tok",
+        "partial: 1 of 2",
+        "charged 2 units",
+        "the bound is retained",
+        "reset 2026-11-05",
+        "quota malformed",
+        "agents 1 slots",
+        "scheduler's running",
+        "cache 5/10",
+        "scope unknown",
+    ] {
+        assert!(projected.contains(fact), "missing {fact:?}: {projected}");
+    }
+}

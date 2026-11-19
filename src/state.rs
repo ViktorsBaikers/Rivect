@@ -34,7 +34,42 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 mod learning;
+pub mod permission;
 pub(crate) mod sql;
+
+pub(crate) const UI_MESSAGE_PRINCIPAL: &str = "ui-message";
+
+/// Retained task activity metadata, excluding raw observations and execution payloads.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TaskActivity {
+    event_id: String,
+    event_type: String,
+    category: String,
+    text: String,
+}
+
+/// Task-local position and the global outbox watermark from the same read.
+pub struct TaskProjection {
+    pub task_id: TaskId,
+    pub revision: u64,
+    pub lifecycle: Lifecycle,
+    pub event_cursor: u64,
+    pub outbox_cursor: u64,
+    pub goal: String,
+    pub origin: String,
+    pub reply: Option<String>,
+    pub error_code: Option<String>,
+}
+
+impl std::fmt::Debug for TaskProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskProjection")
+            .field("task_id", &self.task_id)
+            .field("revision", &self.revision)
+            .field("lifecycle", &self.lifecycle)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Missing {
@@ -3014,6 +3049,45 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// Reads the newest task events in chronological order within one session.
+    ///
+    /// # Errors
+    /// Returns a storage error when retained events cannot be read.
+    pub fn recent_task_events(&self, session: &SessionId, task: &TaskId) -> Result<Vec<Event>> {
+        let mut stmt = self
+            .conn()?
+            .prepare_cached(sql::RECENT_TASK_EVENTS)
+            .map_err(storage)?;
+        let mut events = stmt
+            .query_map(params![session.0, task.0], event_from_row)
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Reads bounded current activity for one session-owned task.
+    ///
+    /// # Errors
+    /// Returns a storage error when the retained records cannot be read.
+    pub fn task_activity(&self, session: &SessionId, task: &TaskId) -> Result<Vec<TaskActivity>> {
+        self.conn()?
+            .prepare_cached(sql::TASK_ACTIVITY)
+            .map_err(storage)?
+            .query_map(params![session.0, task.0], |row| {
+                Ok(TaskActivity {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    category: row.get(2)?,
+                    text: row.get(3)?,
+                })
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(storage)
+    }
+
     /// Total rows in the event outbox, across sessions: the emission
     /// observable for paths that must stay silent (recovery-only journal
     /// completion emits no hooks).
@@ -3214,7 +3288,7 @@ impl TaskStore {
             (&task_id.0, 1),
             "task.created",
             json!({ "task_id": task_id.0, "goal_digest": digest }),
-            "human",
+            principal,
         )?;
         if let Some(question) = question {
             Self::insert_question(&tx, session_id, question)?;
@@ -4782,6 +4856,154 @@ impl TaskStore {
         Ok((items, generation, next_offset, has_more))
     }
 
+    /// Reads one session's first projection page, or one task belonging to it.
+    ///
+    /// # Errors
+    /// Returns a storage error if the snapshot cannot be read.
+    pub fn projection_page(
+        &self,
+        session: &SessionId,
+        task: Option<&TaskId>,
+    ) -> Result<(Vec<TaskProjection>, bool)> {
+        self.projection_window(session, task, i64::MAX)
+    }
+
+    /// Reads the preceding task window using an immutable session-owned task identifier.
+    ///
+    /// # Errors
+    /// Returns not found for an absent or foreign anchor, or a storage error.
+    pub fn older_task_page(
+        &self,
+        session: &SessionId,
+        before: &TaskId,
+    ) -> Result<(Vec<TaskProjection>, bool)> {
+        let anchor = self.task_page_anchor(session, before)?;
+        self.projection_window(session, None, anchor.saturating_sub(1))
+    }
+
+    /// Resolves a task to its page position without loading its text.
+    ///
+    /// # Errors
+    /// Returns not found for absent or foreign tasks, or a storage error.
+    pub fn task_page_anchor(&self, session: &SessionId, task: &TaskId) -> Result<i64> {
+        self.conn()?
+            .prepare_cached(sql::UI_TASK_PAGE_ANCHOR)
+            .map_err(storage)?
+            .query_row(params![session.0, task.0], |row| row.get(0))
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| StoreError::missing_task(&task.0))
+    }
+
+    fn projection_window(
+        &self,
+        session: &SessionId,
+        task: Option<&TaskId>,
+        upper: i64,
+    ) -> Result<(Vec<TaskProjection>, bool)> {
+        let limit = crate::contracts::PAGE_DEFAULT;
+        let mut stmt = self
+            .conn()?
+            .prepare_cached(sql::UI_TASK_PAGE)
+            .map_err(storage)?;
+        let mut tasks = stmt
+            .query_map(
+                params![session.0, task.map(|id| &id.0), limit + 1, upper],
+                |row| {
+                    let counter = |column: usize| {
+                        let raw: i64 = row.get(column)?;
+                        u64::try_from(raw).map_err(|source| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                column,
+                                rusqlite::types::Type::Integer,
+                                Box::new(source),
+                            )
+                        })
+                    };
+                    Ok(TaskProjection {
+                        task_id: TaskId(row.get(0)?),
+                        revision: counter(1)?,
+                        lifecycle: Lifecycle::from_db(&row.get::<_, String>(2)?),
+                        event_cursor: counter(3)?,
+                        outbox_cursor: counter(4)?,
+                        goal: row.get(5)?,
+                        reply: row.get(6)?,
+                        error_code: row.get(7)?,
+                        origin: row.get(8)?,
+                    })
+                },
+            )
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        let more = tasks.len() > limit as usize;
+        tasks.truncate(limit as usize);
+        Ok((tasks, more))
+    }
+
+    pub(crate) fn settle_ui_message(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        revision: u64,
+        reply: std::result::Result<&str, ErrorCode>,
+    ) -> Result<()> {
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let (state, text, code) = match reply {
+            Ok(text) => ("waiting", Some(text), None),
+            Err(code) => ("blocked", None, Some(code.as_str())),
+        };
+        // Both the original admission and a witnessed Begin settle only their own running revision.
+        if tx
+            .execute(
+                sql::SETTLE_UI_MESSAGE,
+                params![session.0, task.0, state, stored_u64(revision)?],
+            )
+            .map_err(storage)?
+            != 1
+        {
+            return Err(StoreError::Conflict(ConflictCause::TaskAlreadyTerminal));
+        }
+        tx.execute(sql::INSERT_UI_REPLY, params![task.0, text, code])
+            .map_err(storage)?;
+        Self::append_event(
+            &tx,
+            session,
+            Some(task),
+            (&task.0, revision + 1),
+            "task.message_settled",
+            json!({"lifecycle":state}),
+            "runtime",
+        )?;
+        tx.commit().map_err(storage)
+    }
+
+    pub(crate) fn reconcile_ui_messages(&mut self) -> Result<()> {
+        while let Some((session, task, revision)) = self
+            .conn()?
+            .query_row(sql::INTERRUPTED_UI_MESSAGE, params![], |row| {
+                Ok((
+                    SessionId(row.get(0)?),
+                    TaskId(row.get(1)?),
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(storage)?
+        {
+            self.settle_ui_message(
+                &session,
+                &task,
+                unsigned(revision)?,
+                Err(ErrorCode::OutcomeUnknown),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn todo_page(
         &self,
         session_id: &SessionId,
@@ -5224,6 +5446,86 @@ impl TaskStore {
             .optional()
             .map_err(storage)?;
         Ok(validity)
+    }
+
+    fn last_step_output(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+        aggregate: &str,
+    ) -> Result<Option<(i64, String)>> {
+        self.conn()?
+            .query_row(
+                sql::LAST_STEP_OUTPUT,
+                params![aggregate, session.0, task.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)
+    }
+
+    /// Only producer status is replayable. Neither output bytes nor untrusted error details enter the outbox.
+    pub(crate) fn record_step_output(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        revision: u64,
+        kind: &'static str,
+    ) -> Result<()> {
+        let aggregate = format!("output:{}:{revision}", task.0);
+        let previous = self.last_step_output(session, task, &aggregate)?;
+        if previous.as_ref().is_some_and(|(_, last)| last == kind) {
+            return Ok(());
+        }
+        let seq = previous.map_or(0, |(seq, _)| seq);
+        let next = unsigned(
+            seq.checked_add(1)
+                .ok_or_else(|| corrupt_column("output revision", &seq.to_string()))?,
+        )?;
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        Self::append_event(
+            &tx,
+            session,
+            Some(task),
+            (&aggregate, next),
+            kind,
+            Value::Null,
+            "controller",
+        )?;
+        tx.commit().map_err(storage)
+    }
+
+    /// Projection of the last actual decision-step settlement at this exact task revision.
+    pub fn step_output(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+        revision: u64,
+    ) -> Result<Option<crate::resources::OutputSettlement>> {
+        use crate::resources::OutputSettlement;
+        let row = self.last_step_output(session, task, &format!("output:{}:{revision}", task.0))?;
+        Ok(row.and_then(|(_, kind)| match kind.as_str() {
+            "output.complete" => Some(OutputSettlement::Complete),
+            "output.partial" => Some(OutputSettlement::Partial {
+                cause: "outcome unknown".into(),
+            }),
+            "output.mode_ask" => Some(OutputSettlement::Failed {
+                cause: crate::executor::MODE_ASK_REASON.into(),
+            }),
+            "output.mode_deny" => Some(OutputSettlement::Failed {
+                cause: crate::executor::MODE_DENY_REASON.into(),
+            }),
+            "output.denied" => Some(OutputSettlement::Failed {
+                cause: "effect denied".into(),
+            }),
+            "output.stopped" => Some(OutputSettlement::Failed {
+                cause: "work stopped".into(),
+            }),
+            _ => None,
+        }))
     }
 
     /// A dispatch whose receipt was lost blocks the scope until the owner
@@ -9522,12 +9824,21 @@ fn settlement_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSettle
 pub struct StoreLedger<'a> {
     store: &'a mut TaskStore,
     scopes: Vec<String>,
+    pending: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl<'a> StoreLedger<'a> {
     #[must_use]
     pub fn new(store: &'a mut TaskStore, scopes: Vec<String>) -> Self {
-        Self { store, scopes }
+        Self {
+            store,
+            scopes,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn observe_pending(&mut self, pending: &'a std::sync::atomic::AtomicBool) {
+        self.pending = Some(pending);
     }
 }
 
@@ -9561,6 +9872,11 @@ impl Ledger for StoreLedger<'_> {
         self.store
             .begin_send(&scopes, context, manifest)
             .map_err(ledger_error)
+            .inspect(|_| {
+                if let Some(pending) = self.pending {
+                    pending.store(true, std::sync::atomic::Ordering::Release);
+                }
+            })
     }
 
     fn finish_send(
@@ -9571,6 +9887,11 @@ impl Ledger for StoreLedger<'_> {
         self.store
             .finish_send(ticket, outcome)
             .map_err(LedgerError::Store)
+            .inspect(|()| {
+                if let Some(pending) = self.pending {
+                    pending.store(false, std::sync::atomic::Ordering::Release);
+                }
+            })
     }
 
     fn record_reasoning_drop(

@@ -9,12 +9,13 @@
 pub mod linux;
 pub mod macos;
 mod project_edit;
+pub mod terminal_witness;
 
 use crate::config::hex;
 use crate::contracts::{
     EffectClass, ErrorCode, RELEASE_EXECUTABLE_NAME, RELEASE_HELPER_NAME,
-    RELEASE_MANIFEST_MAX_BYTES, RELEASE_MANIFEST_NAME, RELEASE_MANIFEST_SCHEMA, ReleaseActivation,
-    ReleaseArtifact, ReleaseManifest, TaskId,
+    RELEASE_MANIFEST_MAX_BYTES, RELEASE_MANIFEST_NAME, RELEASE_MANIFEST_SCHEMA_V2,
+    ReleaseActivation, ReleaseArtifact, ReleaseManifest, TaskId,
 };
 use crate::policy::{
     AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, canonical_egress_target,
@@ -382,6 +383,7 @@ pub fn launch_resource_scope() -> &'static str {
 #[derive(Debug)]
 pub struct PreparedLaunch {
     payload: Command,
+    direct_payload: bool,
     inherit_env: bool,
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
@@ -435,7 +437,9 @@ impl PreparedLaunch {
     /// Prepares one direct payload with the fixed finite worker bound.
     #[must_use]
     pub fn direct(program: impl AsRef<std::ffi::OsStr>) -> Self {
-        Self::new(program, rivect_sandbox_helper::OwnedProfile::Worker)
+        let mut launch = Self::new(program, rivect_sandbox_helper::OwnedProfile::Worker);
+        launch.direct_payload = true;
+        launch
     }
 
     fn new(
@@ -449,6 +453,7 @@ impl PreparedLaunch {
         };
         Self {
             payload: Command::new(program),
+            direct_payload: false,
             inherit_env: true,
             stdin: None,
             stdout: None,
@@ -460,6 +465,29 @@ impl PreparedLaunch {
             profile,
             capability: None,
         }
+    }
+
+    fn verify_managed_helper(&self) -> Result<(), WorkerError> {
+        let exe =
+            std::env::current_exe().map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+        let Some(root) = exe
+            .parent()
+            .filter(|dir| rivect_sandbox_helper::is_managed_release_dir(dir))
+        else {
+            return Ok(());
+        };
+        if !self.direct_payload
+            && Path::new(self.payload.get_program()) != root.join(RELEASE_HELPER_NAME)
+        {
+            return Err(WorkerError::SandboxUnavailable {
+                reason: "sandbox helper is outside the managed release".to_string(),
+            });
+        }
+        read_release_manifest(root)
+            .and_then(|(manifest, _)| release_artifact(root, RELEASE_HELPER_NAME, &manifest.helper))
+            .map_err(|source| WorkerError::SandboxSpawnFailed {
+                source: std::io::Error::other(source),
+            })
     }
 
     /// Prepares this launch's capability generation through the process-wide
@@ -619,6 +647,7 @@ impl PreparedLaunch {
         if let Some(value) = self.stderr.take() {
             self.payload.stderr(value);
         }
+        self.verify_managed_helper()?;
         let child = self
             .payload
             .spawn()
@@ -795,6 +824,7 @@ impl PreparedLaunch {
         if let Some(value) = self.stderr.take() {
             command.stderr(value);
         }
+        self.verify_managed_helper()?;
         protect()?;
         for artifact in &mut self.artifacts {
             artifact.directory.disable_cleanup(true);
@@ -1723,6 +1753,21 @@ pub struct AdmittedManagedWrite {
     expected_identity: WriteIdentity,
 }
 
+/// Exact visible path and anchored scope/file inodes for a private terminal read.
+#[derive(Debug)]
+pub struct FileReadPin {
+    pub target: PathBuf,
+    pub scope: FileIdentity,
+    pub file: FileIdentity,
+}
+
+/// An attachment additionally binds the bytes displayed to the operator before consent.
+#[derive(Debug)]
+pub struct ImageReadPin {
+    pub location: FileReadPin,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectOutcome {
     Read {
@@ -2171,12 +2216,18 @@ fn read_observation_from(
     profile: &str,
     file: File,
 ) -> Result<ReadObservation, WorkerError> {
+    let identity = FileIdentity::from_metadata(
+        &file
+            .metadata()
+            .map_err(|source| WorkerError::ReadFailed { source })?,
+    );
     let bounded = helper_confined_read(platform, profile, file)?;
     if bounded.len() > macos::READ_MAX_BYTES {
         return Err(WorkerError::TooLarge);
     }
     let digest = hex(&sha2::Sha256::digest(&bounded));
     Ok(ReadObservation {
+        identity,
         bytes: bounded,
         digest,
     })
@@ -3480,10 +3531,26 @@ impl<'a> Executor<'a> {
         request: EffectRequest,
         mode: PermissionMode,
     ) -> Result<AdmittedEffect, ExecutorError> {
+        self.admit_pinned(task_id, request, mode, None)
+    }
+
+    pub(crate) fn admit_pinned(
+        &mut self,
+        task_id: &TaskId,
+        request: EffectRequest,
+        mode: PermissionMode,
+        pin: Option<&FileReadPin>,
+    ) -> Result<AdmittedEffect, ExecutorError> {
         // The one instrumented event (I6): the hook answers before the
         // request is judged, and whatever it leaves behind is judged at
         // this same site — never at a second, weaker one.
         let (request, rewrite) = self.hook_transform(request)?;
+        if let Some(pin) = pin
+            && (rewrite.is_some()
+                || !matches!(&request, EffectRequest::Read { path, .. } if path == &pin.target))
+        {
+            return Err(ExecutorError::ModeDenied);
+        }
         let grant_id = request.grant_id();
         let grant = self.policy.admit(grant_id, request.class())?;
         let target = request.target_path();
@@ -3527,7 +3594,7 @@ impl<'a> Executor<'a> {
                     transformed: rewrite.transformed.display().to_string(),
                 });
             }
-            self.reject_mode(&attempt_id, decision)?;
+            self.reject_mode(&attempt_id, decision, &request, &target)?;
         }
         // Single-flight (INV-023): a permitted read joins its identical
         // open flight, keyed by target, snapshot, scope, and rights. A
@@ -3719,6 +3786,14 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// A preview may consult the configured hook, but cannot create a grant or journal an effect.
+    pub fn preview_image_hook(&self, path: &Path) -> Result<(), ExecutorError> {
+        if self.hook_rewrite(path)?.is_some() {
+            return Err(ExecutorError::ModeDenied);
+        }
+        Ok(())
+    }
+
     /// The `effect.request` consult (AC-076, I6): the one instrumented event,
     /// before admission judges the request. The answer is data — a `deny` or
     /// `stop` refuses the request, and a rewritten path replaces the request's
@@ -3728,17 +3803,24 @@ impl<'a> Executor<'a> {
         &self,
         mut request: EffectRequest,
     ) -> Result<(EffectRequest, Option<HookRewrite>), ExecutorError> {
-        let Some(hooks) = self.hooks else {
+        let Some(field) = request.path_field() else {
             return Ok((request, None));
         };
-        if request.path_field().is_none() {
-            return Ok((request, None));
+        let rewrite = self.hook_rewrite(field)?;
+        if let Some(rewrite) = &rewrite {
+            field.clone_from(&rewrite.transformed);
         }
-        let Some(entry) = hooks.for_event(crate::config::HOOK_EVENT_EFFECT_REQUEST) else {
-            return Ok((request, None));
+        Ok((request, rewrite))
+    }
+
+    fn hook_rewrite(&self, original: &Path) -> Result<Option<HookRewrite>, ExecutorError> {
+        let Some(entry) = self
+            .hooks
+            .and_then(|hooks| hooks.for_event(crate::config::HOOK_EVENT_EFFECT_REQUEST))
+        else {
+            return Ok(None);
         };
-        let original = request.target_path();
-        let mut current = original.clone();
+        let mut current = original.to_owned();
         for _ in 0..HOOK_MAX_DEPTH {
             let answer = run_hook(entry, &current)?;
             match answer.decision {
@@ -3755,20 +3837,11 @@ impl<'a> Executor<'a> {
             };
             current = rewritten;
         }
-        if current == original {
-            return Ok((request, None));
-        }
-        if let Some(field) = request.path_field() {
-            *field = current.clone();
-        }
-        Ok((
-            request,
-            Some(HookRewrite {
-                hook: entry.id(),
-                original,
-                transformed: current,
-            }),
-        ))
+        Ok((current != original).then(|| HookRewrite {
+            hook: entry.id(),
+            original: original.to_owned(),
+            transformed: current,
+        }))
     }
 
     /// Reject tail shared by the mode gates: the ledger reason is
@@ -3777,15 +3850,21 @@ impl<'a> Executor<'a> {
         &mut self,
         attempt_id: &str,
         decision: ModeDecision,
+        request: &EffectRequest,
+        target: &Path,
     ) -> Result<(), ExecutorError> {
-        let reason = mode_reason(decision);
-        let error = if matches!(decision, ModeDecision::Ask) {
-            ExecutorError::ModeAsk
-        } else {
-            ExecutorError::ModeDenied
-        };
-        self.store.attempt_rejected(attempt_id, reason)?;
-        Err(error)
+        if decision == ModeDecision::Ask {
+            self.store.reject_asking_permission(
+                attempt_id,
+                request.class(),
+                request.grant_id(),
+                target,
+            )?;
+            return Err(ExecutorError::ModeAsk);
+        }
+        self.store
+            .attempt_rejected(attempt_id, mode_reason(decision))?;
+        Err(ExecutorError::ModeDenied)
     }
 
     /// Fail-closed mode consult immediately before the effect: a verdict
@@ -3796,7 +3875,7 @@ impl<'a> Executor<'a> {
         let ctx = self.reconsult_context(admitted, target)?;
         let decision = self.policy.decide(target, admitted.request.class(), &ctx);
         if decision != ModeDecision::Allow {
-            self.reject_mode(&admitted.attempt_id, decision)?;
+            self.reject_mode(&admitted.attempt_id, decision, &admitted.request, target)?;
         }
         Ok(())
     }
@@ -3921,6 +4000,46 @@ impl<'a> Executor<'a> {
     /// the OS boundary the worker runs under, never by a pre-worker class
     /// bypass. Ask and deny verdicts fail closed at the gates above.
     pub fn execute(&mut self, admitted: &AdmittedEffect) -> Result<EffectOutcome, ExecutorError> {
+        self.execute_pinned(admitted, None)
+    }
+
+    fn read_pinned(
+        &mut self,
+        admitted: &AdmittedEffect,
+        path: &Path,
+        pin: &FileReadPin,
+        digest: Option<&str>,
+    ) -> Result<ReadObservation, WorkerError> {
+        // Consent requires a fresh physical observation, not another flight member's cached bytes.
+        self.abandon_flight(&admitted.attempt_id);
+        let root = admitted
+            .scope_root
+            .metadata()
+            .map_err(|source| WorkerError::ScopeRootUnavailable { source })?;
+        if path != pin.target
+            || FileIdentity::from_metadata(&root) != pin.scope
+            || macos::target_identity(&admitted.scope_root, path)? != pin.file
+        {
+            return Err(WorkerError::TargetChanged {
+                target: path.to_owned(),
+            });
+        }
+        let read = self.worker.read_once(&admitted.scope_root, path)?;
+        if read.identity != pin.file || digest.is_some_and(|expected| read.digest != expected) {
+            return Err(WorkerError::TargetChanged {
+                target: path.to_owned(),
+            });
+        }
+        Ok(read)
+    }
+
+    pub(crate) fn execute_pinned(
+        &mut self,
+        admitted: &AdmittedEffect,
+        pin: Option<(&FileReadPin, Option<&str>)>,
+    ) -> Result<EffectOutcome, ExecutorError> {
+        self.store
+            .link_procedure_source(&admitted.task_id, &admitted.attempt_id)?;
         self.execute_gates(admitted)?;
         let effect = match &admitted.request {
             EffectRequest::Read { path, .. } => {
@@ -3928,7 +4047,11 @@ impl<'a> Executor<'a> {
                 // takes the shared observation instead of charging its
                 // own physical read; the first member to execute
                 // performs the one read and settles the flight.
-                self.read_member(admitted, path).map(read_result)
+                match pin {
+                    Some((pin, digest)) => self.read_pinned(admitted, path, pin, digest),
+                    None => self.read_member(admitted, path),
+                }
+                .map(read_result)
             }
             EffectRequest::Write { path, bytes, .. } => admitted
                 .expected_identity
@@ -4009,9 +4132,7 @@ impl<'a> Executor<'a> {
         binding: &crate::procedure::SegmentBinding,
         mode: PermissionMode,
     ) -> Result<crate::procedure::StepOutcome, ExecutorError> {
-        use crate::procedure::{
-            ProcedureError, StepOutcome, StepStanding, StopCause, settled_result,
-        };
+        use crate::procedure::{ProcedureError, StepOutcome, StepStanding, StopCause};
         let position = run.cursor + 1;
         let step = segment
             .step(position)
@@ -4022,9 +4143,11 @@ impl<'a> Executor<'a> {
             })?;
         let request = binding
             .request(position)
-            .ok_or(ProcedureError::UnboundParameter { position })?
-            .clone();
-        let admitted = match self.admit(task_id, request, mode) {
+            .ok_or(ProcedureError::UnboundParameter { position })?;
+        if !step.accepts(request) || segment.task_id != task_id.0 || run.task_id != task_id.0 {
+            return Err(ProcedureError::IncompatibleOperation { position }.into());
+        }
+        let admitted = match self.admit(task_id, request.clone(), mode) {
             Ok(admitted) => admitted,
             // The effect-time re-check is the admission's own: a right revoked
             // before this step refuses here exactly as it would on a first run.
@@ -4033,6 +4156,12 @@ impl<'a> Executor<'a> {
             }
             Err(error) => return Err(error),
         };
+        if admitted.request != *request {
+            self.abandon_flight(&admitted.attempt_id);
+            self.store
+                .attempt_rejected(&admitted.attempt_id, "procedure binding changed")?;
+            return Err(ProcedureError::IncompatibleOperation { position }.into());
+        }
         let attempt_id = admitted.attempt_id.clone();
         // The prepared row is the run's durable record of this step, and it
         // names the attempt that performs it: the step's own effect is then
@@ -4083,7 +4212,7 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(StepOutcome::Settled {
-            result: settled_result(&step.tool, detail.as_deref()),
+            result: detail.unwrap_or_default(),
             attempt_id,
         })
     }
@@ -4101,6 +4230,8 @@ impl<'a> Executor<'a> {
                 class: admitted.request.class(),
             });
         }
+        self.store
+            .link_procedure_source(&admitted.task_id, &admitted.attempt_id)?;
         self.execute_gates(admitted)?;
         let EffectRequest::Read { path, .. } = &admitted.request else {
             unreachable!("internal error: read class checked above")
@@ -6807,7 +6938,10 @@ fn hash_file(path: &Path) -> std::io::Result<String> {
             "hashed path is not a regular file",
         ));
     }
-    let mut file = file;
+    hash_open_file(file)
+}
+
+fn hash_open_file(mut file: File) -> std::io::Result<String> {
     let mut hasher = sha2::Sha256::new();
     std::io::copy(&mut file, &mut hasher)?;
     Ok(hex(&hasher.finalize()))
@@ -6820,6 +6954,10 @@ fn hash_file(path: &Path) -> std::io::Result<String> {
 /// The error kinds stay raw: an absent file is distinguishable from an
 /// unreadable one at the call sites that need it.
 fn read_inventory_file(path: &Path, rel: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded_inventory_file(path, rel, INVENTORY_FILE_MAX_BYTES)
+}
+
+fn read_bounded_inventory_file(path: &Path, rel: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = File::options()
@@ -6849,7 +6987,7 @@ fn read_inventory_file(path: &Path, rel: &Path) -> std::io::Result<Vec<u8>> {
             ),
         ));
     }
-    if meta.len() > INVENTORY_FILE_MAX_BYTES {
+    if meta.len() > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
             format!(
@@ -6861,12 +6999,12 @@ fn read_inventory_file(path: &Path, rel: &Path) -> std::io::Result<Vec<u8>> {
     // The read itself is take-bounded: growth between the fstat and the
     // read refuses here instead of reading unbounded (the same one-fd
     // discipline as the leaf reads).
-    let mut limited = file.take(INVENTORY_FILE_MAX_BYTES + 1);
+    let mut limited = file.take(limit + 1);
     let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
     limited
         .read_to_end(&mut bytes)
         .map_err(|source| std::io::Error::other(format!("read of {}: {source}", rel.display())))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > INVENTORY_FILE_MAX_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
             format!(
@@ -6880,14 +7018,8 @@ fn read_inventory_file(path: &Path, rel: &Path) -> std::io::Result<Vec<u8>> {
 
 /// Verifies one installed release bundle before anything activates it.
 ///
-/// The inventory is exact — [`RELEASE_EXECUTABLE_NAME`],
-/// [`RELEASE_HELPER_NAME`] and [`RELEASE_MANIFEST_NAME`] and nothing else — so
-/// a checkout tree, a stray resource or a missing half never reads as an
-/// authentic candidate. The manifest is bounded and strictly parsed, both
-/// artifact names and digest shapes are checked, and each artifact's actual
-/// bytes must hash to the digest the manifest records. The returned
-/// [`ReleaseActivation`] carries the manifest's own byte digest, which is the
-/// identity installed producers bind to.
+/// The installer receipt binds the exact manifest bytes. Its inventory binds
+/// the core, helper, native UI and library. Extra files are refused.
 ///
 /// Nothing here writes: a refusal leaves the bundle and any previous release
 /// exactly as they were.
@@ -6904,6 +7036,151 @@ fn read_inventory_file(path: &Path, rel: &Path) -> std::io::Result<Vec<u8>> {
 /// [`ReleaseError::NotExecutable`] when an artifact does not match its
 /// manifest entry.
 pub fn verify_release_bundle(root: &Path) -> Result<ReleaseActivation, ReleaseError> {
+    let (manifest, manifest_sha256) = read_release_manifest(root)?;
+    verify_release_inventory(root, manifest, manifest_sha256)
+}
+
+fn verified_terminal_client(root: &Path, pin: &str) -> Result<PathBuf, ReleaseError> {
+    let (manifest, digest) = read_release_manifest(root)?;
+    if manifest.ui.as_ref().is_none_or(|ui| ui.sha256 != pin) {
+        return Err(ReleaseError::Digest {
+            name: "libexec/rivect-tui",
+        });
+    }
+    verify_release_inventory(root, manifest, digest)?;
+    Ok(root.join("libexec/rivect-tui"))
+}
+
+fn terminal_image(pin: &str) -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let root = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing release directory"))?;
+    verified_terminal_client(root, pin).map_err(std::io::Error::other)
+}
+
+fn terminal_command(image: PathBuf) -> Command {
+    let mut command = Command::new(image);
+    command.env_clear();
+    if ["TMUX", "STY", "ZELLIJ"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+    {
+        command.env("RIVECT_HOST_MUX", "1");
+    }
+    for key in [
+        "HOME",
+        "PATH",
+        "TMPDIR",
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "COLORFGBG",
+        "RIVECT_THEME",
+        "RIVECT_REDUCE_MOTION",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+}
+
+/// Replaces the interactive CLI with its paired UI. A successful exec never returns.
+pub fn exec_terminal_client(pin: &str, args: &[&str], root: Option<&Path>) -> std::io::Error {
+    let mut command = match terminal_image(pin) {
+        Ok(image) => terminal_command(image),
+        Err(error) => return error,
+    };
+    if let Some(root) = root {
+        command.env("RIVECT_DATA_ROOT", root);
+    }
+    command.arg("--terminal-client").args(args).exec()
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_parent_image(pid: rustix::process::Pid) -> std::io::Result<PathBuf> {
+    use security_framework::os::macos::code_signing::{Flags, GuestAttributes, SecCode};
+
+    let mut guest = GuestAttributes::new();
+    guest.set_pid(pid.as_raw_pid());
+    let requirement = option_env!("RIVECT_BUNDLED_UI_REQUIREMENT")
+        .ok_or_else(|| std::io::Error::other("terminal client has no code identity"))?
+        .parse()
+        .map_err(std::io::Error::other)?;
+    let code = SecCode::copy_guest_with_attribues(None, &guest, Flags::NONE)
+        .map_err(std::io::Error::other)?;
+    code.check_validity(Flags::NONE, &requirement)
+        .map_err(std::io::Error::other)?;
+    code.path(Flags::NONE)
+        .map_err(std::io::Error::other)?
+        .to_path()
+        .ok_or_else(|| std::io::Error::other("terminal parent has no executable path"))
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_parent_image(pid: rustix::process::Pid) -> std::io::Result<PathBuf> {
+    let proc_exe = format!("/proc/{pid}/exe");
+    let digest = hash_open_file(File::open(&proc_exe)?)?;
+    if option_env!("RIVECT_BUNDLED_UI_SHA256") != Some(digest.as_str()) {
+        return Err(std::io::Error::other("terminal parent image changed"));
+    }
+    std::fs::read_link(proc_exe)
+}
+
+/// Verifies the live process parent against the executable pinned into this release.
+///
+/// # Errors
+/// Refuses a disconnected parent, a different executable, or a changed release.
+pub fn paired_terminal_parent(pin: &str) -> std::io::Result<PathBuf> {
+    let image = terminal_image(pin)?;
+    let parent = rustix::process::getppid()
+        .ok_or_else(|| std::io::Error::other("terminal client disconnected"))?;
+    if terminal_parent_image(parent)?.canonicalize()? != image
+        || rustix::process::getppid() != Some(parent)
+    {
+        return Err(std::io::Error::other(
+            "requester is not the paired terminal client",
+        ));
+    }
+    Ok(image)
+}
+
+/// Launches one independent decision witness on the controlling terminal.
+///
+/// # Errors
+/// Returns an error if the release, controlling terminal or process cannot be opened.
+pub fn spawn_terminal_witness(pin: &str, channel: std::os::fd::OwnedFd) -> std::io::Result<Child> {
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
+    // A session has at most one controlling terminal. A separate PTY on
+    // stderr or a background job may neither display nor authorize this answer.
+    let sid = rustix::process::getsid(None)?;
+    let group = rustix::process::getpgrp();
+    let stderr = std::io::stderr();
+    if rustix::termios::tcgetsid(&tty)? != sid
+        || rustix::termios::tcgetsid(&stderr)? != sid
+        || rustix::termios::tcgetpgrp(&tty)? != group
+        || rustix::termios::tcgetpgrp(&stderr)? != group
+    {
+        return Err(std::io::Error::other(
+            "decision requires the foreground controlling terminal",
+        ));
+    }
+    terminal_command(paired_terminal_parent(pin)?)
+        .arg("--decision-witness")
+        .stdin(tty.try_clone()?)
+        .stdout(tty)
+        .stderr(File::from(channel))
+        .spawn()
+}
+
+fn read_release_manifest(root: &Path) -> Result<(ReleaseManifest, String), ReleaseError> {
     match std::fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
@@ -6918,61 +7195,111 @@ pub fn verify_release_bundle(root: &Path) -> Result<ReleaseActivation, ReleaseEr
         }
         Err(source) => return Err(ReleaseError::Inventory { source }),
     }
-    release_inventory(root)?;
     let manifest_path = root.join(RELEASE_MANIFEST_NAME);
-    let manifest_bytes = read_inventory_file(&manifest_path, Path::new(RELEASE_MANIFEST_NAME))
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::FileTooLarge {
-                ReleaseError::ManifestTooLarge {
-                    limit: RELEASE_MANIFEST_MAX_BYTES,
-                }
-            } else {
-                ReleaseError::Manifest { source }
+    let manifest_bytes = read_bounded_inventory_file(
+        &manifest_path,
+        Path::new(RELEASE_MANIFEST_NAME),
+        RELEASE_MANIFEST_MAX_BYTES,
+    )
+    .map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            ReleaseError::Missing {
+                name: RELEASE_MANIFEST_NAME,
             }
-        })?;
-    if u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX) > RELEASE_MANIFEST_MAX_BYTES {
-        return Err(ReleaseError::ManifestTooLarge {
-            limit: RELEASE_MANIFEST_MAX_BYTES,
-        });
-    }
+        } else if source.kind() == std::io::ErrorKind::FileTooLarge {
+            ReleaseError::ManifestTooLarge {
+                limit: RELEASE_MANIFEST_MAX_BYTES,
+            }
+        } else {
+            ReleaseError::Manifest { source }
+        }
+    })?;
+    // The bounded read rejects both oversized files and growth after opening.
     let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|source| ReleaseError::ManifestJson { source })?;
-    if manifest.schema_version != RELEASE_MANIFEST_SCHEMA {
+    if manifest.schema_version != RELEASE_MANIFEST_SCHEMA_V2 {
         return Err(ReleaseError::Schema {
             found: manifest.schema_version,
-            expected: RELEASE_MANIFEST_SCHEMA,
+            expected: RELEASE_MANIFEST_SCHEMA_V2,
         });
     }
+    let manifest_sha256 = hex(&sha2::Sha256::digest(&manifest_bytes));
+    let receipt = root.with_added_extension("manifest.sha256");
+    match read_bounded_inventory_file(&receipt, Path::new("manifest receipt"), 65) {
+        Ok(bytes) if bytes.strip_suffix(b"\n") == Some(manifest_sha256.as_bytes()) => {}
+        Ok(_) => {
+            return Err(ReleaseError::Digest {
+                name: "manifest receipt",
+            });
+        }
+        Err(source) => {
+            return Err(ReleaseError::Artifact {
+                name: "manifest receipt",
+                source,
+            });
+        }
+    }
+    Ok((manifest, manifest_sha256))
+}
+
+fn verify_release_inventory(
+    root: &Path,
+    manifest: ReleaseManifest,
+    manifest_sha256: String,
+) -> Result<ReleaseActivation, ReleaseError> {
+    release_inventory(
+        root,
+        &[
+            RELEASE_EXECUTABLE_NAME,
+            RELEASE_HELPER_NAME,
+            RELEASE_MANIFEST_NAME,
+            "libexec",
+        ],
+    )?;
+    let (Some(ui), Some(library)) = (&manifest.ui, &manifest.library) else {
+        return Err(ReleaseError::ManifestInventory);
+    };
+    let libexec = root.join("libexec");
+    let metadata =
+        std::fs::symlink_metadata(&libexec).map_err(|source| ReleaseError::Inventory { source })?;
+    if !metadata.is_dir() {
+        return Err(ReleaseError::NotDirectory {
+            path: libexec.display().to_string(),
+        });
+    }
+    let (name, relative) = if cfg!(target_os = "macos") {
+        ("libopentui.dylib", "libexec/libopentui.dylib")
+    } else {
+        ("libopentui.so", "libexec/libopentui.so")
+    };
+    release_inventory(&libexec, &["rivect-tui", name])?;
+    release_artifact(root, "libexec/rivect-tui", ui)?;
+    release_artifact(root, relative, library)?;
     release_artifact(root, RELEASE_EXECUTABLE_NAME, &manifest.executable)?;
     release_artifact(root, RELEASE_HELPER_NAME, &manifest.helper)?;
     Ok(ReleaseActivation {
-        manifest_sha256: hex(&sha2::Sha256::digest(&manifest_bytes)),
+        manifest_sha256,
         build: manifest.build,
         executable_sha256: manifest.executable.sha256,
         helper_sha256: manifest.helper.sha256,
     })
 }
 
-/// The exact three-name inventory, refused before any digest is read.
-fn release_inventory(root: &Path) -> Result<(), ReleaseError> {
+fn release_inventory(root: &Path, expected: &[&'static str]) -> Result<(), ReleaseError> {
     let entries = std::fs::read_dir(root).map_err(|source| ReleaseError::Inventory { source })?;
     for entry in entries {
         let entry = entry.map_err(|source| ReleaseError::Inventory { source })?;
         let name = entry.file_name();
-        if name != std::ffi::OsStr::new(RELEASE_EXECUTABLE_NAME)
-            && name != std::ffi::OsStr::new(RELEASE_HELPER_NAME)
-            && name != std::ffi::OsStr::new(RELEASE_MANIFEST_NAME)
+        if !expected
+            .iter()
+            .any(|item| name == std::ffi::OsStr::new(item))
         {
             return Err(ReleaseError::UnexpectedEntry {
                 name: name.to_string_lossy().into_owned(),
             });
         }
     }
-    for name in [
-        RELEASE_EXECUTABLE_NAME,
-        RELEASE_HELPER_NAME,
-        RELEASE_MANIFEST_NAME,
-    ] {
+    for &name in expected {
         match std::fs::symlink_metadata(root.join(name)) {
             Ok(_) => {}
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -7009,7 +7336,7 @@ fn release_artifact(
         return Err(ReleaseError::Digest { name: expected });
     }
     #[cfg(unix)]
-    {
+    if !expected.starts_with("libexec/libopentui.") {
         use std::os::unix::fs::PermissionsExt as _;
         let metadata = std::fs::metadata(&path).map_err(|source| ReleaseError::Artifact {
             name: expected,
@@ -7056,7 +7383,9 @@ pub enum ReleaseError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("release manifest schema {found} is not {expected}")]
+    #[error("release artifacts do not match the manifest schema")]
+    ManifestInventory,
+    #[error("release manifest schema {found} is unsupported (latest {expected})")]
     Schema { found: u32, expected: u32 },
     #[error("release manifest names {found} where {expected} belongs")]
     ArtifactName {
@@ -7094,6 +7423,7 @@ impl ReleaseError {
             | Self::UnexpectedEntry { .. }
             | Self::ManifestTooLarge { .. }
             | Self::ManifestJson { .. }
+            | Self::ManifestInventory
             | Self::ArtifactName { .. }
             | Self::DigestShape { .. }
             | Self::Digest { .. }

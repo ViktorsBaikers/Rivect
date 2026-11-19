@@ -628,6 +628,8 @@ fn packaged_tui_slash_image_sends_the_png_and_keeps_the_requested_read_local() {
     .expect("config");
 
     let mut command = support::pty_command(bundle.join("rivect"));
+    command.env("HOME", root.path());
+    command.env("TERM", "xterm-256color");
     command.arg("--data-root");
     command.arg(&data);
     command.cwd(&cwd);
@@ -637,45 +639,37 @@ fn packaged_tui_slash_image_sends_the_png_and_keeps_the_requested_read_local() {
         pty.wait_for(b"\x1b[?1049h", WAIT).expect("pty read"),
         "the packaged TUI enters the alternate screen"
     );
-    pty.send(b"/image image.png\r").expect("pty send");
-    let attached = support::wait_for_screen_text(
-        &pty,
-        24,
-        80,
-        &format!("image png {} bytes", PNG.len()),
-        WAIT,
-    )
-    .expect("attachment line");
-    assert!(
-        attached.contains(&format!("image png {} bytes", PNG.len())),
-        "the composer names the attached media and size: {attached}"
-    );
-    pty.send(b"/image\r").expect("pty send bare image");
-    let cleared =
-        support::wait_for_screen_text(&pty, 24, 80, "image detached", WAIT).expect("clear line");
-    assert!(
-        cleared.contains("image detached"),
-        "bare /image clears the attachment: {cleared}"
-    );
-    pty.send(b"/image image.png\r").expect("pty send again");
+    support::visible_text(&pty, 24, 80, "Message → Main", WAIT);
+    let attached = format!("image png {} bytes", PNG.len());
+    pty.send(b"/image image.png\r").expect("attach image");
+    support::visible_text(&pty, 24, 80, &attached, WAIT);
+    pty.send(b"/image\r").expect("detach image");
+    support::visible_text(&pty, 24, 80, "Image detached.", WAIT);
+    pty.send(b"/help\r").expect("replace attachment output");
+    let help = support::visible_text(&pty, 24, 80, "Commands:", WAIT);
+    assert!(!help.contains(&attached), "{help}");
+    pty.send(b"/image image.png\r").expect("reattach image");
+    let frame = support::visible_text(&pty, 24, 80, &attached, WAIT);
+    assert!(!frame.contains("Image detached."), "{frame}");
 
-    pty.send("run the vision task\r".as_bytes())
-        .expect("pty send");
-    let card =
-        support::wait_for_screen_text(&pty, 24, 80, "awaiting decision", WAIT).expect("start card");
-    assert!(card.contains("awaiting decision"), "the start card opens");
-    pty.pump_for(Duration::from_secs(2))
+    pty.send(b"/task run the vision task\r")
+        .expect("submit project task");
+    let card = support::visible_text(&pty, 24, 80, "> 1. Begin", WAIT);
+    assert!(card.contains("awaiting decision"), "{card}");
+    pty.pump_for(Duration::from_millis(250))
         .expect("start consent floor");
-    pty.send(b"\r").expect("begin");
-    let share = support::wait_for_screen_text(&pty, 24, 80, "Share inventory.txt", WAIT)
-        .expect("read disclosure card");
-    assert!(share.contains("Share inventory.txt"), "{share}");
-    pty.pump_for(Duration::from_secs(2))
+    support::confirm_witness(&mut pty);
+    support::visible_text(&pty, 24, 80, "Share inventory.txt", WAIT);
+    let share = support::visible_text(&pty, 24, 80, "focus 1/", WAIT);
+    assert!(
+        share.contains("Share inventory.txt") && share.contains("> 1. Keep local"),
+        "{share}"
+    );
+    assert_eq!(peer.posts(), 1, "file bytes have not been shared");
+    pty.pump_for(Duration::from_millis(250))
         .expect("disclosure consent floor");
-    pty.send(b"\r").expect("keep the file local");
-    let local = support::wait_for_screen_text(&pty, 24, 80, "file contents kept local", WAIT)
-        .expect("read outcome");
-    assert!(local.contains("file contents kept local"), "{local}");
+    support::confirm_witness(&mut pty);
+    support::visible_text(&pty, 24, 80, "file contents kept local", WAIT);
     pty.send(b"\x1b").expect("pty send exit");
     assert_eq!(pty.wait_exit(WAIT).expect("pty wait"), Some(0));
     let db = data.join("runtime").join("rivect.db");

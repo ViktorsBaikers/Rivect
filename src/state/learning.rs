@@ -3012,20 +3012,12 @@ fn rebind_learning_identities_on(
     })
 }
 
-/// Retention (INV-010) for the saved segments: a derived record of an executed
-/// plan, so beyond the newest window a segment leaves with its runs.
+/// Retained derived segments, excluding those pinned by a prepared effect or receipt mismatch.
 pub const PROCEDURE_SEGMENT_RETENTION: usize = 32;
 
-/// Retention (INV-010) for the runs: terminal runs are derived records and
-/// leave beyond the named window; a run still running is never pruned. Inside
-/// the window a terminal run keeps its cursor, its stop and its step rows, so a
-/// resume neither re-issues a settled effect nor takes a stop for a fresh start.
-/// Beyond it every terminal run leaves, a stopped one included: losing the
-/// completed row leaves nothing to refuse, and losing a stopped run drops the
-/// cursor its resume continued from. Neither row is remembered outside the
-/// window, so with no completed row left to refuse the segment, a plain
-/// [`RunStart::Resume`] opens a new run at the first step and issues the effects
-/// that already ran again.
+/// Retained terminal runs. A prepared effect or receipt mismatch pins its safety record.
+/// For ordinary completed runs, eviction removes the record that prevents a plain
+/// [`RunStart::Resume`] from starting the sequence again.
 pub const PROCEDURE_RUN_RETENTION: usize = 16;
 
 fn procedure_serialization(error: serde_json::Error) -> StoreError {
@@ -3116,10 +3108,112 @@ impl StoredRun {
 }
 
 impl TaskStore {
-    /// Derives the task's segment from the plan that already ran and saves it
-    /// (AC-053): the current selection, the plan revision recorded under it and
-    /// the rows its handlers closed. Re-deriving the same plan revision returns
-    /// the saved segment, so a run that is already following it keeps its steps.
+    /// Link an executor dispatch, not a semantic action with the same effect class.
+    pub(crate) fn link_procedure_source(&mut self, task: &TaskId, attempt: &str) -> Result<()> {
+        self.conn_write()?
+            .execute(
+                sql::LINK_PROCEDURE_SOURCE,
+                params![
+                    attempt,
+                    task.0,
+                    i64::try_from(crate::procedure::MAX_SEGMENT_STEPS).map_err(storage)?
+                ],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    fn recorded_effect_steps(&self, task: &TaskId, revision: u64) -> Result<Vec<SegmentStep>> {
+        use crate::procedure::MAX_SEGMENT_STEPS;
+        let mut stmt = self
+            .conn()?
+            .prepare_cached(sql::PROCEDURE_SOURCES)
+            .map_err(storage)?;
+        let mut rows = stmt
+            .query(params![
+                task.0,
+                stored_u64(revision)?,
+                i64::try_from(MAX_SEGMENT_STEPS + 1).map_err(storage)?
+            ])
+            .map_err(storage)?;
+        let mut steps = Vec::new();
+        let mut inputs = std::collections::BTreeMap::new();
+        while let Some(row) = rows.next().map_err(storage)? {
+            let class: String = row.get(0).map_err(storage)?;
+            let state: String = row.get(1).map_err(storage)?;
+            let result: Option<String> = row.get(2).map_err(storage)?;
+            let tool = match class.as_str() {
+                "read" => "read_file",
+                "write" => "write_file",
+                _ => return Ok(Vec::new()),
+            };
+            if state != "confirmed" || steps.len() == MAX_SEGMENT_STEPS {
+                return Ok(Vec::new());
+            }
+            let position = steps.len() as u64 + 1;
+            let target: String = row.get(3).map_err(storage)?;
+            if target.contains(char::REPLACEMENT_CHARACTER) {
+                return Ok(Vec::new());
+            }
+            let step = SegmentStep {
+                position,
+                tool: tool.to_string(),
+                expected_output: result.unwrap_or_default(),
+                source_input: Some(*inputs.entry(target).or_insert(position)),
+            };
+            if !step.accepts_receipt(&step.expected_output) {
+                return Ok(Vec::new());
+            }
+            steps.push(step);
+        }
+        Ok(steps)
+    }
+
+    fn check_procedure_receipt_stop(
+        &self,
+        task_id: &str,
+    ) -> std::result::Result<(), ProcedureError> {
+        let run = self
+            .conn()?
+            .query_row(sql::RECEIPT_STOP_FOR_TASK, params![task_id], |r| r.get(0))
+            .optional()
+            .map_err(storage)?;
+        match run {
+            Some(run_id) => Err(ProcedureError::ReceiptMismatch { run_id }),
+            None => Ok(()),
+        }
+    }
+
+    /// Resolve the landed receipt before an ordinary dispatch can bypass its segment.
+    pub(crate) fn recover_procedure_receipt(
+        &mut self,
+        task: &TaskId,
+    ) -> std::result::Result<(), ProcedureError> {
+        self.check_procedure_receipt_stop(&task.0)?;
+        let landed: Option<String> = self
+            .conn()?
+            .query_row(sql::LANDED_PROCEDURE_RUN_FOR_TASK, params![task.0], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(storage)?;
+        if let Some(run_id) = landed {
+            let run = self.procedure_run(&run_id)?;
+            self.reopen_procedure_run(run)?;
+            let prepared = self
+                .prepared_procedure_step(&run_id)?
+                .ok_or_else(|| corrupt_column("prepared step", &run_id))?;
+            let run = self.settle_procedure_step(&run_id, &prepared.settlement())?;
+            if run.state == RunState::Stopped {
+                return Err(ProcedureError::ReceiptMismatch { run_id });
+            }
+        }
+        Ok(())
+    }
+
+    /// Records a segment of the executed plan. Only a complete bounded trace of
+    /// confirmed executor operations can replay; without it the semantic rows
+    /// stay available as history. An existing template is immutable.
     ///
     /// # Errors
     /// Returns [`ProcedureError::PlanMissing`] when the task has no plan
@@ -3142,13 +3236,17 @@ impl TaskStore {
                     task_id: task_id.0.clone(),
                 })?;
         let rows = self.plan_obligations(task_id)?;
-        let template = SegmentTemplate::derive(
+        let mut template = SegmentTemplate::derive(
             task_id,
             selection.revision,
             &plan,
             &rows,
             crate::executor::backend(),
         )?;
+        let effects = self.recorded_effect_steps(task_id, plan.revision)?;
+        if !effects.is_empty() {
+            template.steps = effects;
+        }
         let steps = serde_json::to_string(&template.steps).map_err(procedure_serialization)?;
         let tx = self
             .conn_mut()?
@@ -3256,6 +3354,7 @@ impl TaskStore {
         snapshot: &SegmentSnapshot,
         open: RunStart,
     ) -> std::result::Result<ProcedureRun, ProcedureError> {
+        self.check_procedure_receipt_stop(&segment.task_id)?;
         segment.prepare(snapshot)?;
         if let Some(run) = self.resumable_procedure_run(&segment.procedure_id, segment.version)? {
             return self.reopen_procedure_run(run);
@@ -3324,7 +3423,13 @@ impl TaskStore {
             .conn_write()?
             .execute(
                 sql::PREPARE_PROCEDURE_STEP,
-                params![run.run_id, stored_u64(position)?, tool, attempt_id],
+                params![
+                    run.run_id,
+                    stored_u64(position)?,
+                    tool,
+                    attempt_id,
+                    stored_u64(crate::procedure::PROCEDURE_SCHEMA_VERSION)?
+                ],
             )
             .map_err(storage)?;
         if prepared == 0 {
@@ -3424,6 +3529,10 @@ impl TaskStore {
         step: &SettledStep,
     ) -> std::result::Result<ProcedureRun, ProcedureError> {
         let run = self.procedure_run(run_id)?;
+        let template = self.procedure_segment(&run.procedure_id)?;
+        let matches = template.step(step.position).is_some_and(|recorded| {
+            recorded.tool == step.tool && recorded.accepts_receipt(&step.result)
+        });
         let tx = self
             .conn_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3451,6 +3560,17 @@ impl TaskStore {
                 position: step.position,
                 cursor: run.cursor,
             });
+        }
+        if !matches {
+            let stop =
+                crate::procedure::stop_decision(&crate::procedure::StopCause::ReceiptMismatch {
+                    position: step.position,
+                });
+            tx.execute(
+                sql::STOP_PROCEDURE_RUN,
+                params![run_id, stop.trigger.as_str(), stop.detail],
+            )
+            .map_err(storage)?;
         }
         tx.commit().map_err(storage)?;
         self.procedure_run(run_id)

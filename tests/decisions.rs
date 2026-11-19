@@ -13,7 +13,6 @@
 
 mod support;
 
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rivect::actions::{
     ASSESS_PLAN, ActionContext, ActionError, ActionInput, ActionOutcome, ActionRegistry,
     CHALLENGE_DIRECTION, DECISION_OPTION_SLOTS, DECISIONS_CONTROL, DESIGN_CONTRACTS,
@@ -26,19 +25,13 @@ use rivect::contracts::{
     KNOWN_READY_OPTION, OptionId, Question, QuestionOption, SessionId, TASK_START_OPTION,
     TEXT_MAX_BYTES, TaskId,
 };
-use rivect::policy::ModeDecision;
 use rivect::state::{ConflictCause, InvalidCause, Missing, StoreError};
 use rivect::tools::{LocalKind, describe, local_command_kind};
-use rivect::ui::{
-    DECISION_ANSWERED_NOTE, DECISION_DRAFT_LIMIT_NOTE, DECISION_LEFT_NOTE,
-    DECISION_PASTE_REFUSED_NOTE, DECISION_SETTLED_NOTE, DECISION_TITLE, DecisionPanel, PANEL_TITLE,
-    PermissionPanel, handle_decision_event, initial_view, render,
-};
 use serde_json::json;
 use std::time::Duration;
 use support::{
     corpus_answer_custom, corpus_answer_option, corpus_decisions_control, corpus_question_current,
-    corpus_steer, decision_input, open_world, rivect_binary, spawn_pty,
+    corpus_steer, decision_input, open_world,
 };
 
 // ----- support: shared world + context builders -----
@@ -4616,820 +4609,956 @@ fn decisions_control_lost_receipt_conflicts_stale_and_reheals() {
     );
 }
 
-// ----- decision card (unit seam) -----
+// Installed renderer, real owner, disposable offline state.
+const CARD_WAIT: Duration = Duration::from_secs(10);
+const CARD_FLOOR: Duration = Duration::from_millis(200);
+const DECISION_UNANSWERED: &str = "Unanswered; question stays pending";
 
-fn card_view(
-    world: &mut support::World,
+struct CardPty {
+    terminal: support::PtySession,
+    question: Question,
+    session: SessionId,
+    permission: Option<Question>,
+    parser: vt100::Parser,
+    parsed: usize,
+}
+
+impl CardPty {
+    fn open(rows: u16, cols: u16, permission: bool) -> Self {
+        let mut card = Self::at_prompt(rows, cols, permission);
+        card.resume();
+        card.see("focus 1/6");
+        card.wait_consent_floor();
+        card
+    }
+
+    fn at_prompt(rows: u16, cols: u16, permission: bool) -> Self {
+        let dir = tempfile::tempdir().expect("isolated home");
+        let home = dir.path();
+        let root = home.join(".rivect");
+        std::fs::create_dir(&root).expect("data root");
+        let mut world = support::open_world_at(
+            &root,
+            Some(concat!(
+                "config_version = 1\n[connections.loopback]\nkind = \"local\"\nendpoint = \"\"\n",
+                "[models.defaults]\nmodel = { mode = \"fixed\", connection = \"loopback\", model_id = \"offline\" }\n",
+                "effort = { mode = \"fixed\", value = \"medium\" }\nfallback = { mode = \"off\" }\n",
+            )),
+        );
+        let session = world.open_session("decision-pty");
+        let permission = permission.then(|| {
+            let task = world.create_task(&session, "park-permission");
+            let mut q = Question::fixture(&task, 1);
+            q.question_id.0 = format!("write-file:{}", q.question_id.0);
+            assert!(q.is_permission());
+            world
+                .runtime
+                .store_writer()
+                .publish_question(&session, &q)
+                .expect("park permission");
+            q
+        });
+        let task = world.create_task(&session, "decision-task");
+        let question = world.publish(&session, &task);
+        drop(world);
+        let mut cmd = support::pty_command(support::release::baseline_bundle().join("rivect"));
+        cmd.env_clear();
+        cmd.env("HOME", home);
+        cmd.env("TMPDIR", home);
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.env("TERM", "xterm-256color");
+        cmd.cwd(home);
+        let terminal =
+            support::PtySession::spawn(cmd, rows, cols, dir, root).expect("installed PTY");
+        let mut card = Self {
+            terminal,
+            question,
+            session,
+            permission,
+            parser: vt100::Parser::new(rows, cols, 0),
+            parsed: 0,
+        };
+        card.see("Message");
+        card
+    }
+
+    fn resume(&mut self) {
+        self.send(format!("/resume {}\r", self.session.0).as_bytes());
+    }
+
+    fn ingest(&mut self) {
+        let stream = self.terminal.collected().expect("PTY output");
+        self.parser.process(&stream[self.parsed..]);
+        self.parsed = stream.len();
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.ingest();
+        self.terminal.resize(rows, cols).expect("live PTY resize");
+        self.parser.screen_mut().set_size(rows, cols);
+    }
+
+    fn frame(&mut self) -> String {
+        self.ingest();
+        let screen = self.parser.screen();
+        screen
+            .rows(0, screen.size().1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn see(&mut self, needle: &str) -> String {
+        self.until(needle, |frame| {
+            frame.contains(needle) || support::squashed(frame).contains(needle)
+        })
+    }
+
+    fn until(&mut self, expected: &str, accepts: impl Fn(&str) -> bool) -> String {
+        let deadline = std::time::Instant::now() + CARD_WAIT;
+        loop {
+            let frame = self.frame();
+            if accepts(&frame) {
+                return frame;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing {expected}: {frame}"
+            );
+            self.terminal
+                .pump_for(Duration::from_millis(20))
+                .expect("frame");
+        }
+    }
+
+    fn send(&mut self, input: &[u8]) {
+        self.terminal.send(input).expect("PTY input");
+    }
+
+    fn paste(&mut self, text: &str) {
+        self.send(b"\x1b[200~");
+        self.send(text.as_bytes());
+        self.send(b"\x1b[201~");
+    }
+
+    fn wait_consent_floor(&mut self) {
+        self.terminal
+            .pump_for(CARD_FLOOR + Duration::from_millis(50))
+            .expect("visible choice consent floor");
+    }
+
+    fn focus(&mut self, from: usize, to: usize) {
+        for offset in 1..=(to + 6 - from) % 6 {
+            self.send(b"\x1b[B");
+            self.see(&format!("focus {}/6", (from + offset - 1) % 6 + 1));
+        }
+        self.wait_consent_floor();
+    }
+
+    fn edit(&mut self) {
+        self.focus(1, 6);
+        self.send(b"\r");
+        self.see("Enter newline");
+    }
+
+    fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(
+            self.terminal.data_root().join("runtime/rivect.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read-only observer")
+    }
+
+    fn pending(&self, q: &Question) {
+        let row: (String, Option<String>, i64) = self.db().query_row(
+            "SELECT state, answer_json, (SELECT count(*) FROM answer_attempts WHERE task_id = ?2) FROM questions WHERE question_id = ?1",
+            rusqlite::params![q.question_id.0, q.task_id.0], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).expect("pending fork");
+        assert_eq!(row, ("pending".into(), None, 0));
+    }
+
+    fn answer(&mut self, expected: AnswerSelection) {
+        self.wait_consent_floor();
+        support::confirm_witness(&mut self.terminal);
+        let frame = self.see("decision answer recorded");
+        assert!(
+            !frame.contains("Enter selects"),
+            "old card stayed open: {frame}"
+        );
+        let db = self.db();
+        let q = &self.question;
+        let (state, author, selection): (String, String, String) = db
+            .query_row(
+                "SELECT state, answered_origin, answer_json FROM questions WHERE question_id = ?1",
+                [&q.question_id.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("durable answer");
+        assert_eq!((state.as_str(), author.as_str()), ("answered", "human"));
+        assert_eq!(
+            serde_json::from_str::<AnswerSelection>(&selection).expect("selection"),
+            expected
+        );
+        let mut stmt = db.prepare("SELECT question_id, question_revision, outcome FROM answer_attempts WHERE task_id = ?1 ORDER BY id").expect("journal");
+        let attempts = stmt
+            .query_map([&q.task_id.0], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .expect("attempts")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("journal rows");
+        assert_eq!(
+            attempts,
+            [(
+                q.question_id.0.clone(),
+                i64::try_from(q.question_revision).expect("stored revision"),
+                "applied".to_owned()
+            )]
+        );
+    }
+
+    // A second live owner is forbidden. Commit on a consistent private snapshot, then
+    // expose just that task's decision transition to the disposable installed session.
+    fn external<T>(&self, change: impl FnOnce(&mut rivect::state::TaskStore) -> T) -> T {
+        let snapshot = tempfile::tempdir().expect("isolated competing owner");
+        let path = snapshot
+            .path()
+            .canonicalize()
+            .expect("snapshot directory")
+            .join("rivect.db");
+        let copy = path.to_str().expect("fixture path");
+        let mut live =
+            rusqlite::Connection::open(self.terminal.data_root().join("runtime/rivect.db"))
+                .expect("disposable installed database");
+        live.execute("VACUUM INTO ?1", [copy])
+            .expect("consistent owner snapshot");
+        let mut staged = rivect::state::TaskStore::open(&path).expect("independent store owner");
+        let task = &self.question.task_id;
+        let previous = staged.snapshot(task).expect("staged revision").revision;
+        let result = change(&mut staged);
+        drop(staged);
+
+        live.execute("ATTACH DATABASE ?1 AS staged", [copy])
+            .expect("attach committed state");
+        let tx = live.transaction().expect("atomic external transition");
+        assert_eq!(tx.execute(
+            "UPDATE main.tasks SET (revision,intent_revision,lifecycle,event_cursor) =
+                (SELECT revision,intent_revision,lifecycle,event_cursor FROM staged.tasks WHERE task_id=?1)
+             WHERE task_id=?1 AND revision=?2",
+            rusqlite::params![task.0, i64::try_from(previous).expect("stored revision")],
+        ).expect("transfer task revision"), 1, "the installed task moved independently");
+        tx.execute(
+            "INSERT INTO main.questions SELECT * FROM staged.questions WHERE task_id=?1
+             ON CONFLICT(question_id) DO UPDATE SET state=excluded.state,
+                 answer_json=excluded.answer_json, answered_origin=excluded.answered_origin
+             WHERE questions.state != excluded.state",
+            [&task.0],
+        )
+        .expect("transfer questions");
+        tx.execute(
+            "INSERT INTO main.events SELECT e.* FROM staged.events e WHERE e.task_id=?1 AND
+             NOT EXISTS (SELECT 1 FROM main.events WHERE event_id=e.event_id)",
+            [&task.0],
+        )
+        .expect("transfer owner outbox events");
+        tx.execute(
+            "INSERT INTO main.answer_attempts SELECT a.* FROM staged.answer_attempts a WHERE a.task_id=?1 AND
+             NOT EXISTS (SELECT 1 FROM main.answer_attempts WHERE id=a.id)", [&task.0],
+        ).expect("transfer append-only answer receipts");
+        tx.commit().expect("publish external transition");
+        result
+    }
+
+    fn quit_and_reopen_store(&mut self) -> rivect::state::TaskStore {
+        self.send(b"\x1b");
+        assert_eq!(
+            self.terminal.wait_exit(CARD_WAIT).expect("normal exit"),
+            Some(0)
+        );
+        rivect::state::TaskStore::open(&self.terminal.data_root().join("runtime/rivect.db"))
+            .expect("reopen after the installed owner released the store")
+    }
+}
+
+fn competing_answer(
+    store: &mut rivect::state::TaskStore,
     session: &SessionId,
-    task: &TaskId,
-) -> rivect::ui::LocalView {
-    let question = world.publish(session, task);
-    let mut view = initial_view();
-    view.decision = Some(DecisionPanel::new(question));
-    view
-}
-
-fn key(code: KeyCode) -> TermEvent {
-    TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-/// `key` with an explicit event kind — `Repeat` synthesizes the
-/// held-key autorepeat the consent surfaces must refuse.
-fn key_kind(code: KeyCode, kind: KeyEventKind) -> TermEvent {
-    TermEvent::Key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind))
-}
-
-#[test]
-fn focus_and_recommendation_never_apply_selection() {
-    let (mut world, session, task) = world_with_task("card-focus");
-    let mut view = card_view(&mut world, &session, &task);
-    let rt = &mut world.runtime;
-
-    // The recommended row opens focused — neither the marker nor the
-    // focus position is a selection.
-    let card = view.decision.as_ref().expect("card open");
-    assert_eq!(card.focus(), 0);
-    assert_eq!(card.custom_row(), 5);
-
-    handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    handle_decision_event(&key(KeyCode::Up), &mut view, rt, &session);
-    assert_eq!(view.decision.as_ref().expect("card").focus(), 0);
-
-    // Sweep all six rows and wrap back onto the recommended position:
-    // navigation alone, even dwelling on the recommended row, never
-    // commits anything.
-    for _ in 0..6 {
-        handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    }
-    assert_eq!(view.decision.as_ref().expect("card").focus(), 0);
-
-    assert!(view.decision.is_some(), "the card stays open");
-    assert!(
-        rt.store()
-            .current_question(&task)
-            .expect("current")
-            .is_some(),
-        "focus moves never answered the fork"
-    );
-    assert!(
-        rt.store()
-            .answered_question(&task)
-            .expect("answered")
-            .is_none(),
-        "the recommended position was never applied"
-    );
-    assert!(
-        rt.store()
-            .answer_attempts(&task)
-            .expect("attempts")
-            .is_empty(),
-        "no selection journaled — focus and recommendation are display state"
-    );
-}
-
-#[test]
-fn disabled_options_carry_reason_and_are_not_selectable() {
-    let (mut world, session, task) = world_with_task("card-disabled");
-    let mut view = card_view(&mut world, &session, &task);
-    let rt = &mut world.runtime;
-
-    // The disabled `diagram` row (fixture index 4) carries its reason on
-    // the question record itself.
-    let reason = match &view.decision.as_ref().expect("card").question.options[4].availability {
-        Availability::Disabled { reason } => reason.clone(),
-        Availability::Enabled => panic!("the diagram row ships disabled"),
+    question: &Question,
+) {
+    let selection = AnswerSelection::Option {
+        option_id: question.recommended_option_id.clone(),
     };
-    assert_eq!(reason, "no useful diagram for this topic");
-
-    for _ in 0..4 {
-        handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    }
-    assert_eq!(view.decision.as_ref().expect("card").focus(), 4);
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    assert!(
-        view.decision.is_some(),
-        "a disabled position refuses and the card stays open"
-    );
-    assert!(
-        view.transcript.iter().any(|line| {
-            line.contains("decision position unavailable") && line.contains(&reason)
-        }),
-        "the refusal names the carried reason: {:?}",
-        view.transcript
-    );
-    assert!(
-        rt.store()
-            .current_question(&task)
-            .expect("current")
-            .is_some(),
-        "no substitute selection was applied underneath"
-    );
-    assert!(
-        rt.store()
-            .answer_attempts(&task)
-            .expect("attempts")
-            .is_empty(),
-        "a disabled position is not selectable — nothing was even attempted"
-    );
-}
-
-#[test]
-fn enter_applies_only_explicit_choice_on_current_revision() {
-    // Model pools + a scoped read, mirroring the wire answer's world:
-    // without them the resumed node cannot dispatch and the resume
-    // observables below would be unattainable.
-    let mut world = open_world("card-commit", Some(&support::config_distinct_pools()));
-    let session = world.open_session("decision-session");
-    let task = world.create_task(&session, "cmd-decision-task");
-    let scope = world.root.join("scope");
-    std::fs::create_dir_all(&scope).expect("scope dir");
-    let file = scope.join("allowed.txt");
-    std::fs::write(&file, "rivect-decision-marker\n").expect("scoped file");
-    world.runtime.purpose = "backend_task".to_string();
-    world.runtime.set_read_scope(scope, file);
-    let calls_before = world
-        .provider_calls
-        .load(std::sync::atomic::Ordering::SeqCst);
-
-    let mut view = card_view(&mut world, &session, &task);
-    let question_id = view
-        .decision
-        .as_ref()
-        .expect("card")
-        .question
-        .question_id
-        .clone();
-
-    handle_decision_event(&key(KeyCode::Down), &mut view, &mut world.runtime, &session);
-    handle_decision_event(
-        &key(KeyCode::Enter),
-        &mut view,
-        &mut world.runtime,
-        &session,
-    );
-
-    assert!(view.decision.is_none(), "a committed card closes");
-    assert!(
-        view.transcript
-            .iter()
-            .any(|line| line == DECISION_ANSWERED_NOTE),
-        "{:?}",
-        view.transcript
-    );
-    let (answer_json, origin) = world
-        .runtime
-        .store()
-        .answered_question(&task)
-        .expect("answered")
-        .expect("the card's answer is durable");
-    assert_eq!(origin, "human", "the card answers as the human author");
-    assert!(answer_json.contains("\"steps\""), "{answer_json}");
-    let attempts = world
-        .runtime
-        .store()
-        .answer_attempts(&task)
-        .expect("attempts");
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].question_id, question_id);
-    assert_eq!(attempts[0].outcome, AnswerAttemptOutcome::Applied);
-    // The card rides the same resume seam the wire answer takes: the
-    // committed answer submitted its runnable node and the drain ran
-    // the admitted scoped read — but a fixed option already names the
-    // one permitted read, so no provider dispatch is spent interpreting
-    // it. Durable state alone would have left the task parked on a
-    // drained question.
-    assert_eq!(
-        world
-            .provider_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        calls_before,
-        "a fixed option names the permitted read — the resume spent no dispatch"
-    );
-    assert_eq!(
-        world.worker_reads(),
-        1,
-        "the drain ran the admitted scoped read"
-    );
-    assert_eq!(
-        world
-            .runtime
-            .store()
-            .snapshot(&task)
-            .expect("snapshot")
-            .lifecycle,
-        rivect::contracts::Lifecycle::Completed,
-        "the resumed task ran to completion"
-    );
-
-    // The other half of "only on the current revision": a card whose
-    // pinned revision the question already moved past refuses — Enter
-    // never applies a stale pin.
-    let (mut world, session, task) = world_with_task("card-stale-pin");
-    let mut view = card_view(&mut world, &session, &task);
-    let question = view.decision.as_ref().expect("card").question.clone();
-
-    // The question moves under the open card: a wire answer commits
-    // first, so the card's pinned revision is stale.
-    world
-        .runtime
-        .store_writer()
+    store
         .answer_question(
-            &session,
-            &task,
+            session,
+            &question.task_id,
             &question.question_id,
             question.question_revision,
-            &AnswerSelection::Option {
-                option_id: OptionId(KNOWN_READY_OPTION.to_string()),
-            },
+            &selection,
             "human",
         )
-        .expect("the wire answer lands first");
+        .expect("competing owner answer");
+}
 
-    handle_decision_event(
-        &key(KeyCode::Enter),
-        &mut view,
-        &mut world.runtime,
-        &session,
-    );
-    assert!(
-        view.decision.is_none(),
-        "a denied card does not linger on a moved question"
-    );
-    assert!(
-        view.transcript
-            .iter()
-            .any(|line| line.contains("decision answer denied")),
-        "the denial is named: {:?}",
-        view.transcript
-    );
-    let attempts = world
-        .runtime
-        .store()
-        .answer_attempts(&task)
-        .expect("attempts");
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].outcome, AnswerAttemptOutcome::Applied);
-    assert_eq!(attempts[1].outcome, AnswerAttemptOutcome::Denied);
+fn only_applied_answer(store: &rivect::state::TaskStore, question: &Question) {
+    let attempts = store
+        .answer_attempts(&question.task_id)
+        .expect("persisted journal");
+    let [attempt] = attempts.as_slice() else {
+        panic!("expected one answer; got {}", attempts.len())
+    };
+    assert_eq!(attempt.question_id, question.question_id);
+    assert_eq!(attempt.question_revision, question.question_revision);
+    assert_eq!(attempt.author, "human");
+    assert_eq!(attempt.outcome, AnswerAttemptOutcome::Applied);
+    assert_eq!(attempt.denial, None);
     assert_eq!(
-        attempts[1].denial.as_deref(),
-        Some("replayed_answer"),
-        "the card's stale pin journals its own class: {attempts:?}"
+        attempt.selection,
+        AnswerSelection::Option {
+            option_id: question.recommended_option_id.clone()
+        }
     );
 }
 
-#[test]
-fn card_custom_row_writes_a_multiline_answer() {
-    // Model pools + a scoped read, mirroring the option-commit leg:
-    // a free-text answer needs the model to interpret it, so the
-    // dispatch observables below must be attainable.
-    let mut world = open_world("card-custom", Some(&support::config_distinct_pools()));
-    let session = world.open_session("decision-session");
-    let task = world.create_task(&session, "cmd-decision-task");
-    let scope = world.root.join("scope");
-    std::fs::create_dir_all(&scope).expect("scope dir");
-    let file = scope.join("allowed.txt");
-    std::fs::write(&file, "rivect-decision-marker\n").expect("scoped file");
-    world.runtime.purpose = "backend_task".to_string();
-    world.runtime.set_read_scope(scope, file);
-    let calls_before = world
-        .provider_calls
-        .load(std::sync::atomic::Ordering::SeqCst);
-
-    let mut view = card_view(&mut world, &session, &task);
-    let rt = &mut world.runtime;
-
-    for _ in 0..5 {
-        handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    }
-    let card = view.decision.as_ref().expect("card");
-    assert_eq!(card.focus(), card.custom_row());
-
-    // Enter on an empty draft opens editing; Enter inside editing adds
-    // a newline rather than submitting.
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    assert!(view.decision.as_ref().expect("card").custom_editing());
-    for ch in "hold the".chars() {
-        handle_decision_event(&key(KeyCode::Char(ch)), &mut view, rt, &session);
-    }
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    for ch in "freeze".chars() {
-        handle_decision_event(&key(KeyCode::Char(ch)), &mut view, rt, &session);
-    }
-    // A bracketed paste lands atomically — its newline is draft text,
-    // never an Enter key.
-    handle_decision_event(
-        &TermEvent::Paste(" window\nagain".to_string()),
-        &mut view,
-        rt,
-        &session,
-    );
-    handle_decision_event(&key(KeyCode::Esc), &mut view, rt, &session);
-    let card = view.decision.as_ref().expect("card");
-    assert!(!card.custom_editing(), "Esc finishes editing");
-    assert_eq!(card.custom_draft(), "hold the\nfreeze window\nagain");
-
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    assert!(view.decision.is_none(), "the custom answer commits");
-    // Only free-text answers pay a model dispatch — a fixed option
-    // already names the permitted read. The card's custom answer proves
-    // the dispatch arm still fires: the drain interpreted the answer
-    // through one provider call, then ran the scoped read to
-    // completion.
-    assert_eq!(
-        world
-            .provider_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        calls_before + 1,
-        "the free-text answer dispatched the resumed node"
-    );
-    assert_eq!(
-        world.worker_reads(),
-        1,
-        "the drain ran the admitted scoped read"
-    );
-    assert_eq!(
-        world
-            .runtime
-            .store()
-            .snapshot(&task)
-            .expect("snapshot")
-            .lifecycle,
-        rivect::contracts::Lifecycle::Completed,
-        "the resumed task ran to completion"
-    );
-    let (answer_json, _) = world
-        .runtime
-        .store()
-        .answered_question(&task)
-        .expect("answered")
-        .expect("durable");
-    assert!(
-        answer_json.contains("hold the\\nfreeze window\\nagain"),
-        "the multiline draft is the custom answer: {answer_json}"
-    );
+fn shows_pin(frame: &str, question: &Question) -> bool {
+    let mut rows = frame.lines();
+    let Some(left) = rows.find_map(|row| {
+        row.split_once("awaiting decision")
+            .map(|(sidebar, _)| sidebar.chars().count())
+    }) else {
+        return false;
+    };
+    // Read only the card's column; a wrapped UUID may share rows with sidebar text.
+    let header: String = rows
+        .take_while(|row| !row.contains(&question.prompt))
+        .flat_map(|row| row.chars().skip(left).filter(|c| !c.is_whitespace()))
+        .collect();
+    header.starts_with(&format!(
+        "task:{}·question:{}rev{}",
+        question.task_id.0, question.question_id.0, question.question_revision
+    ))
 }
 
+// Installed replacement for pty_decision_card_closes_when_its_question_moves.
 #[test]
-fn card_backspace_removes_the_whole_grapheme() {
-    let (mut world, session, task) = world_with_task("card-grapheme-backspace");
-    let mut view = card_view(&mut world, &session, &task);
-    let rt = &mut world.runtime;
-    for _ in 0..5 {
-        handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    }
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    assert!(view.decision.as_ref().expect("card").custom_editing());
+fn installed_open_card_tracks_external_steer_replacement_and_answer() {
+    const MOVED: &str = "Question changed.";
+    let mut card = CardPty::open(24, 80, false);
+    let old = card.question.clone();
+    card.until("original pin", |frame| shows_pin(frame, &old));
+    card.focus(1, 2);
+    let intent = card.external(|store| {
+        let snap = store.snapshot(&old.task_id).expect("old intent");
+        store
+            .steer_task(
+                &card.session,
+                &old.task_id,
+                old.intent_revision,
+                snap.revision,
+                "hold the rollout",
+            )
+            .expect("supersede open fork")
+            .intent_revision
+    });
+    assert!(intent > old.intent_revision);
+    card.until("first external close", |frame| {
+        frame.contains(MOVED) && !frame.contains("Enter selects")
+    });
+    let next = Question::fixture(&old.task_id, intent);
+    assert_ne!(old.question_id, next.question_id);
+    card.external(|store| {
+        store
+            .publish_question(&card.session, &next)
+            .expect("publish steered fork")
+    });
+    card.until("replacement pin and reset focus", |frame| {
+        shows_pin(frame, &next) && frame.contains("focus 1/6") && !shows_pin(frame, &old)
+    });
+    card.external(|store| competing_answer(store, &card.session, &next));
+    // A close replaces the notice; it does not append a transcript entry.
+    card.until("second external close", |frame| {
+        frame.contains(MOVED) && !frame.contains("Enter selects")
+    });
+    let store = card.quit_and_reopen_store();
+    assert!(
+        store
+            .current_question(&old.task_id)
+            .expect("final fork")
+            .is_none()
+    );
+    only_applied_answer(&store, &next);
+}
 
-    // One draft, three extended clusters: a combining mark, a ZWJ
-    // sequence, and the pasted newline — each dies in one press, never
-    // mid-cluster.
-    handle_decision_event(
-        &TermEvent::Paste("e\u{301}\u{1F469}\u{200D}\u{1F4BB}\n".to_string()),
-        &mut view,
-        rt,
-        &session,
-    );
-    assert_eq!(
-        view.decision.as_ref().expect("card").custom_draft(),
-        "e\u{301}\u{1F469}\u{200D}\u{1F4BB}\n"
-    );
-    for draft in ["e\u{301}\u{1F469}\u{200D}\u{1F4BB}", "e\u{301}", ""] {
-        handle_decision_event(&key(KeyCode::Backspace), &mut view, rt, &session);
-        assert_eq!(
-            view.decision.as_ref().expect("card").custom_draft(),
-            draft,
-            "one Backspace removes exactly one cluster"
+// Installed replacement for pty_dismissed_card_stays_down_and_a_different_fork_reopens_it.
+#[test]
+fn installed_dismissal_suppresses_only_its_pin_on_the_same_intent() {
+    let mut card = CardPty::open(24, 80, false);
+    let old = card.question.clone();
+    card.until("original pin", |frame| shows_pin(frame, &old));
+    card.send(b"\x1b");
+    card.until("dismissed fork", |frame| {
+        frame.contains(DECISION_UNANSWERED)
+            && !frame.contains("Enter selects")
+            && !frame.contains(&old.question_id.0)
+    });
+    let until = std::time::Instant::now() + Duration::from_millis(750);
+    while std::time::Instant::now() < until {
+        card.terminal
+            .pump_for(Duration::from_millis(25))
+            .expect("dismissal observation");
+        let frame = card.frame();
+        assert!(
+            !frame.contains("Enter selects") && !frame.contains(&old.question_id.0),
+            "resurrected card: {frame}"
         );
     }
-
-    // A `\r\n` tail is one cluster too: one Backspace removes the
-    // pair — never a stray `\r`.
-    handle_decision_event(
-        &TermEvent::Paste("x\r\n".to_string()),
-        &mut view,
-        rt,
-        &session,
-    );
-    handle_decision_event(&key(KeyCode::Backspace), &mut view, rt, &session);
-    assert_eq!(view.decision.as_ref().expect("card").custom_draft(), "x");
+    card.pending(&old);
+    let fresh = Question::fixture(&old.task_id, old.intent_revision);
+    assert_ne!(fresh.question_id, old.question_id);
+    card.external(|store| {
+        competing_answer(store, &card.session, &old);
+        store
+            .publish_question(&card.session, &fresh)
+            .expect("replacement on same intent");
+    });
+    card.until("fresh fork without reopening the old one", |frame| {
+        shows_pin(frame, &fresh) && frame.contains("focus 1/6") && !shows_pin(frame, &old)
+    });
+    card.terminal
+        .pump_for(CARD_FLOOR)
+        .expect("replacement consent floor");
+    card.send(b"\x1b");
+    card.until("replacement dismissed", |frame| {
+        frame.contains(DECISION_UNANSWERED) && !frame.contains("Enter selects")
+    });
+    let store = card.quit_and_reopen_store();
+    let (pending, _) = store
+        .current_question(&old.task_id)
+        .expect("current question")
+        .expect("unanswered replacement");
+    assert_eq!(pending.question_id, fresh.question_id);
+    assert_eq!(pending.intent_revision, old.intent_revision);
+    only_applied_answer(&store, &old);
 }
 
+// Installed replacement for pty_decision_card_repaints_inside_a_live_resize.
 #[test]
-fn card_paste_outside_editing_is_refused_and_named() {
-    let (mut world, session, task) = world_with_task("card-paste-refused");
-    let mut view = card_view(&mut world, &session, &task);
-    let rt = &mut world.runtime;
-
-    // A paste aimed at the composer while the card owns input is a
-    // refused write — it must be named like every other refused append,
-    // never silently dropped.
-    handle_decision_event(
-        &TermEvent::Paste("composer text".to_string()),
-        &mut view,
-        rt,
-        &session,
-    );
-    assert!(view.decision.is_some(), "the card stays open");
-    assert_eq!(
-        view.decision.as_ref().expect("card").custom_draft(),
-        "",
-        "the refused paste never entered the draft"
-    );
+fn installed_resize_reveals_the_full_decision_body_without_moving_focus() {
+    let mut card = CardPty::open(20, 60, false);
     assert!(
-        view.transcript
-            .iter()
-            .any(|line| line == DECISION_PASTE_REFUSED_NOTE),
-        "the refused paste is named: {:?}",
-        view.transcript
+        !card.frame().contains("6. custom answer"),
+        "60x20 already showed the last row"
     );
+    card.resize(40, 120);
+    let frame = card.until("all six options and pinned footer at 120x40", |frame| {
+        [
+            "1. Brief answer",
+            "2. Step-by-step",
+            "3. Worked example",
+            "4. Compare options",
+            "5. Diagram",
+            "6. custom answer",
+            "focus 1/6",
+        ]
+        .iter()
+        .all(|needle| frame.contains(*needle))
+    });
     assert!(
-        rt.store()
-            .answer_attempts(&task)
-            .expect("attempts")
-            .is_empty(),
-        "a refused paste journals nothing"
+        frame.contains("Esc returns · Enter selects · focus 1/6"),
+        "missing decision controls after resize: {frame}"
+    );
+    card.send(b"\x1b");
+    card.until("unanswered after resize", |frame| {
+        frame.contains(DECISION_UNANSWERED) && !frame.contains("Enter selects")
+    });
+    card.pending(&card.question);
+    let store = card.quit_and_reopen_store();
+    assert!(
+        store
+            .answer_attempts(&card.question.task_id)
+            .expect("resize journal")
+            .is_empty()
     );
 }
 
+// Installed replacements for render_never_stamps_a_card_that_painted_no_inner_cells,
+// render_stamps_the_cards_first_paint, card_consent_is_refused_until_the_card_has_been_visible,
+// and pty_decision_card_refuses_consent_inside_the_visibility_floor.
 #[test]
-fn card_editing_ignores_modified_char_chords() {
-    let (mut world, session, task) = world_with_task("card-modified-chord");
-    let mut view = card_view(&mut world, &session, &task);
-    let rt = &mut world.runtime;
-    for _ in 0..5 {
-        handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    }
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    assert!(view.decision.as_ref().expect("card").custom_editing());
-
-    // A bare Ctrl or Alt chord is a command the card does not bind:
-    // its letter must never land in the draft (Ctrl+W is not "w").
-    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
-        handle_decision_event(
-            &TermEvent::Key(KeyEvent::new(KeyCode::Char('w'), modifiers)),
-            &mut view,
-            rt,
-            &session,
+fn installed_first_readable_paint_starts_consent_after_an_invisible_resume() {
+    for (rows, cols) in [(24, 1), (1, 80)] {
+        let mut card = CardPty::at_prompt(24, 80, false);
+        let db = card.db();
+        let session = card.session.clone();
+        let revision = || {
+            db.query_row(
+                "SELECT session_revision FROM sessions WHERE session_id=?1",
+                [&session.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("resume receipt")
+        };
+        let before = revision();
+        card.resize(rows, cols);
+        card.resume();
+        let deadline = std::time::Instant::now() + CARD_WAIT;
+        while revision() == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "installed owner never resumed"
+            );
+            card.terminal
+                .pump_for(Duration::from_millis(10))
+                .expect("resume");
+        }
+        drop(db);
+        card.terminal
+            .pump_for(CARD_FLOOR * 2)
+            .expect("hidden pending question");
+        let hidden = card.frame();
+        assert!(
+            !hidden.contains(&card.question.prompt) && !hidden.contains("1. Brief answer"),
+            "{hidden}"
         );
-    }
-    // CONTROL|ALT — and its shifted level, which crossterm reports with
-    // SHIFT still pressed — is the AltGr pair on Windows: draft text
-    // there, a real command chord everywhere else (unix AltGr is
-    // ISO_Level3_Shift and never sets these bits). The assertion
-    // follows the platform honestly.
-    for (ch, modifiers) in [
-        ('@', KeyModifiers::CONTROL | KeyModifiers::ALT),
-        (
-            'Ą',
-            KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
-        ),
-    ] {
-        handle_decision_event(
-            &TermEvent::Key(KeyEvent::new(KeyCode::Char(ch), modifiers)),
-            &mut view,
-            rt,
-            &session,
+        let mark = card.parsed;
+        card.send(b"\r");
+        card.terminal
+            .pump_for(CARD_FLOOR * 2)
+            .expect("blind keys observed");
+        card.pending(&card.question);
+
+        card.resize(40, 120);
+        card.until("first readable question and focus", |frame| {
+            frame.contains("1. Brief answer") && frame.contains("focus 1/6")
+        });
+        card.send(b"\r");
+        card.terminal
+            .pump_for(CARD_FLOOR * 2)
+            .expect("early keys observed");
+        let frame = card.frame();
+        assert!(
+            frame.contains("focus 1/6") && !frame.contains(DECISION_UNANSWERED),
+            "{frame}"
         );
+        let stream = card.terminal.collected().expect("terminal witness history");
+        assert!(
+            support::find_subsequence(&stream[mark..], b" to confirm, or press Enter to cancel:")
+                .is_none(),
+            "hidden or first-frame Enter opened a witness"
+        );
+        card.pending(&card.question);
+        let choice = AnswerSelection::Option {
+            option_id: card.question.recommended_option_id.clone(),
+        };
+        card.answer(choice);
+        let store = card.quit_and_reopen_store();
+        assert!(
+            store
+                .current_question(&card.question.task_id)
+                .expect("current question")
+                .is_none()
+        );
+        only_applied_answer(&store, &card.question);
     }
-    // Bare and Shift-ed chars still append; a real terminal reports
-    // Shift+Y as `Char('Y')` with SHIFT, never `Char('y')`.
-    handle_decision_event(
-        &TermEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
-        &mut view,
-        rt,
-        &session,
-    );
-    handle_decision_event(
-        &TermEvent::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT)),
-        &mut view,
-        rt,
-        &session,
-    );
-    let expected = if cfg!(windows) { "@ĄxY" } else { "xY" };
-    assert_eq!(
-        view.decision.as_ref().expect("card").custom_draft(),
-        expected,
-        "AltGr chars type on the AltGr platform; the same bits are dead chords elsewhere"
-    );
 }
 
 #[test]
-fn card_esc_leaves_the_question_pending() {
-    let (mut world, session, task) = world_with_task("card-esc");
-    let mut view = card_view(&mut world, &session, &task);
-
-    handle_decision_event(&key(KeyCode::Esc), &mut view, &mut world.runtime, &session);
-    assert!(view.decision.is_none());
-    assert!(
-        view.transcript
-            .iter()
-            .any(|line| line == DECISION_LEFT_NOTE),
-        "{:?}",
-        view.transcript
-    );
-    assert!(
-        world
-            .runtime
-            .store()
-            .current_question(&task)
-            .expect("current")
-            .is_some(),
-        "Esc never answers and never denies"
-    );
-    assert!(
-        world
-            .runtime
-            .store()
-            .answer_attempts(&task)
-            .expect("attempts")
-            .is_empty(),
-        "Esc journals nothing"
-    );
-}
-
-#[test]
-fn held_key_autorepeat_never_commits_or_dismisses() {
-    let (mut world, session, task) = world_with_task("card-autorepeat");
-    let mut view = card_view(&mut world, &session, &task);
-    let rt = &mut world.runtime;
-
-    // The handler carries no clock — the floor lives in the loop — so
-    // the event kind is the guard past it: a held key's `Repeat` is the
-    // same unaimed input the floor refuses and must not reach the
-    // consent arms.
-    handle_decision_event(
-        &key_kind(KeyCode::Enter, KeyEventKind::Repeat),
-        &mut view,
-        rt,
-        &session,
-    );
-    assert!(view.decision.is_some(), "autorepeat Enter never commits");
-    assert!(
-        rt.store()
-            .current_question(&task)
-            .expect("current")
-            .is_some(),
-        "autorepeat Enter never answered the fork"
-    );
-    assert!(
-        rt.store()
-            .answer_attempts(&task)
-            .expect("attempts")
-            .is_empty(),
-        "autorepeat Enter journaled nothing"
-    );
-
-    handle_decision_event(
-        &key_kind(KeyCode::Esc, KeyEventKind::Repeat),
-        &mut view,
-        rt,
-        &session,
-    );
-    assert!(
-        view.decision.is_some(),
-        "autorepeat Esc never dismisses the card"
-    );
-    assert!(
-        view.decision_dismissed.is_none(),
-        "no dismissal marker was recorded"
-    );
-    assert!(
-        !view
-            .transcript
-            .iter()
-            .any(|line| line == DECISION_LEFT_NOTE),
-        "the dismiss note never landed: {:?}",
-        view.transcript
-    );
-
-    // The kind gate is the card's whole surface, not just consent: a
-    // held arrow's Repeat is autorepeat too and must not move focus —
-    // an unaimed key cannot steer a card either.
-    handle_decision_event(
-        &key_kind(KeyCode::Down, KeyEventKind::Repeat),
-        &mut view,
-        rt,
-        &session,
-    );
-    assert_eq!(
-        view.decision.as_ref().expect("card").focus(),
-        0,
-        "held-arrow autorepeat never navigates"
-    );
-
-    // A discrete Press is aimed input: Down moves the focus and Enter
-    // on the focused enabled row commits and journals the applied
-    // attempt.
-    handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    assert_eq!(view.decision.as_ref().expect("card").focus(), 1);
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    assert!(
-        view.decision.is_none(),
-        "an aimed Enter commits and the card closes"
-    );
-    let attempts = rt.store().answer_attempts(&task).expect("attempts");
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].outcome, AnswerAttemptOutcome::Applied);
-    assert!(
-        rt.store()
-            .answered_question(&task)
-            .expect("answered")
-            .is_some(),
-        "the discrete press answered the fork"
-    );
-}
-
-#[test]
-fn card_answer_on_a_settled_tree_reports_settled_not_resumed() {
-    let (mut world, session, task) = world_with_task("card-settled");
-    let mut view = card_view(&mut world, &session, &task);
-
-    // The tree drains while the question stays pending — the task row
-    // itself is untouched, so the card's answer still commits; only the
-    // scheduler refuses to grow runnable work for it.
-    world
-        .runtime
-        .scheduler
-        .cancel_task_tree(&task)
-        .expect("tree cancel drains");
-
-    handle_decision_event(
-        &key(KeyCode::Enter),
-        &mut view,
-        &mut world.runtime,
-        &session,
-    );
-
-    assert!(view.decision.is_none(), "a committed card still closes");
-    assert!(
-        view.transcript
-            .iter()
-            .any(|line| line == DECISION_SETTLED_NOTE),
-        "a settled tree is named settled, never resumed: {:?}",
-        view.transcript
-    );
-    assert!(
-        !view
-            .transcript
-            .iter()
-            .any(|line| line == DECISION_ANSWERED_NOTE),
-        "the resumed claim must not appear: {:?}",
-        view.transcript
-    );
-    let attempts = world
-        .runtime
-        .store()
-        .answer_attempts(&task)
-        .expect("attempts");
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].outcome,
-        AnswerAttemptOutcome::Applied,
-        "the answer is durable even though nothing dispatches"
-    );
-}
-
-#[test]
-fn card_ctrl_c_cancels_the_tui() {
-    let (mut world, session, task) = world_with_task("card-ctrl-c");
-    let mut view = card_view(&mut world, &session, &task);
-    let event = TermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert!(
-        !handle_decision_event(&event, &mut view, &mut world.runtime, &session),
-        "Ctrl-C keeps the global cancel affordance"
-    );
-}
-
-/// Renders one view onto a test buffer and joins the cell symbols per
-/// row: exactly the bytes the terminal would receive — the same
-/// helper shape `effect_boundary` uses, at the geometry under test.
-fn rendered_text(view: &rivect::ui::LocalView, cols: u16, rows: u16) -> String {
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(cols, rows))
-        .expect("test terminal");
-    render(&mut terminal, view).expect("render view");
-    let buffer = terminal.backend().buffer();
-    let width = usize::from(buffer.area.width);
-    buffer
-        .content
-        .chunks(width)
-        .map(|row| {
-            row.iter()
-                .map(ratatui::buffer::Cell::symbol)
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn arriving_escape_is_ignored_but_a_deliberate_blind_escape_can_dismiss() {
+    let mut card = CardPty::at_prompt(24, 80, false);
+    card.resume();
+    card.see("focus 1/6");
+    card.send(b"\x1b");
+    card.wait_consent_floor();
+    let frame = card.frame();
+    assert!(frame.contains("Enter selects"), "{frame}");
+    card.resize(1, 80);
+    card.wait_consent_floor();
+    let frame = card.frame();
+    assert!(!frame.contains("1. Brief answer"), "{frame}");
+    card.send(b"\x1b");
+    card.wait_consent_floor();
+    card.resize(24, 80);
+    card.until("dismissed without consent", |frame| {
+        frame.contains(DECISION_UNANSWERED) && !frame.contains("Enter selects")
+    });
+    card.pending(&card.question);
 }
 
 #[test]
 fn resolve_decision_shows_five_honest_slots_plus_always_multiline_custom() {
-    // The shipped fork is five positions plus the always-present custom
-    // row — the card paints every one of them with its honest state.
-    let (mut world, session, task) = world_with_task("card-slots");
-    let question = world.publish(&session, &task);
-    assert_eq!(question.options.len(), 5, "five positions ship");
-    let mut view = initial_view();
-    view.decision = Some(DecisionPanel::new(question));
-
-    // Border glyphs are layout, not content: rows wrap inside them, so
-    // the comparison reads the text with the box strokes stripped.
-    let frame = rendered_text(&view, 160, 50).replace(['│', '─', '┌', '┐', '└', '┘'], " ");
-    let flat = support::squashed(&frame);
+    let mut card = CardPty::open(50, 160, false);
+    assert_eq!(card.question.options.len(), 5);
+    let frame = support::squashed(&card.see("focus 1/6"));
     for needle in [
-        DECISION_TITLE,
-        "1. Brief answer — The essentials without a breakdown. (recommended)",
+        "awaiting decision",
+        "> 1. Brief answer — The essentials without a breakdown. (recommended)",
         "2. Step-by-step — Sequential steps with an explanation of each.",
         "3. Worked example — A full example from the given conditions to the result.",
         "4. Compare options — A table of trade-offs.",
         "5. Diagram — A visual structure diagram. — unavailable: no useful diagram for this topic",
         "6. custom answer — type your own answer",
-        "focus 1/6",
-        "arrows move",
+        "↑↓ move",
+        "Enter selects",
     ] {
-        assert!(flat.contains(needle), "the card paints {needle:?}: {flat}");
+        assert!(frame.contains(needle), "missing {needle:?}: {frame}");
     }
     println!("ROW 17.1 ok");
 }
 
 #[test]
 fn card_header_paints_the_pinned_pair_without_clipping() {
-    // The narrowest acceptance geometry: the card is 60 cells wide, the
-    // pinned header owns three rows inside the border — 58 cells. The
-    // pinned pair the answer commits against must fit whole; a clipped
-    // tail would read as a truncated id or a dropped revision.
-    let (mut world, session, task) = world_with_task("card-header-floor");
-    let question = world.publish(&session, &task);
-    let mut view = initial_view();
-    view.decision = Some(DecisionPanel::new(question.clone()));
+    let mut card = CardPty::open(20, 60, false);
+    let frame = card.frame();
+    assert!(shows_pin(&frame, &card.question), "clipped pin: {frame}");
+}
 
-    let frame = rendered_text(&view, 60, 20);
-    let task_row = frame
-        .lines()
-        .find(|line| line.contains("task: "))
-        .expect("the header paints the task row");
-    assert!(
-        task_row.trim_end_matches('│').trim_end().ends_with(&task.0),
-        "the task id ends its row unclipped: {task_row}"
+#[test]
+fn focus_and_recommendation_never_apply_selection() {
+    let mut card = CardPty::open(50, 160, false);
+    card.focus(1, 2);
+    card.send(b"\x1b[A");
+    card.see("focus 1/6");
+    card.focus(1, 6);
+    card.focus(6, 1);
+    card.pending(&card.question);
+}
+
+#[test]
+fn disabled_options_carry_reason_and_are_not_selectable() {
+    let mut card = CardPty::open(50, 160, false);
+    assert_eq!(
+        card.question.options[4].availability,
+        Availability::Disabled {
+            reason: "no useful diagram for this topic".into()
+        }
     );
-    let question_row = frame
-        .lines()
-        .find(|line| line.contains("question: "))
-        .expect("the header paints the question row");
-    let pinned = format!(
-        "{} rev {}",
-        question.question_id.0, question.question_revision
-    );
-    assert!(
-        question_row
-            .trim_end_matches('│')
-            .trim_end()
-            .ends_with(&pinned),
-        "the pinned pair ends its row unclipped: {question_row}"
-    );
+    card.focus(1, 5);
+    card.send(b"\r");
+    let frame = card.see("Unavailable: no useful diagram for this topic");
+    assert!(frame.contains("focus 5/6"));
+    card.pending(&card.question);
+}
+
+#[test]
+fn card_paste_outside_editing_is_refused_and_named() {
+    let mut card = CardPty::open(50, 160, false);
+    card.paste("composer text");
+    let frame = card.see("Paste refused while the decision card owns input");
+    assert!(frame.contains("6. custom answer — type your own answer"));
+    assert!(!frame.contains("composer text"));
+    card.pending(&card.question);
+}
+
+#[test]
+fn card_esc_leaves_the_question_pending() {
+    let mut card = CardPty::open(50, 160, false);
+    card.send(b"\x1b");
+    let frame = card.see(DECISION_UNANSWERED);
+    assert!(!frame.contains("Enter selects"));
+    card.pending(&card.question);
+}
+
+#[test]
+fn held_key_autorepeat_never_commits_or_dismisses() {
+    let mut card = CardPty::open(50, 160, false);
+    // Kitty event-type 2, sent after the first-paint guard has expired.
+    card.send(b"\x1b[13;1:2u\x1b[27;1:2u\x1b[1;1:2B");
+    card.terminal
+        .pump_for(Duration::from_millis(250))
+        .expect("repeat processing");
+    let frame = card.frame();
+    assert!(frame.contains("focus 1/6"));
+    assert!(!frame.contains("left unanswered") && !frame.contains("to confirm"));
+    card.pending(&card.question);
+    card.focus(1, 2);
+    card.answer(AnswerSelection::Option {
+        option_id: OptionId("steps".into()),
+    });
 }
 
 #[test]
 fn decision_card_owns_the_modal_over_a_permission_panel() {
-    let (mut world, session, task) = world_with_task("card-modal-order");
-    let mut view = card_view(&mut world, &session, &task);
-    view.panel = Some(PermissionPanel::new(
-        ModeDecision::Ask,
-        EffectClass::Write,
-        "grant-1",
-        "task",
-        "session",
-        "/tmp/scope",
-    ));
+    let mut card = CardPty::open(24, 80, true);
+    card.focus(1, 2);
+    let frame = card.see("focus 2/6");
+    assert!(frame.contains("awaiting decision"));
+    assert!(!frame.contains("awaiting permission"));
+    card.pending(card.permission.as_ref().expect("parked permission"));
+    card.pending(&card.question);
+}
 
-    // Input order: while a card is open the decision handler owns the
-    // keys — a Down moves the card's focus and the panel never sees it.
-    handle_decision_event(&key(KeyCode::Down), &mut view, &mut world.runtime, &session);
+#[test]
+fn card_custom_row_writes_a_multiline_answer() {
+    let mut card = CardPty::open(50, 160, false);
+    card.edit();
+    card.send(b"hold the\rfreeze");
+    card.paste(" window\nagain");
+    card.see("again");
+    card.send(b"\x1b");
+    card.see("Enter selects");
+    card.pending(&card.question);
+    card.answer(support::answer_custom("hold the\nfreeze window\nagain"));
+}
+
+#[test]
+fn card_backspace_removes_the_whole_grapheme() {
+    // A durable, witnessed submission after each suffix proves exact bytes,
+    // including newlines and invisible combining characters.
+    for (initial, deletes, expected) in [
+        ("e\u{301}👩‍💻\n", 0, "e\u{301}👩‍💻\n"),
+        ("e\u{301}👩‍💻\n", 1, "e\u{301}👩‍💻"),
+        ("e\u{301}👩‍💻\n", 2, "e\u{301}"),
+        ("e\u{301}👩‍💻\n", 3, ""),
+        ("x\r\n", 1, "x"),
+    ] {
+        let mut card = CardPty::open(50, 160, false);
+        card.edit();
+        card.paste(initial);
+        for _ in 0..deletes {
+            card.send(b"\x7f");
+        }
+        card.send(b"!"); // Non-blank sentinel makes even the empty draft committable.
+        card.see("!");
+        card.send(b"\x1b");
+        card.see("Enter selects");
+        card.answer(support::answer_custom(&format!("{expected}!")));
+    }
+}
+
+#[test]
+fn card_editing_ignores_modified_char_chords() {
+    let mut card = CardPty::open(50, 160, false);
+    card.edit();
+    // Ctrl+W, Alt+W, Ctrl+Alt+@, Shift+Ctrl+Alt+Ą. On the supported Unix
+    // targets none is AltGr text. Bare and shifted characters remain text.
+    card.send(b"\x17\x1b[119;3u\x1b[64;7u\x1b[260;8uxY");
+    card.see("xY");
+    card.send(b"\x1b");
+    card.see("Enter selects");
+    card.answer(support::answer_custom("xY"));
+}
+
+#[test]
+fn card_reports_the_committed_answer_without_promising_resumed_work() {
+    let mut card = CardPty::open(50, 160, false);
+    card.answer(AnswerSelection::Option {
+        option_id: card.question.recommended_option_id.clone(),
+    });
+    let frame = card.until("settled task projection", |frame| {
+        frame.contains("blocked: denied")
+    });
+    assert!(
+        !frame.contains("decision answer recorded; task running"),
+        "{frame}"
+    );
+    assert!(!frame.contains("task resumed"), "{frame}");
+}
+
+#[test]
+fn terminal_answer_on_a_settled_tree_commits_without_resuming() {
+    // Scheduler cancellation is process-local: use the same owner that settled the tree.
+    let (mut world, session, task) = world_with_task("terminal-answer-settled");
+    let question = world.publish(&session, &task);
+    world
+        .runtime
+        .scheduler
+        .cancel_task_tree(&task)
+        .expect("settled tree");
+    let request = corpus_answer_option(
+        &session,
+        "late-answer",
+        &task,
+        &question,
+        KNOWN_READY_OPTION,
+        json!(1),
+    );
+    let mut envelope: serde_json::Value = serde_json::from_str(&request).expect("answer envelope");
+    let work = world
+        .runtime
+        .begin_terminal_answer(envelope["params"].take(), None)
+        .expect("answer commit");
+    world
+        .runtime
+        .finish_terminal_answer(
+            work,
+            std::sync::Arc::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_| {},
+        )
+        .expect("settle without dispatch");
     assert_eq!(
-        view.decision.as_ref().expect("card").focus(),
-        1,
-        "the decision card took the key"
+        world
+            .runtime
+            .store()
+            .snapshot(&task)
+            .expect("settled task")
+            .lifecycle,
+        rivect::contracts::Lifecycle::Cancelled
     );
-    assert!(view.panel.is_some(), "the panel stayed parked underneath");
+    assert_eq!(world.worker_reads(), 0);
+    only_applied_answer(world.runtime.store(), &question);
+}
 
-    // Paint order: the modals share the same centered rect — the card
-    // clears and repaints over it, so its header, never the panel's,
-    // is what the terminal shows.
-    let frame = rendered_text(&view, 80, 24);
-    assert!(
-        frame.contains(DECISION_TITLE),
-        "the decision card paints on top: {frame}"
+#[test]
+fn enter_applies_only_explicit_choice_on_current_revision() {
+    let mut card = CardPty::open(50, 160, false);
+    card.focus(1, 2);
+    card.answer(AnswerSelection::Option {
+        option_id: OptionId("steps".into()),
+    });
+}
+
+#[test]
+fn stale_card_denies_a_witnessed_answer_without_replacing_the_winner() {
+    let mut card = CardPty::open(50, 160, false);
+    let snapshot = tempfile::tempdir().expect("competing transition fixture");
+    let rt = snapshot.path().join("runtime");
+    std::fs::create_dir(&rt).expect("fixture state");
+    let copy = rt.join("rivect.db");
+    // Produce the racing answer through the actual store, not invented journal
+    // JSON. The installed owner is exclusive: inject just the committed rows
+    // into its disposable fixture during the real terminal-witness pause.
+    rusqlite::Connection::open(card.terminal.data_root().join("runtime/rivect.db"))
+        .expect("source fixture")
+        .execute("VACUUM INTO ?1", [copy.to_str().expect("fixture path")])
+        .expect("consistent snapshot");
+    let q = &card.question;
+    let winner = AnswerSelection::Option {
+        option_id: q.recommended_option_id.clone(),
+    };
+    let mut other = support::open_world_at(snapshot.path(), None);
+    other
+        .runtime
+        .store_writer()
+        .answer_question(
+            &card.session,
+            &q.task_id,
+            &q.question_id,
+            q.question_revision,
+            &winner,
+            "human",
+        )
+        .expect("competing answer");
+    drop(other);
+    card.focus(1, 2);
+    let database = card.terminal.data_root().join("runtime/rivect.db");
+    let id = card.question.question_id.0.clone();
+    support::confirm_witness_with(&mut card.terminal, || {
+        let mut fixture = rusqlite::Connection::open(database).expect("race fixture");
+        fixture
+            .execute(
+                "ATTACH DATABASE ?1 AS winner",
+                [copy.to_str().expect("fixture path")],
+            )
+            .expect("attach competing receipt");
+        let tx = fixture.transaction().expect("atomic racing commit");
+        assert_eq!(tx.execute("UPDATE questions SET (state,answer_json,answered_origin) = (SELECT state,answer_json,answered_origin FROM winner.questions WHERE question_id=?1) WHERE question_id=?1 AND state='pending'", [&id]).expect("land winning answer"), 1);
+        assert_eq!(tx.execute("INSERT INTO answer_attempts (question_id,task_id,question_revision,selection_json,author,outcome,denial) SELECT question_id,task_id,question_revision,selection_json,author,outcome,denial FROM winner.answer_attempts WHERE question_id=?1", [&id]).expect("land winning receipt"), 1);
+        tx.commit().expect("racing commit");
+    });
+    let frame = card.see("Check /decision before attempting another answer.");
+    assert!(!frame.contains("Enter selects"));
+    let db = card.db();
+    let answer: String = db
+        .query_row(
+            "SELECT answer_json FROM questions WHERE question_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .expect("winner");
+    assert_eq!(
+        serde_json::from_str::<AnswerSelection>(&answer).expect("answer"),
+        winner
     );
-    assert!(
-        !frame.contains(PANEL_TITLE),
-        "the permission panel never bleeds through: {frame}"
+    let mut stmt = db
+        .prepare("SELECT outcome, denial FROM answer_attempts WHERE question_id=?1 ORDER BY id")
+        .expect("journal");
+    let attempts = stmt
+        .query_map([&id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .expect("attempts")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows");
+    assert_eq!(
+        attempts,
+        [
+            ("applied".into(), None),
+            ("denied".into(), Some("replayed_answer".into()))
+        ]
     );
+}
+
+#[test]
+fn recorded_card_selections_resume_only_the_admitted_scoped_read() {
+    // A relaunched package cannot inherit an in-process worker counter or an
+    // in-memory grant. Verify the execution contract through the shared owner.
+    for custom in [false, true] {
+        let mut world = open_world("card-resume", Some(&support::config_distinct_pools()));
+        let session = world.open_session("card-resume");
+        let task = world.create_task(&session, "decision-task");
+        let scope = world.root.join("scope");
+        std::fs::create_dir(&scope).expect("scope");
+        let file = scope.join("allowed.txt");
+        std::fs::write(&file, "rivect-decision-marker\n").expect("scoped file");
+        world.runtime.purpose = "backend_task".into();
+        world.runtime.set_read_scope(scope, file);
+        let calls = world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let q = world.publish(&session, &task);
+        let answer = if custom {
+            corpus_answer_custom(
+                &session,
+                "custom",
+                &task,
+                &q,
+                "hold the\nfreeze window\nagain",
+                json!(1),
+            )
+        } else {
+            corpus_answer_option(&session, "steps", &task, &q, "steps", json!(1))
+        };
+        let receipt = world.dispatch(&answer);
+        assert!(receipt["error"].is_null(), "{receipt}");
+        assert_eq!(
+            world
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                - calls,
+            u64::from(custom)
+        );
+        assert_eq!(world.worker_reads(), 1);
+        assert_eq!(
+            world
+                .runtime
+                .store()
+                .snapshot(&task)
+                .expect("snapshot")
+                .lifecycle,
+            rivect::contracts::Lifecycle::Completed
+        );
+    }
+}
+
+#[test]
+fn card_ctrl_c_cancels_the_tui() {
+    let mut card = CardPty::open(20, 60, false);
+    card.send(b"\x03");
+    assert_eq!(
+        card.terminal.wait_exit(CARD_WAIT).expect("card exit"),
+        Some(130)
+    );
+    card.pending(&card.question);
 }
 
 #[test]
 fn card_draft_honors_the_wire_size_limit() {
     let (mut world, session, task) = world_with_task("card-draft-limit");
-    let mut view = card_view(&mut world, &session, &task);
-    let question = view.decision.as_ref().expect("card").question.clone();
+    let question = world.publish(&session, &task);
 
     // The wire bound denies first — an oversized custom answer journals
     // invalid_selection and leaves the fork pending.
@@ -5453,53 +5582,16 @@ fn card_draft_honors_the_wire_size_limit() {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].denial.as_deref(), Some("invalid_selection"));
 
-    // The card's draft carries the same bound: the paste that fills it
-    // lands, the byte past the bound refuses with the named note —
-    // never a silent truncate.
-    let rt = &mut world.runtime;
-    for _ in 0..5 {
-        handle_decision_event(&key(KeyCode::Down), &mut view, rt, &session);
-    }
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    assert!(view.decision.as_ref().expect("card").custom_editing());
-    handle_decision_event(
-        &TermEvent::Paste("x".repeat(TEXT_MAX_BYTES)),
-        &mut view,
-        rt,
-        &session,
-    );
-    assert_eq!(
-        view.decision.as_ref().expect("card").custom_draft().len(),
-        TEXT_MAX_BYTES,
-        "the draft fills exactly to the wire bound"
-    );
-    handle_decision_event(&TermEvent::Paste("y".to_string()), &mut view, rt, &session);
-    assert_eq!(
-        view.decision.as_ref().expect("card").custom_draft().len(),
-        TEXT_MAX_BYTES,
-        "the refused append never grew the draft"
-    );
-    assert!(
-        view.transcript
-            .iter()
-            .any(|line| line == DECISION_DRAFT_LIMIT_NOTE),
-        "the refused append is named: {:?}",
-        view.transcript
-    );
-
-    // And the bound-sized draft still commits through the shared seam.
-    handle_decision_event(&key(KeyCode::Esc), &mut view, rt, &session);
-    handle_decision_event(&key(KeyCode::Enter), &mut view, rt, &session);
-    let (answer_json, _) = world
-        .runtime
-        .store()
-        .answered_question(&task)
-        .expect("answered")
-        .expect("the bound-sized draft commits");
-    assert!(
-        answer_json.contains(&"x".repeat(TEXT_MAX_BYTES)),
-        "the max-size custom answer is durable"
-    );
+    let mut card = CardPty::open(50, 160, false);
+    card.edit();
+    let limit = "x".repeat(TEXT_MAX_BYTES);
+    card.paste(&limit);
+    card.see("xxxxxxxxxx");
+    card.paste("y");
+    card.see("size limit");
+    card.send(b"\x1b");
+    card.see("Enter selects");
+    card.answer(support::answer_custom(&limit));
 }
 
 // ----- PTY proof on the 60x20 acceptance geometry -----
@@ -5512,8 +5604,11 @@ fn pty_terminal_enables_then_restores_bracketed_paste() {
     // The enable lands with the alternate screen at startup; the
     // disable rides the same restore path on exit — enable strictly
     // before its own disable, both paired with the alt-screen dance.
-    let mut pty = spawn_pty(
-        &rivect_binary(),
+    let mut pty = support::spawn_pty(
+        support::release::baseline_bundle()
+            .join("rivect")
+            .to_str()
+            .expect("installed launcher"),
         DECISION_PTY_ROWS as u16,
         DECISION_PTY_COLS as u16,
     );

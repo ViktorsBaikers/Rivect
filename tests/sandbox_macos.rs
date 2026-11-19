@@ -414,7 +414,7 @@ fn sandbox_worker_reads_scope_and_lands_checked_managed_write() {
     let mut worker = macos::MacosReadWorker;
     let scope_root = file.parent().expect("scope root").to_path_buf();
 
-    let ReadObservation { bytes, digest } = worker
+    let ReadObservation { bytes, digest, .. } = worker
         .read_once(&scope_root, &file)
         .expect("confined scoped read");
     assert_eq!(bytes, b"scoped-by-seatbelt");

@@ -8,11 +8,11 @@ commit=$2
 bundle=$3
 logs=$4
 candidate=$(shasum -a 256 "$bundle/rivect.manifest.json" | awk '{print $1}')
+sbom=$(shasum -a 256 "$bundle.cdx.json" | awk '{print $1}')
 case $platform in
     linux)
-        legs='["auth.secret_service","measurement.offline_corpus"]'
-        oracles='auth:secret_service_leg_records_not_run_when_the_headless_store_is_absent
-measurement:offline_corpus_measures_the_installed_candidate_against_the_frozen_limits'
+        legs='["auth.secret_service"]'
+        oracles='auth:secret_service_leg_records_not_run_when_the_headless_store_is_absent'
         ;;
     macos)
         legs='["auth.keychain"]'
@@ -35,7 +35,7 @@ for leg in $(printf '%s' "$legs" | jq -r '.[]'); do
     fi
 done
 jq -n --arg commit "$commit" --arg platform "$platform" \
-    --arg candidate "$candidate" --arg run "${GITHUB_RUN_ID:-local}" \
+    --arg candidate "$candidate" --arg sbom "$sbom" --arg run "${GITHUB_RUN_ID:-local}" \
     --argjson legs "$legs" \
     '{schema_version:2, commit:$commit, run_id:$run, platform:$platform,
-      candidate_manifest_sha256:$candidate, served_legs:$legs}' > xhost-receipt.json
+      candidate_manifest_sha256:$candidate, sbom_sha256:$sbom, served_legs:$legs}' > xhost-receipt.json

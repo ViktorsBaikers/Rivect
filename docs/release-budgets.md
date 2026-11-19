@@ -1,5 +1,11 @@
 # Release budgets and the AC-003 corpus (frozen)
 
+This declaration and its measured baseline apply to the historical three-file
+package v1. Package v2 has a different inventory. Neither this declaration nor
+the historical verdict supplies a v2 resource-budget PASS. AC-003 remains open
+for v2 until its measurement contract is approved before measurement and verified
+against the exact v2 candidate.
+
 Every number and workload below is declared **before** the candidate is
 measured. The fenced declaration is the frozen artifact: the release report
 carries its SHA-256 digest, and a later change to the corpus, the repeats, the

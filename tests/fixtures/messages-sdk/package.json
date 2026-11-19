@@ -1,0 +1,7 @@
+{
+  "name": "rivect-offline-messages-trial",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {"@anthropic-ai/sdk": "1.10.0"}
+}

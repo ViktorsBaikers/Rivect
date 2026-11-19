@@ -36,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: quality
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all -- --check
       - run: >-
@@ -53,6 +53,8 @@ jobs:
           sh -n install.sh
           shellcheck install.sh scripts/*.sh
           python3 scripts/ci-contract-tests.py
+          python3 scripts/ci-tui-contract-tests.py
+          python3 scripts/eval-metrics-test.py
           python3 scripts/install-contract-tests.py
 
   test:
@@ -77,7 +79,10 @@ jobs:
           persist-credentials: false
       - name: locate candidate outside the checkout
         run: |
-          echo "RIVECT_TEST_BUNDLE=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
+          {
+            echo "RIVECT_TEST_BUNDLE=$RUNNER_TEMP/candidate"
+            echo "RIVECT_V2_TEST_BUNDLE=$RUNNER_TEMP/candidate"
+          } >> "$GITHUB_ENV"
       - name: select native Apple Git for confined execution
         if: matrix.platform == 'macos'
         run: |
@@ -89,24 +94,56 @@ jobs:
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: test-${{ matrix.platform }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: native-v2-${{ matrix.platform }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - name: Linux sandbox and local credential-store prerequisites
         if: matrix.platform == 'linux'
         run: |
           sh scripts/ci-linux-prerequisites.sh
           sudo apt-get install -y -qq gnome-keyring dbus dbus-x11
-      - name: build candidate once and smoke
+      - name: verify release tag matches package version
         run: |
-          sh scripts/package-release.sh "$RIVECT_TEST_BUNDLE"
-          "$RIVECT_TEST_BUNDLE/rivect" --version
-          "$RIVECT_TEST_BUNDLE/rivect" --help
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             version=$(cargo metadata --locked --no-deps --format-version 1 |
               jq -r '.packages[] | select(.name == "rivect") | .version')
             test "$GITHUB_REF_NAME" = "v$version"
           fi
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.4'
+      - name: build and verify the OpenTUI candidate
+        working-directory: tui
+        run: |
+          bun install --frozen-lockfile --ignore-scripts --libc '*'
+          node_modules/.bin/tsc
+          bun build.ts
+          sh ../scripts/package-release.sh "$RIVECT_TEST_BUNDLE"
+          python3 ../scripts/check-release-sbom.py "$RIVECT_TEST_BUNDLE"
+          "$RIVECT_TEST_BUNDLE/rivect" --version
+          "$RIVECT_TEST_BUNDLE/rivect" --help
+      - name: test the OpenTUI candidate
+        run: |
+          ln -s "$RIVECT_TEST_BUNDLE" tui/build/core
+          (cd tui && bun test ./wire_test.ts ./actions_test.ts ./dock.test.ts)
+          cargo build --offline --locked --example pty-screen
+          python3 scripts/ci-tui-test.py "$RIVECT_V2_TEST_BUNDLE"
+      - name: verify MCP against independent SDK
+        run: |
+          npm ci --prefix tests/fixtures/mcp-sdk \
+            --ignore-scripts --no-audit --no-fund
+          cargo test --locked --offline --test mcp \
+            official_sdk_stdio_contract -- --ignored --exact
+      - name: test installed OpenTUI across upgrade and rollback in a PTY
+        run: |
+          cmp tui/build/rivect-tui "$RIVECT_V2_TEST_BUNDLE/libexec/rivect-tui"
+          python3 scripts/install-contract-tests.py -v \
+            InstallerContract.test_native_v2_activation
       - name: run platform targets once and attest their evidence
         run: |
           if [[ "$PLATFORM" == linux ]]; then
@@ -119,9 +156,16 @@ jobs:
       - name: assemble tested candidate and evidence
         run: |
           mkdir -p transfer/target
+          case "$PLATFORM" in
+            macos) lib=libopentui.dylib ;; linux) lib=libopentui.so ;;
+            *) exit 2 ;;
+          esac
+          export COPYFILE_DISABLE=1
           tar -C "$RIVECT_TEST_BUNDLE" -czf transfer/candidate.tar.gz \
-            rivect rivect-sandbox-helper rivect.manifest.json
-          cp xhost-receipt.json transfer/
+            rivect rivect-sandbox-helper rivect.manifest.json \
+            libexec/rivect-tui "libexec/$lib"
+          cp xhost-receipt.json "$RIVECT_TEST_BUNDLE.cdx.json" \
+            "$RIVECT_TEST_BUNDLE.manifest.sha256" transfer/
           cp target/provider-trials.json target/search-trials.json \
             target/acceptance-rows-*.json target/installed-ordinary.json \
             target/installed-tui-matrix.json transfer/target/
@@ -132,6 +176,7 @@ jobs:
           name: xhost-${{ matrix.platform }}
           path: transfer/
           if-no-files-found: error
+          compression-level: 0
           retention-days: 7
       - name: retain diagnostics even on failure
         if: ${{ always() }}
@@ -141,6 +186,7 @@ jobs:
           name: diagnostics-${{ matrix.platform }}
           path: |
             target/ci-logs/
+            target/tui-ci-logs/
             target/rivect-not-run/
           retention-days: 7
 
@@ -180,11 +226,9 @@ jobs:
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: test-${{ matrix.platform }}
+          shared-key: native-v2-${{ matrix.platform }}
+          cache-bin: false
           save-if: false
-      - name: Linux sandbox prerequisite for the conjunction
-        if: matrix.platform == 'linux'
-        run: sh scripts/ci-linux-prerequisites.sh
       # download-artifact v8.0.2
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -198,9 +242,16 @@ jobs:
           tar -xOf "xhost/xhost-$PLATFORM/candidate.tar.gz" \
             rivect.manifest.json > "$RIVECT_TEST_BUNDLE/rivect.manifest.json"
           sh scripts/xhost-bind.sh "$RIVECT_TEST_BUNDLE" "$GITHUB_SHA"
-          tar -xf "xhost/xhost-$PLATFORM/candidate.tar.gz" \
-            -C "$RIVECT_TEST_BUNDLE"
+          host="xhost/xhost-$PLATFORM"
+          tar -xf "$host/candidate.tar.gz" -C "$RIVECT_TEST_BUNDLE"
+          for suffix in cdx.json manifest.sha256; do
+            cp "$host/candidate.$suffix" "$RIVECT_TEST_BUNDLE.$suffix"
+          done
+          python3 scripts/check-release-sbom.py "$RIVECT_TEST_BUNDLE"
           cp -R "xhost/xhost-$PLATFORM/target/." target/
+      - name: Linux sandbox prerequisite for the conjunction
+        if: matrix.platform == 'linux'
+        run: sh scripts/ci-linux-prerequisites.sh
       - name: release conjunction only (no producer reruns)
         run: |
           code=0
@@ -210,14 +261,20 @@ jobs:
           mkdir dist
           cp install.sh "dist/install-$TARGET.sh"
           installer=$(shasum -a 256 "dist/install-$TARGET.sh" | cut -d ' ' -f 1)
+          sbom=$(shasum -a 256 "$RIVECT_TEST_BUNDLE.cdx.json" | cut -c1-64)
           jq --argjson exit "$code" --arg target "$TARGET" \
             --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
-            --arg installer "$installer" \
+            --arg installer "$installer" --arg sbom "$sbom" \
             '. + {gate_exit:$exit, target:$target,
-                  commit:$commit, run_id:$run, installer_sha256:$installer}' \
-            target/final-acceptance.json > "dist/$TARGET.json"
+                  commit:$commit, run_id:$run, sbom_sha256:$sbom,
+                  installer_sha256:$installer}' \
+            target/final-acceptance.json > "dist/report-$TARGET.json"
           cp "xhost/xhost-$PLATFORM/candidate.tar.gz" \
             "dist/rivect-$GITHUB_REF_NAME-$TARGET.tar.gz"
+          base="dist/rivect-$GITHUB_REF_NAME-$TARGET"
+          for suffix in cdx.json manifest.sha256; do
+            cp "$RIVECT_TEST_BUNDLE.$suffix" "$base.$suffix"
+          done
           (cd dist && shasum -a 256 ./*.tar.gz > "$TARGET.sha256")
       # upload-artifact v7.0.2
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -225,6 +282,7 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
+          compression-level: 0
           retention-days: 30
 
   publish:
@@ -234,6 +292,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       # No checkout, Cargo, build script or test runs with a write token.
       # download-artifact v8.0.2
@@ -243,28 +303,46 @@ jobs:
           path: dist
           merge-multiple: true
           digest-mismatch: error
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/rivect-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/rivect-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
       - name: publish both platforms in one transaction owner
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           cd dist
-          test "$(find . -name '*.json' | wc -l | tr -d ' ')" = 2
+          test "$(find . -name 'report-*.json' | wc -l | tr -d ' ')" = 2
+          test "$(find . -name '*.cdx.json' | wc -l | tr -d ' ')" = 2
+          test "$(find . -name '*.manifest.sha256' | wc -l)" -eq 2
           test "$(find . -name '*.tar.gz' | wc -l | tr -d ' ')" = 2
+          assets=()
           for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
             sha256sum -c "$target.sha256"
             candidate=$(tar -xOf "rivect-$GITHUB_REF_NAME-$target.tar.gz" \
               rivect.manifest.json | sha256sum | cut -d ' ' -f 1)
+            base="rivect-$GITHUB_REF_NAME-$target"
+            test "$(cat "$base.manifest.sha256")" = "$candidate"
+            jq -e --arg hash "$candidate" 'any(.components[];
+              .type == "file" and .name == "rivect.manifest.json" and
+              .hashes == [{alg:"SHA-256", content:$hash}])' \
+              "$base.cdx.json" >/dev/null
+            sbom=$(sha256sum "$base.cdx.json" | cut -c1-64)
+            assets+=("./$base.tar.gz" "./$base.cdx.json"
+                     "./$base.manifest.sha256" "./report-$target.json"
+                     "./$target.sha256")
             test -f "install-$target.sh"
             test ! -L "install-$target.sh"
             installer=$(sha256sum "install-$target.sh" | cut -d ' ' -f 1)
             jq -e --arg target "$target" --arg commit "$GITHUB_SHA" \
               --arg run "$GITHUB_RUN_ID" --arg candidate "$candidate" \
-              --arg installer "$installer" '
+              --arg installer "$installer" --arg sbom "$sbom" '
               .schema_version == 1 and .target == $target and
               .commit == $commit and .run_id == $run and
               .candidate_manifest_sha256 == $candidate and
-              .installer_sha256 == $installer and
+              .installer_sha256 == $installer and .sbom_sha256 == $sbom and
               (.release_ready | type == "boolean") and
               (.blockers.retained_legs |
                 type == "number" and . >= 0 and . == floor) and
@@ -272,7 +350,7 @@ jobs:
                 .blockers.retained_legs == 0) or
                (.gate_exit == 5 and (.release_ready == false or
                 .blockers.retained_legs > 0)))
-            ' "$target.json"
+            ' "report-$target.json"
           done
           cmp install-x86_64-unknown-linux-gnu.sh install-aarch64-apple-darwin.sh
           cp install-x86_64-unknown-linux-gnu.sh install.sh
@@ -287,7 +365,7 @@ jobs:
           args=(--draft)
           ready=true
           if ! jq -se 'all(.[]; .gate_exit == 0 and .release_ready == true
-            and .blockers.retained_legs == 0)' ./*.json; then
+            and .blockers.retained_legs == 0)' ./report-*.json; then
             args+=(--prerelease)
             ready=false
           fi
@@ -295,7 +373,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag \
             --title "Rivect $GITHUB_REF_NAME" \
             --notes 'Install with: curl -fsSL https://github.com/ViktorsBaikers/Rivect/releases/latest/download/install.sh | sh' \
-            "${args[@]}" ./*.tar.gz ./*.sha256 ./*.json install.sh
+            "${args[@]}" "${assets[@]}" ./install.sh.sha256 install.sh
           if [[ "$ready" == true ]]; then
             verify_tag
             gh release edit "$GITHUB_REF_NAME" --draft=false

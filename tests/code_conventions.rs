@@ -372,35 +372,8 @@ fn production_lines(source: &str) -> impl Iterator<Item = (usize, &str)> {
         .into_iter()
 }
 
-#[test]
-fn ui_production_scan_includes_run_tui() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui.rs");
-    let source = fs::read_to_string(path).expect("read ui source");
-    assert!(
-        production_lines(&source).any(|(_, line)| line.contains("pub fn run_tui(")),
-        "ui production scan must include run_tui before trailing test module"
-    );
-}
-
-/// AC-076: the entry hand is the only way a working directory enters the
-/// runtime, and it is what makes instruction discovery reachable at all — a
-/// run handed no root discovers nothing. Both product entries make that hand
-/// with the directory they were started in; an entry that stops passing one
-/// leaves discovery unreachable again. The scan is whitespace-free, so a
-/// rustfmt wrap of the call is not a false failure.
-#[test]
-fn both_entries_hand_a_root_p9() {
-    for entry in ["main.rs", "ui.rs"] {
-        let source = fs::read_to_string(source_root().join(entry)).expect("read entry source");
-        let production: String = production_lines(&source)
-            .flat_map(|(_, line)| line.split_whitespace())
-            .collect();
-        assert!(
-            production.contains("set_instructions_root(std::env::current_dir().ok())"),
-            "{entry} must hand its working directory to the runtime"
-        );
-    }
-}
+// first_task verifies cwd in the installed model request and the headless grant.
+// production_scan_resumes_after_every_kind_of_test_item exercises the scanner itself.
 
 #[test]
 fn no_panic_family_in_src() {

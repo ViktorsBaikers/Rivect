@@ -1439,17 +1439,24 @@ pub fn preapproval_scope(class: EffectClass, grant_id: &str, scope: &str) -> Opt
     if !grant_id_is_key_safe(grant_id) {
         return None;
     }
-    let scope = match class {
+    let scope = canonical_preapproval_target(class, scope)?;
+    Some(format!("{}:{grant_id}:{scope}", class_key(class)))
+}
+
+pub(crate) fn canonical_preapproval_target(
+    class: EffectClass,
+    scope: &str,
+) -> Option<Cow<'_, str>> {
+    match class {
         EffectClass::Read | EffectClass::Write | EffectClass::Exec => {
             match Path::new(scope).canonicalize() {
-                Ok(path) => path.to_str()?.to_string(),
-                Err(_) => scope.to_string(),
+                Ok(path) => path.into_os_string().into_string().ok().map(Cow::Owned),
+                Err(_) => Some(Cow::Borrowed(scope)),
             }
         }
-        EffectClass::Egress => canonical_egress_target(scope),
-        EffectClass::Model | EffectClass::Control => scope.to_string(),
-    };
-    Some(format!("{}:{grant_id}:{scope}", class_key(class)))
+        EffectClass::Egress => Some(Cow::Owned(canonical_egress_target(scope))),
+        EffectClass::Model | EffectClass::Control => Some(Cow::Borrowed(scope)),
+    }
 }
 
 /// True when `grant_id` can occupy a preapproval key field: non-empty

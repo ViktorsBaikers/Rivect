@@ -65,8 +65,8 @@ const MCP_HANDSHAKE_METHOD: &str = "initialize";
 /// which the handshake has already grown.
 const MCP_CALL_METHOD: &str = "tools/call";
 
-/// The methods this client speaks. A reply to anything else is a
-/// `capability_unavailable` refusal, not a scheme this build invents.
+/// The request methods this client speaks. Initialization also sends the
+/// one-way `notifications/initialized` message before the tool call.
 pub const MCP_DECLARED_METHODS: &[&str] = &[MCP_HANDSHAKE_METHOD, MCP_CALL_METHOD];
 
 /// One bounded wait: an answer, a stop, or the peer's death — never an
@@ -105,6 +105,12 @@ pub const MCP_RETAINED_MAX_LINE_BYTES: usize = 4096;
 /// The workspace directory the retained artifacts live in — outside the
 /// disposable child trees, so cleanup cannot take the evidence with it.
 pub const MCP_REPORTS_DIR: &str = "reports";
+
+/// Whether this root entry belongs to retained evidence, including case aliases.
+pub fn is_evidence_directory(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .eq_ignore_ascii_case(MCP_REPORTS_DIR.as_bytes())
+}
 
 /// The id a seam reports when the map somehow does not carry it. It exists so
 /// the lookup is total without a panic; a case asserts every seam maps to its
@@ -210,6 +216,7 @@ pub enum McpReason {
     ReadFailed,
     UndeclaredMethod,
     ProtocolError,
+    ToolError,
     SpawnFailed,
     MissingProtocolVersion,
     UnsupportedProtocolVersion,
@@ -230,7 +237,7 @@ pub enum McpReason {
 
 impl McpReason {
     /// Every reason, in map order — the completeness sweep reads this.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::ArtifactUnavailable,
         Self::ClaimUnavailable,
         Self::CredentialRefused,
@@ -250,6 +257,7 @@ impl McpReason {
         Self::ReadFailed,
         Self::UndeclaredMethod,
         Self::ProtocolError,
+        Self::ToolError,
         Self::SpawnFailed,
         Self::MissingProtocolVersion,
         Self::UnsupportedProtocolVersion,
@@ -291,6 +299,7 @@ impl McpReason {
             Self::ReadFailed => "read_failed",
             Self::UndeclaredMethod => "undeclared_method",
             Self::ProtocolError => "protocol_error",
+            Self::ToolError => "tool_error",
             Self::SpawnFailed => "spawn_failed",
             Self::MissingProtocolVersion => "missing_protocol_version",
             Self::UnsupportedProtocolVersion => "unsupported_protocol_version",
@@ -333,6 +342,7 @@ impl McpReason {
             | Self::ReadFailed => McpSeam::Framing,
             Self::UndeclaredMethod
             | Self::ProtocolError
+            | Self::ToolError
             | Self::SpawnFailed
             | Self::MissingProtocolVersion
             | Self::UnsupportedProtocolVersion
@@ -917,7 +927,7 @@ pub struct Continuation {
 }
 
 /// What one logical operation ended as, on the surface and in the store.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct McpOutcome {
     pub operation: String,
     pub attempt: String,
@@ -928,6 +938,9 @@ pub struct McpOutcome {
     pub reason_code: Option<String>,
     pub continuation: Option<Continuation>,
     pub result: Option<Value>,
+    /// Optional structured tool output; like `result`, never persisted for replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     /// Every byte this session wrote, the `initialize` handshake included, so
     /// the count describes the session and never only the call frame.
     pub bytes_sent: u64,
@@ -935,11 +948,21 @@ pub struct McpOutcome {
     pub peer_version_digest: Option<String>,
 }
 
+impl std::fmt::Debug for McpOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOutcome")
+            .field("state", &self.state)
+            .field("code", &self.code)
+            .field("bytes_sent", &self.bytes_sent)
+            .finish_non_exhaustive()
+    }
+}
+
 impl McpOutcome {
     /// This outcome as the `mcp.call` result payload.
     #[must_use]
     pub fn wire(&self, server: &str) -> Value {
-        json!({
+        let mut wire = json!({
             "schema_version": crate::contracts::SCHEMA_VERSION,
             "kind": "mcp.call",
             "server": server,
@@ -954,7 +977,11 @@ impl McpOutcome {
             "result": self.result,
             "bytes_sent": self.bytes_sent,
             "artifact": self.artifact,
-        })
+        });
+        if let Some(content) = &self.structured_content {
+            wire["structured_content"] = content.clone();
+        }
+        wire
     }
 }
 
@@ -1108,6 +1135,7 @@ pub fn recorded(store: &TaskStore, operation: &str) -> Result<Option<McpOutcome>
         reason_code: record.reason_code,
         continuation: record.continuation,
         result: None,
+        structured_content: None,
         bytes_sent: record.bytes_sent,
         artifact: record.artifact,
         peer_version_digest: record.peer_version_digest,
@@ -1186,6 +1214,7 @@ pub fn settle_unresolved(
         reason_code: Some(reason.as_str().to_string()),
         continuation: None,
         result: None,
+        structured_content: None,
         bytes_sent: 0,
         artifact: artifact_relative(operation),
         peer_version_digest: None,
@@ -1693,16 +1722,25 @@ impl Session {
         encoded.push(b'\n');
         self.write_frame(&encoded, watch, RequestFrame::of(method))?;
         let answer = self.wait(watch)?;
-        let parsed: Value = serde_json::from_slice(&answer)
+        let mut parsed: Value = serde_json::from_slice(&answer)
             .map_err(|source| SeamFailure::framing_source(McpReason::MalformedFrame, &source))?;
+        if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(SeamFailure::framing(McpReason::MalformedFrame));
+        }
         if parsed.get("id").and_then(Value::as_u64) != Some(id) {
             return Err(SeamFailure::framing(McpReason::AnswerNamesAnotherRequest));
         }
         if let Some(error) = parsed.get("error") {
-            let missing_method = error.get("code").and_then(Value::as_i64) == Some(-32601);
+            let Some(code) = error.get("code").and_then(Value::as_i64) else {
+                return Err(SeamFailure::framing(McpReason::MalformedFrame));
+            };
+            if parsed.get("result").is_some() || !error.get("message").is_some_and(Value::is_string)
+            {
+                return Err(SeamFailure::framing(McpReason::MalformedFrame));
+            }
             return Err(SeamFailure::protocol(
                 McpReason::ProtocolError,
-                if missing_method {
+                if code == -32601 {
                     "the mcp server does not serve the requested method"
                 } else {
                     "the mcp server refused the request"
@@ -1710,8 +1748,8 @@ impl Session {
             ));
         }
         parsed
-            .get("result")
-            .cloned()
+            .get_mut("result")
+            .map(Value::take)
             .ok_or_else(|| SeamFailure::framing(McpReason::AnswerCarriesNoResult))
     }
 
@@ -1745,7 +1783,11 @@ impl Session {
             if written == encoded.len() {
                 break Ok(());
             }
-            match watch.cancelled(already.saturating_add(written as u64)) {
+            let call_bytes = match frame {
+                RequestFrame::Handshake => already,
+                RequestFrame::Call => already.saturating_add(written as u64),
+            };
+            match watch.cancelled(call_bytes) {
                 Ok(true) => break Err(SeamFailure::cancelled()),
                 Ok(false) => {}
                 Err(failure) => break Err(failure),
@@ -1923,7 +1965,7 @@ fn peer_version_digest(version: &str) -> String {
 
 /// The handshake's version verdict: the declared version is the only one this
 /// client speaks, and the peer's answer is fingerprinted rather than retained.
-fn negotiate(result: &Value) -> Result<String, SeamFailure> {
+fn negotiate(result: &Value) -> Result<(), SeamFailure> {
     let version = result
         .get("protocolVersion")
         .and_then(Value::as_str)
@@ -1944,7 +1986,111 @@ fn negotiate(result: &Value) -> Result<String, SeamFailure> {
             ),
         });
     }
-    Ok(peer_version_digest(version))
+    if !result
+        .pointer("/capabilities/tools")
+        .is_some_and(Value::is_object)
+    {
+        return Err(SeamFailure::protocol(
+            McpReason::ProtocolError,
+            "the mcp server did not declare the tools capability",
+        ));
+    }
+    if !result
+        .pointer("/serverInfo/name")
+        .is_some_and(Value::is_string)
+        || !result
+            .pointer("/serverInfo/version")
+            .is_some_and(Value::is_string)
+    {
+        return Err(SeamFailure::protocol(
+            McpReason::ProtocolError,
+            "the mcp server did not identify its implementation",
+        ));
+    }
+    Ok(())
+}
+
+enum ToolResult {
+    InputRequired(String),
+    Complete {
+        content: Value,
+        structured: Option<Value>,
+    },
+}
+
+fn supported_content(block: &Value) -> bool {
+    let string = |key: &str| block.get(key).is_some_and(Value::is_string);
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => string("text"),
+        Some("image" | "audio") => string("data") && string("mimeType"),
+        Some("resource_link") => string("uri") && string("name"),
+        Some("resource") => block.get("resource").is_some_and(|resource| {
+            resource.get("uri").is_some_and(Value::is_string)
+                && (resource.get("text").is_some_and(Value::is_string)
+                    || resource.get("blob").is_some_and(Value::is_string))
+        }),
+        _ => false,
+    }
+}
+
+fn tool_result(mut result: Value) -> Result<ToolResult, SeamFailure> {
+    let unknown = || {
+        SeamFailure::unreadable_verdict(
+            McpReason::UnknownResultType,
+            "the mcp server answered an unsupported tool result",
+        )
+    };
+    if let Some(flag) = result.get("isError")
+        && flag.as_bool().ok_or_else(unknown)?
+    {
+        return Err(SeamFailure::protocol(
+            McpReason::ToolError,
+            "the mcp tool reported an execution error",
+        ));
+    }
+    if let Some(kind) = result.get("resultType") {
+        match kind.as_str() {
+            Some("input_required") => {
+                let handle = result
+                    .get("requestState")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if handle.is_empty() {
+                    return Err(SeamFailure::protocol(
+                        McpReason::ContinuationWithoutHandle,
+                        "the mcp server asked for input without a continuation handle",
+                    ));
+                }
+                if !is_bounded_token(handle, 64) {
+                    return Err(SeamFailure::unreadable_verdict(
+                        McpReason::ContinuationHandleUnbounded,
+                        "the mcp server asked for input with an unusable continuation handle",
+                    ));
+                }
+                return Ok(ToolResult::InputRequired(handle.to_owned()));
+            }
+            Some("complete") => {}
+            _ => return Err(unknown()),
+        }
+    }
+    let content = result
+        .get_mut("content")
+        .filter(|value| {
+            value
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().all(supported_content))
+        })
+        .ok_or_else(unknown)?
+        .take();
+    let structured = match result.get_mut("structuredContent") {
+        Some(value) if value.is_object() => Some(value.take()),
+        Some(_) => return Err(unknown()),
+        None => None,
+    };
+    Ok(ToolResult::Complete {
+        content,
+        structured,
+    })
 }
 
 /// Where one logical operation's run stands when a call is refused after its
@@ -2055,6 +2201,7 @@ impl Running<'_> {
             reason_code: failure.map(|failure| failure.reason.as_str().to_string()),
             continuation: None,
             result,
+            structured_content: None,
             bytes_sent,
             artifact: self.artifact.clone(),
             peer_version_digest: None,
@@ -2244,74 +2391,40 @@ pub fn run(
         .map(|version| peer_version_digest(&bounded_peer_text(version, 40)));
     let answered = version.and_then(|result| {
         negotiate(&result)?;
-        // The same spelling [`RequestFrame::of`] classifies on, so the call
-        // frame cannot be mistaken for the handshake.
-        session.request(MCP_CALL_METHOD, params, &mut watch)
+        session.write_frame(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            &mut watch,
+            RequestFrame::Handshake,
+        )?;
+        tool_result(session.request(MCP_CALL_METHOD, params, &mut watch)?)
     });
     // The count the settlement keeps is every byte this session wrote — the
     // handshake included — so the artifact shows a handshake even when no call
     // frame left; the seam above was classified on the call frame's own bytes.
     let bytes_sent = session.bytes_sent;
     let outcome = match answered {
-        Ok(result) => {
-            let kind = result
-                .get("resultType")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            match kind {
-                "input_required" => {
-                    let handle = result
-                        .get("requestState")
-                        .and_then(Value::as_str)
-                        .map(|handle| bounded_peer_text(handle, 64))
-                        .unwrap_or_default();
-                    if !is_bounded_token(&handle, 64) {
-                        let failure = SeamFailure::unreadable_verdict(
-                            McpReason::ContinuationHandleUnbounded,
-                            "the mcp server asked for input with an unusable continuation handle",
-                        );
-                        running.outcome(failure.state, Some(&failure), None, bytes_sent)
-                    } else if handle.is_empty() {
-                        let failure = SeamFailure::protocol(
-                            McpReason::ContinuationWithoutHandle,
-                            "the mcp server asked for input without a continuation handle",
-                        );
-                        running.outcome(McpState::Failed, Some(&failure), None, bytes_sent)
-                    } else {
-                        let first = recorded_continuation(&*running.store, &operation)?;
-                        let handle = first.unwrap_or(handle);
-                        write_record(
-                            running.store,
-                            &continuation_boundary(&operation),
-                            &operation,
-                            &Continuation {
-                                handle: handle.clone(),
-                                logical_operation_id: operation.clone(),
-                            },
-                        )?;
-                        let mut outcome =
-                            running.outcome(McpState::InputRequired, None, None, bytes_sent);
-                        outcome.continuation = Some(Continuation {
-                            handle,
-                            logical_operation_id: operation.clone(),
-                        });
-                        outcome
-                    }
-                }
-                "complete" => running.outcome(
-                    McpState::Succeeded,
-                    None,
-                    result.get("content").cloned(),
-                    bytes_sent,
-                ),
-                _ => {
-                    let failure = SeamFailure::unreadable_verdict(
-                        McpReason::UnknownResultType,
-                        "the mcp server answered a result type this client does not declare",
-                    );
-                    running.outcome(failure.state, Some(&failure), None, bytes_sent)
-                }
-            }
+        Ok(ToolResult::InputRequired(handle)) => {
+            let continuation = Continuation {
+                handle: recorded_continuation(&*running.store, &operation)?.unwrap_or(handle),
+                logical_operation_id: operation.clone(),
+            };
+            write_record(
+                running.store,
+                &continuation_boundary(&operation),
+                &operation,
+                &continuation,
+            )?;
+            let mut outcome = running.outcome(McpState::InputRequired, None, None, bytes_sent);
+            outcome.continuation = Some(continuation);
+            outcome
+        }
+        Ok(ToolResult::Complete {
+            content,
+            structured,
+        }) => {
+            let mut outcome = running.outcome(McpState::Succeeded, None, Some(content), bytes_sent);
+            outcome.structured_content = structured;
+            outcome
         }
         Err(failure) => running.outcome(failure.state, Some(&failure), None, bytes_sent),
     };
