@@ -23,7 +23,8 @@ with chat_terminal(Path(sys.argv[1]).resolve(strict=True), 'loopback', '', befor
     see(master, b'Paste the callback URL')
     os.write(master, b'\x19')
     see(master, b'https://auth.openai.com/oauth/authorize?')
-    see(master, b'originator=')
+    # The parameter name can straddle physical rows in a narrow viewport.
+    see(master, b'=omp')
     os.write(master, b'\x1b[200~' + callback.replace(b'/callback?', b'/wrong?') + b'\x1b[201~\r')
     assert secret not in see(master, b'Input discarded')
     os.write(master, b'\x1b')
