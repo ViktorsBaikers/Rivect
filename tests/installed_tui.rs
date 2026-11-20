@@ -3250,8 +3250,8 @@ fn installed_fresh_project_prepares_and_cancels_login() {
         .wait_settled_after("Paste the callback URL", 0, WAIT)
         .expect("private callback prompt");
     assert!(
-        pending.contains("Private login") && pending.contains("Login pending: https://"),
-        "{pending}"
+        pending.contains("Private login") && pending.contains("Open OpenAI sign-in"),
+        "missing sign-in link in private panel"
     );
     tui.send(b"\x1b")
         .expect("leave private entry without completing login");

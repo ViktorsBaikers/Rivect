@@ -1,5 +1,5 @@
 import { createMemo, createSignal, onCleanup, Show } from 'solid-js';
-import { useKeyboard, usePaste, useRenderer } from '@opentui/solid';
+import { useKeyboard, usePaste } from '@opentui/solid';
 import type { ScrollBoxRenderable } from '@opentui/core';
 import { palette } from './theme';
 import { goalByteLimit } from './input';
@@ -8,7 +8,6 @@ import type { CoreClient } from './core';
 export type LoginInput = 'blocked' | 'callback';
 export function PrivateLogin(props:{mode:LoginInput; owner?:CoreClient; lines:readonly string[]; close:(result?:string[])=>void}) {
   const [state,setState] = createSignal(''), [filled,setFilled] = createSignal(false);
-  const renderer = useRenderer();
   const signIn = createMemo(() => {
     const prefix = 'Login pending: ';
     const line = props.lines[0];
@@ -46,12 +45,7 @@ export function PrivateLogin(props:{mode:LoginInput; owner?:CoreClient; lines:re
     if (key.eventType !== 'press' || key.repeated || pending) return;
     if (key.name === 'escape') { clear(); props.close(); return; }
     if (props.mode === 'callback' && key.ctrl && !key.meta && !key.option && !key.super && key.name === 'y') {
-      const url = signIn();
-      if (url) {
-        const sent = renderer.copyToClipboardOSC52(url);
-        setShowUrl(true);
-        setState(sent ? 'Copy requested. If blocked, select the URL below.' : 'Terminal clipboard unavailable. Select the URL below.');
-      }
+      if (signIn()) setShowUrl(value => !value);
       return;
     }
     if (props.mode === 'blocked' || key.ctrl || key.meta || key.option || key.super) return;
@@ -72,7 +66,7 @@ export function PrivateLogin(props:{mode:LoginInput; owner?:CoreClient; lines:re
       <scrollbox ref={node=>{details=node;}} flexGrow={1} minHeight={0}>
         <Show when={signIn()} keyed>{url => <>
           <text fg={palette.accent}><a href={url}><u>Open OpenAI sign-in</u></a></text>
-          <text fg={palette.ink}>Ctrl+Y copies sign-in URL</text>
+          <text fg={palette.ink}>Copy link in terminal · Ctrl+Y shows full URL</text>
           <Show when={showUrl()}><text fg={palette.ink}>{url}</text></Show>
         </>}</Show>
         <text fg={palette.ink}>If the browser cannot reach localhost, leave that tab open.</text>

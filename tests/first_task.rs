@@ -6592,7 +6592,7 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
     for marker in [
         "Private login",
         "Paste the callback URL",
-        "https://auth.openai.com/oauth/authorize?",
+        "Open OpenAI sign-in",
     ] {
         assert!(
             support::wait_for_screen_text(&pty, 24, 100, marker, WAIT)
