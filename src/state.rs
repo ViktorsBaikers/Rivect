@@ -1847,11 +1847,9 @@ impl TaskStore {
         let present: i64 = conn
             .query_row(sql::RECOVERY_TABLES_PRESENT, [], |row| row.get(0))
             .map_err(storage)?;
-        // Five: the settlement reconciliation writes `usage_settlements` and
-        // the incremental `usage_totals` row, so a store predating either
-        // additive table takes the post-commit path, where the DDL exists and
-        // the totals row is backfilled before the first recovery write.
-        if present != 5 {
+        // Additive tables can be missing even at the current schema generation.
+        // Publish them and backfill usage totals before recovery uses them.
+        if present != 6 {
             return Ok(false);
         }
         // A store reverted to a build without the incremental row leaves the

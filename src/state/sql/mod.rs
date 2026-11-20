@@ -998,7 +998,7 @@ pub const ADD_BASE_STATE_SET_EPOCH: &str =
 pub const RECOVERY_TABLES_PRESENT: &str = "SELECT COUNT(*) FROM sqlite_schema
              WHERE type = 'table'
              AND name IN ('config_publications', 'retained', 'attempts', 'usage_settlements',
-                          'usage_totals')";
+                          'usage_totals', 'ui_message_replies')";
 /// The consistent copy an update takes before it touches anything: `VACUUM
 /// INTO` writes one complete database beside the primary from the connection
 /// that holds the writer lock, so the copy is transactionally consistent

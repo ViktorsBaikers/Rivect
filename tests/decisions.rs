@@ -5263,8 +5263,9 @@ fn card_paste_outside_editing_is_refused_and_named() {
 fn card_esc_leaves_the_question_pending() {
     let mut card = CardPty::open(50, 160, false);
     card.send(b"\x1b");
-    let frame = card.see(DECISION_UNANSWERED);
-    assert!(!frame.contains("Enter selects"));
+    card.until("dismissed decision card", |frame| {
+        frame.contains(DECISION_UNANSWERED) && !frame.contains("Enter selects")
+    });
     card.pending(&card.question);
 }
 

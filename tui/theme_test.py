@@ -51,6 +51,11 @@ class ThemeTest(unittest.TestCase):
                 raw = self.frame(inline=True, RIVECT_THEME='high-contrast', **override)
                 self.assertNotRegex(raw, rb'\x1b\[(?:[0-9;]*;)?(?:3[0-8]|4[0-8]|58|9[0-7]|10[0-7])(?:[;:][0-9;:]*)?m')
 
+    def test_ssh_with_only_term_uses_indexed_colors(self):
+        raw = self.frame()
+        self.assertRegex(raw, rb'(?:38|48);5;13(?:[;m])')
+        self.assertNotRegex(raw, rb'(?:38|48)[;:]2[;:]')
+
     def test_background_heuristic(self):
         for background, status in [('15;0', b'6'), ('0;15', b'4')]:
             with self.subTest(background=background):
@@ -58,7 +63,7 @@ class ThemeTest(unittest.TestCase):
                 self.assertIn(status, colors)
 
     def test_mono_and_unknown(self):
-        for env in [{}, {'COLORFGBG':'15;999'}, {'RIVECT_THEME':'light', 'NO_COLOR':''}, {'RIVECT_THEME':'dark', 'TERM':'dumb'},
+        for env in [{'TERM':'vt100'}, {'TERM':'vt100', 'COLORFGBG':'15;999'}, {'RIVECT_THEME':'light', 'NO_COLOR':''}, {'RIVECT_THEME':'dark', 'TERM':'dumb'},
                     {'RIVECT_THEME':'bad-control-value', 'COLORFGBG':'15;0'}]:
             with self.subTest(env=env):
                 raw = self.frame(**env)

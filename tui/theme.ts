@@ -11,9 +11,11 @@ const color = !!process.stdout.isTTY && process.env.NO_COLOR === undefined && te
 const mux = process.env.RIVECT_HOST_MUX === '1' || /^(?:tmux|screen)(?:-|$)/u.test(term);
 const capable = /^(?:truecolor|24bit)$/iu.test(process.env.COLORTERM ?? '') || term.endsWith('-direct');
 const thread = color && capable && !mux && (theme === 'dark' || (raw === undefined && theme === undefined));
-const indexed = color && theme !== undefined && !thread;
+// SSH may forward TERM without the local emulator's theme or truecolor hints.
+const indexed = color && !thread && (theme !== undefined ||
+  (raw === undefined && (capable || /-(?:256|88)color$/u.test(term))));
 const token = (light: number, dark: number, high: number, plum: string) => thread ? RGBA.fromHex(plum)
-  : indexed ? RGBA.fromIndex(theme === 'light' ? light : theme === 'dark' ? dark : high) : terminalInk;
+  : indexed ? RGBA.fromIndex(theme === 'light' ? light : theme === 'high-contrast' ? high : dark) : terminalInk;
 const ink = thread ? RGBA.fromHex('#f0e2ee') : terminalInk;
 const canvas = thread ? RGBA.fromHex('#1c1521') : terminalCanvas;
 

@@ -197,6 +197,47 @@ fn raw_request(child: &mut std::process::Child, frame: Value) -> std::io::Result
 }
 
 #[test]
+fn boot_upgrades_existing_history_before_reconciling_message_replies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let mut child = private_child(root.path())?;
+    let opened = request(
+        &mut child,
+        "session.open",
+        json!({"bootstrap_id":"before-upgrade"}),
+    )?;
+    let session = &opened["result"]["session_id"];
+    let message = request(
+        &mut child,
+        "task.message",
+        json!({"session_id":session,"command_id":"retained","goal":"keep existing history"}),
+    )?;
+    assert_eq!(message["result"]["status"], "accepted", "{message}");
+    drop(child.stdin.take());
+    assert!(child.wait()?.success());
+
+    let db = rusqlite::Connection::open(root.path().join("runtime/rivect.db"))?;
+    db.execute_batch("DROP TABLE ui_message_replies")?;
+    drop(db);
+
+    let mut child = private_child(root.path())?;
+    let boot = request(&mut child, "runtime.boot", json!({}))?;
+    assert!(boot["result"].is_object(), "{boot}");
+    let attached = request(
+        &mut child,
+        "session.attach",
+        json!({"session_id":session,"bootstrap_id":"after-upgrade"}),
+    )?;
+    assert_eq!(
+        attached["result"]["tasks"][0]["goal"], "keep existing history",
+        "{attached}"
+    );
+    drop(child.stdin.take());
+    assert!(child.wait()?.success());
+    Ok(())
+}
+
+#[test]
 fn boot_reports_pending_verdict_without_echoing_invalid_config()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
