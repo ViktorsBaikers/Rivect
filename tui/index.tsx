@@ -563,7 +563,7 @@ export function Thread(opened: Startup) {
             <Show when={task().events.some(event => event.category !== 'task' && event.category !== 'waiting') ||
               task().preview || task().output || task().reply !== undefined || task().proposedDiff || task().errorCode}>
               <ThreadNode label="Main" compact={compact()}
-                footer={task().reply === undefined ? task().output?.status : undefined}>
+                footer={fullscreen() || task().reply === undefined ? task().output?.status : undefined}>
                 <Index each={task().events.filter(event => event.category !== 'task' && event.category !== 'waiting')}>{event =>
                   <ThreadBranch label={event().category === 'agent' && event().type === 'question.published' ? event().type : event().category ?? event().type}>
                     <Show when={event().text}>{description => <text fg={ink}>{description()}</text>}</Show>
