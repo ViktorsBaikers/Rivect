@@ -6611,16 +6611,18 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
     support::wait_for_screen_text(&pty, 24, 100, "Sign in · OpenAI (ChatGPT)", WAIT)
         .expect("method step");
     pty.send(b"\r").expect("start the browser leg");
-    // Do not print the private panel: it contains fresh callback state.
+    // The panel replaces the picker in one frame; require its link and its
+    // private entry together so a mid-transition composite never passes.
     let frame = see_frame(&mut pty, 100, "browser sign-in panel", |screen| {
-        screen.contents().contains("Sign in · browser")
+        let text = screen.contents();
+        text.contains("Sign in · browser")
+            && text.contains("Open sign-in page")
+            && text.contains("Paste the redirect URL")
     });
-    for marker in ["Open sign-in page", "Paste the redirect URL"] {
-        assert!(
-            frame.contains(marker),
-            "missing {marker} in the panel: {frame}"
-        );
-    }
+    assert!(
+        frame.contains("Open sign-in page") && frame.contains("Paste the redirect URL"),
+        "{frame}"
+    );
     pty.send(b"\x1b").expect("cancel the pending leg");
     // Re-parse the real VT100 grid, not the text-only approximation, after
     // the TUI leaves the private surface. Keep callback state out of diagnostics.
