@@ -6587,21 +6587,41 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
     assert!(screen.contains("Run /login"), "{screen}");
     assert!(!screen.contains("settled unknown"), "{screen}");
     assert!(!screen.contains("NOT_RUN"), "{screen}");
-    pty.send(b"/login\r").expect("start browser login");
-    // Do not print the private panel: it contains fresh callback state.
+    pty.send(b"/login\r").expect("open the provider picker");
+    // The picker is core-served: every login provider appears before any leg
+    // exists, and the private panel never appears until one is chosen.
     for marker in [
-        "Private login",
-        "Paste the callback URL",
-        "Open OpenAI sign-in",
+        "Sign in to a provider",
+        "Anthropic (Claude)",
+        "Kimi Code",
+        "OpenAI (ChatGPT)",
     ] {
         assert!(
             support::wait_for_screen_text(&pty, 24, 100, marker, WAIT)
-                .expect("private login panel")
+                .expect("provider picker")
                 .contains(marker),
-            "missing private login marker"
+            "missing picker marker {marker}"
         );
     }
-    pty.send(b"\x1b").expect("close private login panel");
+    // The list is ordered by id; OpenAI is the fourth row.
+    pty.send(b"\x1b[B\x1b[B\x1b[B").expect("move to OpenAI");
+    support::wait_for_screen_text(&pty, 24, 100, "▪ OpenAI (ChatGPT)", WAIT)
+        .expect("selected provider row");
+    pty.send(b"\r").expect("open the method list");
+    support::wait_for_screen_text(&pty, 24, 100, "Sign in · OpenAI (ChatGPT)", WAIT)
+        .expect("method step");
+    pty.send(b"\r").expect("start the browser leg");
+    // Do not print the private panel: it contains fresh callback state.
+    let frame = see_frame(&mut pty, 100, "browser sign-in panel", |screen| {
+        screen.contents().contains("Sign in · browser")
+    });
+    for marker in ["Open sign-in page", "Paste the redirect URL"] {
+        assert!(
+            frame.contains(marker),
+            "missing {marker} in the panel: {frame}"
+        );
+    }
+    pty.send(b"\x1b").expect("cancel the pending leg");
     // Re-parse the real VT100 grid, not the text-only approximation, after
     // the TUI leaves the private surface. Keep callback state out of diagnostics.
     let deadline = std::time::Instant::now() + WAIT;
@@ -6612,8 +6632,7 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
         parser.process(&bytes[offset..]);
         offset = bytes.len();
         let pending = parser.screen().contents();
-        if pending.contains("Message → Main") && pending.contains("Login pending · /login cancel")
-        {
+        if pending.contains("Message → Main") && pending.contains("Login cancelled.") {
             assert!(
                 !pending.contains("Session connected") && !pending.contains("oauth/authorize"),
                 "private login data remained in the thread"
@@ -6627,9 +6646,7 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
         pty.pump_for(Duration::from_millis(25))
             .expect("pending login repaint");
     }
-    pty.send(b"/login cancel\r").expect("cancel browser login");
-    let cancelled = support::visible_text(&pty, 24, 100, "Login cancelled.", WAIT);
-    assert!(cancelled.contains("Login cancelled."), "{cancelled}");
+    let cancelled = support::visible_text(&pty, 24, 100, "not connected", WAIT);
     assert!(cancelled.contains("not connected"), "{cancelled}");
     pty.send(b"\x1b").expect("pty send exit");
     assert_eq!(

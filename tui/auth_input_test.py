@@ -1,4 +1,5 @@
-"""A callback pasted into the ordinary composer must never become a goal or echo its code."""
+"""The sign-in picker reaches every provider, and a pasted callback never
+becomes a goal, never echoes its code and never leaves the private panel."""
 import os
 from pathlib import Path
 import sqlite3
@@ -18,9 +19,24 @@ with chat_terminal(Path(sys.argv[1]).resolve(strict=True), 'loopback', '', befor
     secret = b'private-test-code-42'
     see = terminal_reader(secret)
     callback = b'http://localhost:1455/auth/callback?state=wrong&code=' + secret
-    os.write(master, b'/login\r')  # Browser PKCE begin produces a URL locally; no token exchange.
-    see(master, b'Open OpenAI sign-in')
-    see(master, b'Paste the callback URL')
+
+    # The picker lists every provider the core can sign in to, and the search
+    # filters by name and id.
+    os.write(master, b'/login\r')
+    see(master, b'Sign in to a provider')
+    see(master, b'OpenAI (ChatGPT)')
+    see(master, b'Anthropic (Claude)')
+    # The list is ordered by id: Anthropic, Copilot, Kimi, OpenAI, Z.AI.
+    os.write(master, b'\x1b[B\x1b[B\x1b[B')
+    see(master, b'\xe2\x96\xaa OpenAI (ChatGPT)')
+    os.write(master, b'\r')
+    see(master, b'Sign in \xc2\xb7 OpenAI (ChatGPT)')
+    see(master, b'Device code')
+
+    # A provider with two methods asks once; the browser leg takes it.
+    os.write(master, b'\r')
+    see(master, b'Open sign-in page')
+    see(master, b'Paste the redirect URL')
     os.write(master, b'\x19')
     def complete_url(screen):
         # Join visible content cells across wraps, excluding the sidebar.
@@ -28,23 +44,21 @@ with chat_terminal(Path(sys.argv[1]).resolve(strict=True), 'loopback', '', befor
         return b'https://auth.openai.com/oauth/authorize?' in content and b'&originator=omp' in content
 
     see(master, b'complete authorization URL', screen_matches=complete_url)
+
+    # A stale redirect is refused without echoing the code, and the private
+    # entry stays hidden.
     os.write(master, b'\x1b[200~' + callback.replace(b'/callback?', b'/wrong?') + b'\x1b[201~\r')
-    assert secret not in see(master, b'Input discarded')
+    assert secret not in see(master, b'Redirect refused')
+
+    # A callback pasted outside the panel is discarded before it can become a
+    # goal or a stored task.
     os.write(master, b'\x1b')
-    assert secret not in see(master, b'Login pending')
+    see(master, b'Login cancelled.')
     os.write(master, b'\x1b[200~' + callback + b'\x1b[201~\r')
-    result = see(master, b'Private login')
-    assert secret not in result
-    os.write(master, b'\x1b')
-    restored = see(master, b'Message')
-    assert secret not in restored
-    os.write(master, b'http://localhost:1455/auth/callback?')
-    see(master, b'Private login')
-    os.write(master, b'code=' + secret + b'\r\x1b')
-    see(master, b'Message')
-    os.write(master, b'/login cancel\r')
-    assert secret not in see(master, b'Login cancelled.')
-    os.write(master, b'/permissions\r')
+    assert secret not in see(master, b'Callback discarded')
+    assert secret not in see(master, b'Message')
+
+    os.write(master, b'\x1b[200~/permissions\x1b[201~\r')
     result = see(master, b'Permissions:')
     assert secret not in result
     with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:

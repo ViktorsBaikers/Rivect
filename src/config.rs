@@ -1987,6 +1987,57 @@ impl Config {
         Ok(self.finish_edit())
     }
 
+    /// Declares one sign-in catalogue row: its connection and its credential
+    /// profile, both create-only. An already declared connection is left
+    /// byte-identical, so selecting the same provider twice journals nothing
+    /// new. The edited document must still validate whole; a rejection
+    /// restores the retained original.
+    pub fn declare_connection(
+        &mut self,
+        provider: &crate::providers::login_catalog::Provider,
+    ) -> Result<ConfigEdit, ConfigError> {
+        let key = format!("connections.{}", provider.id);
+        if self.connections.contains_key(provider.id) {
+            return Ok(self.finish_edit());
+        }
+        let original = self.raw.clone();
+        let edited = self.require_document(&key).and_then(|doc| {
+            let connection =
+                ensure_table_like(doc.as_item_mut(), &["connections", provider.id], &key)?;
+            set_field(
+                connection,
+                "kind",
+                toml_edit::value(provider.kind.to_string()),
+            );
+            set_field(connection, "endpoint", toml_edit::value(provider.endpoint));
+            let reference = format!("keyring:rivect/{}", provider.profile);
+            set_field(
+                connection,
+                "credential_ref",
+                toml_edit::value(reference.as_str()),
+            );
+            set_field(connection, "profile", toml_edit::value(provider.profile));
+            let profile_key = format!("profiles.{}", provider.profile);
+            let profile = ensure_table_like(
+                doc.as_item_mut(),
+                &["profiles", provider.profile],
+                &profile_key,
+            )?;
+            set_field(
+                profile,
+                "credential_ref",
+                toml_edit::value(reference.as_str()),
+            );
+            validated_document(doc).map(|_| ())
+        });
+        if let Err(error) = edited {
+            self.raw = original;
+            return Err(error);
+        }
+        self.refresh_view_if_valid();
+        Ok(self.finish_edit())
+    }
+
     fn require_document(&mut self, key: &str) -> Result<&mut DocumentMut, ConfigError> {
         self.raw
             .as_mut()

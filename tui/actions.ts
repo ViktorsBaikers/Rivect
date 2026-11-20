@@ -3,6 +3,54 @@ import { record, u64, type Task } from './wire';
 export type OperatorAction = {kind: 'settings' | 'permissions' | 'accounting' | 'login_browser' | 'login_device' | 'login_cancel' | 'login_complete'} |
   {kind: 'login_callback'; redirect: string};
 
+/** One sign-in method the core advertises for a provider. */
+export type LoginMethod = {id: string; label: string; capture: boolean};
+/** One provider row the `/login` picker renders. */
+export type LoginProvider = {id: string; name: string; declared: boolean; methods: LoginMethod[]};
+/** The receipt a started leg carries: what to open and whether the core
+ * captures the redirect itself. */
+export type LoginPending = {provider: string; method: string; url: string; user_code?: string; capture: boolean};
+export type LoginReceipt = {lines: string[]; pending?: LoginPending};
+
+/** The three picker actions plus the leg's own lifecycle. */
+export type LoginAction =
+  {kind: 'login_providers'} |
+  {kind: 'login_connect'; provider: string} |
+  {kind: 'login_start'; provider: string; method: string} |
+  {kind: 'login_complete'} |
+  {kind: 'login_cancel'} |
+  {kind: 'login_callback'; redirect: string};
+
+/** A provider row is only rendered from the exact recorded shape: an extra or
+ * missing member is a protocol error, never a guess. */
+export function loginProviders(value: unknown): LoginProvider[] {
+  if (!Array.isArray(value) || !value.length) throw new Error('invalid sign-in catalogue');
+  return value.map(raw => {
+    if (!record(raw) || typeof raw.id !== 'string' || !raw.id || typeof raw.name !== 'string' || !raw.name ||
+        typeof raw.declared !== 'boolean' || !Array.isArray(raw.methods) || !raw.methods.length)
+      throw new Error('invalid sign-in provider');
+    const methods = raw.methods.map(method => {
+      if (!record(method) || typeof method.id !== 'string' || !method.id || typeof method.label !== 'string' ||
+          typeof method.capture !== 'boolean') throw new Error('invalid sign-in method');
+      return {id: method.id, label: method.label, capture: method.capture};
+    });
+    return {id: raw.id, name: raw.name, declared: raw.declared, methods};
+  });
+}
+
+/** The pending receipt a started leg answers; absent for every other receipt. */
+export function loginPending(value: unknown): LoginPending | undefined {
+  if (value === undefined) return;
+  if (!record(value) || typeof value.provider !== 'string' || typeof value.method !== 'string' ||
+      typeof value.url !== 'string' || typeof value.capture !== 'boolean')
+    throw new Error('invalid login receipt');
+  const code = value.user_code;
+  if (code != null && typeof code !== 'string') throw new Error('invalid login receipt');
+  return {provider: value.provider, method: value.method, url: value.url,
+    user_code: code ?? undefined, capture: value.capture};
+}
+
+
 export function operatorAction(input: string): OperatorAction | undefined {
   switch (input) {
     case '/settings': case '/config': return {kind: 'settings'};

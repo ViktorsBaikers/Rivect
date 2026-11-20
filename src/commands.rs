@@ -230,6 +230,10 @@ pub struct Runtime {
     /// The one login `auth.login.begin` minted and `auth.login.complete`
     /// consumes — the browser PKCE session or the device poll.
     pending_login: Option<PendingLogin>,
+    /// The loopback capture beside a pending browser leg. It retains one
+    /// redirect URL; `auth.login.complete` consumes it when the caller pastes
+    /// nothing. Dropped with its leg, which closes the socket.
+    login_callback: Option<crate::providers::login_callback::CallbackListener>,
     /// Boot-time publication-recovery verdicts a human must resolve:
     /// collected, sanitized lines with their resolution. Each surface
     /// reports them its own way — headless stderr, TUI transcript — and
@@ -324,6 +328,9 @@ enum PendingLogin {
     Browser(crate::providers::openai_login::LoginSession),
     Device(crate::providers::openai_login::DeviceLoginSession),
     KimiDevice(crate::providers::kimi::DeviceLoginSession),
+    AnthropicBrowser(crate::providers::anthropic_login::LoginSession),
+    ZaiBrowser(crate::providers::zai_login::LoginSession),
+    CopilotDevice(crate::providers::copilot_login::DeviceLoginSession),
 }
 
 impl PendingLogin {
@@ -332,6 +339,11 @@ impl PendingLogin {
             Self::Browser(session) => session.state(),
             Self::Device(device) => device.state(),
             Self::KimiDevice(device) => device.state(),
+            Self::AnthropicBrowser(session) => session.state(),
+            Self::ZaiBrowser(session) => session.state(),
+            // The device leg carries no CSRF state: its handle is the peer's
+            // device code, which `complete` never accepts from a caller.
+            Self::CopilotDevice(_) => "",
         }
     }
 }
@@ -1896,6 +1908,7 @@ impl Runtime {
             #[cfg(test)]
             login_endpoints: None,
             pending_login: None,
+            login_callback: None,
             boot_diagnostics,
             base_recovery,
             paused_attempts: BTreeMap::new(),
@@ -2772,6 +2785,8 @@ const METHODS: &[&str] = &[
     "auth.login.begin",
     "auth.login.complete",
     "auth.login.cancel",
+    "auth.providers",
+    "provider.connect",
     "auth.refresh",
     "auth.logout",
     "auth.revoke",
@@ -6109,6 +6124,8 @@ fn handle_method(
         "auth.login.begin" => auth_login_begin(rt, ingress, &params, id),
         "auth.login.complete" => auth_login_complete(rt, ingress, &params, id),
         "auth.login.cancel" => auth_login_cancel(rt, ingress, &params, id),
+        "auth.providers" => auth_providers(rt, id),
+        "provider.connect" => provider_connect(rt, ingress, &params, id),
         "auth.refresh" => auth_refresh(rt, ingress, &params, id),
         "auth.logout" => auth_logout(rt, ingress, &params, id),
         "auth.revoke" => auth_revoke(rt, ingress, &params, id),
@@ -8014,6 +8031,7 @@ const LOGIN_BEGIN_ENDPOINT_PARAMS: &[&str] = &[
     "token_endpoint",
     "usercode_endpoint",
     "device_token_endpoint",
+    "callback_port",
 ];
 /// Whether this build admits the contract-peer endpoint overrides. The
 /// library proofs link the debug profile, so integration tests keep their
@@ -8036,7 +8054,35 @@ fn unknown_login_begin_param(params: &Value, allow_endpoints: bool) -> Option<Re
     }
     unknown_param(params, LOGIN_BEGIN_PARAMS)
 }
+/// The debug/test bind-port seam: moves the capture socket without changing
+/// the recorded redirect origin. A release build always answers `None`,
+/// because the parameter itself is refused before this reads it.
+fn login_callback_port(params: &Value) -> Option<u16> {
+    if !LOGIN_ENDPOINT_OVERRIDE {
+        return None;
+    }
+    params
+        .get("callback_port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+}
+
 const LOGIN_COMPLETE_PARAMS: &[&str] = &["schema_version", "state", "redirect"];
+/// The complete-side endpoint seam, admitted beside the begin-side one.
+const LOGIN_COMPLETE_ENDPOINT_PARAMS: &[&str] = &["token_endpoint"];
+
+/// The first unknown key of one login-complete request. The endpoint seam
+/// joins the set only when the build admits it, so a release caller gets a
+/// typed `UnknownParameter` instead of a silently ignored redirect target.
+fn unknown_login_complete_param(params: &Value) -> Option<RequestError> {
+    match unknown_param(params, LOGIN_COMPLETE_PARAMS) {
+        None if LOGIN_ENDPOINT_OVERRIDE => unknown_param(
+            params,
+            &[LOGIN_COMPLETE_PARAMS, LOGIN_COMPLETE_ENDPOINT_PARAMS].concat(),
+        ),
+        error => error,
+    }
+}
 
 /// Durable ingress policy shared by the login and sharing methods: the
 /// trusted human and the local machine ingress may steer them; the read-only
@@ -8078,6 +8124,316 @@ fn unknown_param(params: &Value, known: &[&str]) -> Option<RequestError> {
         .map(|name| RequestError::UnknownParameter { name: name.clone() })
 }
 
+/// `auth.providers`: the sign-in catalogue this build serves. Each row names
+/// its connection, whether the document already declares it, and the methods
+/// the picker offers. Nothing here reads a credential.
+fn auth_providers(rt: &Runtime, id: Value) -> RpcResponse {
+    let config = rt.config_for_broker();
+    let declared = |name: &str| config.connections.contains_key(name);
+    let rows: Vec<Value> = crate::providers::login_catalog::PROVIDERS
+        .iter()
+        .map(|provider| {
+            json!({
+                "id": provider.id,
+                "name": provider.name,
+                "declared": declared(provider.id),
+                "methods": provider.methods.iter().map(|method| json!({
+                    "id": method.id,
+                    "label": method.label,
+                    "capture": method.callback.is_some(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    RpcResponse::ok(
+        id,
+        json!({"schema_version": SCHEMA_VERSION, "kind": "auth.providers", "providers": rows}),
+    )
+}
+
+/// `provider.connect`: declares the catalogue row an operator selected — its
+/// connection and credential profile — through the same journaled config
+/// admission every other edit uses. An already declared row is a no-op, so a
+/// repeated selection publishes nothing.
+fn provider_connect(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "provider.connect") {
+        return response;
+    }
+    if let Some(error) = unknown_param(params, &["schema_version", "id"]) {
+        return request_error(id, error);
+    }
+    let Some(name) = params.get("id").and_then(Value::as_str) else {
+        return request_error(id, RequestError::Required { field: "id" });
+    };
+    let Some(provider) = crate::providers::login_catalog::provider(name) else {
+        return request_error(id, RequestError::InvalidParameter { name: "id" });
+    };
+    if rt.config_for_broker().connections.contains_key(name) {
+        return RpcResponse::ok(
+            id,
+            json!({"schema_version": SCHEMA_VERSION, "id": name, "declared": true}),
+        );
+    }
+    let before = retained_view(rt);
+    let edit = match retained_edit(rt, |config| config.declare_connection(provider)) {
+        Ok(edit) => edit,
+        Err(error) => return config_error(id, &error),
+    };
+    admit_config_command(
+        rt,
+        id,
+        "provider.connect",
+        &format!("connections.{name}"),
+        &edit,
+        before,
+    )
+}
+
+/// The catalogue rows whose legs this handler mints. `None` keeps the
+/// recorded Codex/Kimi paths exactly as they were; every other catalogue row
+/// is refused with its own cause instead of falling into a Codex-shaped leg.
+fn auth_login_catalogue(
+    rt: &mut Runtime,
+    id: Value,
+    connection: &str,
+    mode: &str,
+    callback_port: Option<u16>,
+) -> Option<RpcResponse> {
+    if !matches!(connection, "anthropic" | "zai" | "github-copilot") {
+        return None;
+    }
+    let provider = crate::providers::login_catalog::provider(connection)?;
+    if crate::providers::login_catalog::method(provider, mode).is_none() {
+        return Some(request_error(
+            id,
+            RequestError::CommandUnavailable {
+                command: "auth.login.begin".to_string(),
+                reason: format!("{connection} records no {mode} login"),
+            },
+        ));
+    }
+    let origin = |callback: Option<crate::providers::login_catalog::Callback>| match callback {
+        Some(callback) => format!("http://{}:{}", callback.host, callback.port),
+        None => String::new(),
+    };
+    match (connection, mode) {
+        ("anthropic", "browser") => {
+            let session = match crate::providers::anthropic_login::begin_login() {
+                Ok(session) => session,
+                Err(error) => return Some(anthropic_login_error(id, &error)),
+            };
+            let capture = crate::providers::login_catalog::method(provider, mode)
+                .and_then(|method| method.callback);
+            let origin = origin(capture);
+            rt.login_callback = capture.and_then(|callback| {
+                crate::providers::login_callback::CallbackListener::start(
+                    &origin,
+                    callback,
+                    callback_port,
+                )
+            });
+            let result = json!({
+                "schema_version": SCHEMA_VERSION,
+                "state": session.state(),
+                "verification_url": session.authorize_url(),
+                "user_code": Value::Null,
+                "expires_in": Value::Null,
+                "capture": rt.login_callback.is_some(),
+            });
+            rt.pending_login = Some(PendingLogin::AnthropicBrowser(session));
+            Some(RpcResponse::ok(id, result))
+        }
+        ("zai", "browser") => {
+            let session = match crate::providers::zai_login::begin_login(
+                &crate::providers::zai_login::ZaiEndpoints::recorded(),
+            ) {
+                Ok(session) => session,
+                Err(error) => return Some(zai_login_error(id, &error)),
+            };
+            let result = json!({
+                "schema_version": SCHEMA_VERSION,
+                "state": session.state(),
+                "verification_url": session.authorize_url(),
+                "user_code": Value::Null,
+                "expires_in": Value::Null,
+                "capture": false,
+            });
+            rt.login_callback = None;
+            rt.pending_login = Some(PendingLogin::ZaiBrowser(session));
+            Some(RpcResponse::ok(id, result))
+        }
+        ("github-copilot", "device") => {
+            let domain = "github.com";
+            let device = match crate::providers::copilot_login::begin_device(
+                domain,
+                crate::providers::copilot_login::DeviceEndpoints::recorded(domain),
+            ) {
+                Ok(device) => device,
+                Err(error) => return Some(copilot_login_error(id, &error)),
+            };
+            let result = json!({
+                "schema_version": SCHEMA_VERSION,
+                "state": Value::Null,
+                "verification_url": device.verification_uri(),
+                "user_code": device.user_code(),
+                "expires_in": device.expires_in(),
+                "capture": false,
+            });
+            rt.login_callback = None;
+            rt.pending_login = Some(PendingLogin::CopilotDevice(device));
+            Some(RpcResponse::ok(id, result))
+        }
+        _ => Some(request_error(
+            id,
+            RequestError::CommandUnavailable {
+                command: "auth.login.begin".to_string(),
+                reason: format!("{connection} records no {mode} login"),
+            },
+        )),
+    }
+}
+
+/// The credential seam a catalogue leg writes through: the injected store, or
+/// the platform backend the declared row's scope names.
+fn provider_login_store(
+    rt: &mut Runtime,
+    config: &config::Config,
+    connection: &str,
+) -> Result<Arc<dyn crate::providers::CredentialStore>, ProviderError> {
+    if let Some(store) = &rt.login_credentials {
+        return Ok(Arc::clone(store));
+    }
+    let reference = crate::providers::resolve_credential(config, connection)?;
+    let store: Arc<dyn crate::providers::CredentialStore> = Arc::new(
+        crate::providers::native_store(reference.store(), reference.service())?,
+    );
+    rt.login_credentials = Some(Arc::clone(&store));
+    Ok(store)
+}
+
+/// One binding or store refusal from a catalogue leg.
+fn provider_login_error(id: Value, error: &ProviderError) -> RpcResponse {
+    let code = match error {
+        ProviderError::StoreUnavailable { .. }
+        | ProviderError::StoreAmbiguous { .. }
+        | ProviderError::CredentialOutsideNamespace { .. }
+        | ProviderError::CredentialMalformed { .. } => ErrorCode::StorageUnavailable,
+        ProviderError::CredentialOccupied { .. } => ErrorCode::Conflict,
+        ProviderError::Transport { .. }
+        | ProviderError::ProviderFailed { .. }
+        | ProviderError::UnknownTerminal { .. }
+        | ProviderError::StreamViolation { .. }
+        | ProviderError::IncompatibleOutput { .. }
+        | ProviderError::Retried { .. } => ErrorCode::OutcomeUnknown,
+        _ => ErrorCode::InvalidInput,
+    };
+    envelope_error(id, code, -32000, &error.to_string())
+}
+
+/// The token endpoint a catalogue browser leg exchanges against. A release
+/// build always names the recorded constant; the debug/test seam admits a
+/// loopback peer so the wire path is provable offline.
+fn anthropic_token_endpoint(params: &Value) -> Result<&str, RequestError> {
+    if LOGIN_ENDPOINT_OVERRIDE {
+        return optional_string(params, "token_endpoint")
+            .map(|endpoint| endpoint.unwrap_or(crate::providers::anthropic_login::TOKEN_ENDPOINT));
+    }
+    Ok(crate::providers::anthropic_login::TOKEN_ENDPOINT)
+}
+
+/// One Anthropic refusal mapped to the wire classes the Codex leg uses.
+fn anthropic_login_error(
+    id: Value,
+    error: &crate::providers::anthropic_login::LoginError,
+) -> RpcResponse {
+    use crate::providers::anthropic_login::LoginError as Login;
+    let code = match error {
+        Login::Provider(inner) => match inner {
+            ProviderError::StoreUnavailable { .. }
+            | ProviderError::StoreAmbiguous { .. }
+            | ProviderError::CredentialOutsideNamespace { .. } => ErrorCode::StorageUnavailable,
+            ProviderError::CredentialOccupied { .. } => ErrorCode::Conflict,
+            ProviderError::Transport { .. }
+            | ProviderError::ProviderFailed { .. }
+            | ProviderError::UnknownTerminal { .. }
+            | ProviderError::StreamViolation { .. }
+            | ProviderError::IncompatibleOutput { .. }
+            | ProviderError::Retried { .. } => ErrorCode::OutcomeUnknown,
+            _ => ErrorCode::InvalidInput,
+        },
+        Login::Cancelled
+        | Login::Denied { .. }
+        | Login::TokenRejected { .. }
+        | Login::StateMismatch
+        | Login::OriginMismatch => ErrorCode::Denied,
+        Login::Entropy { .. } | Login::Clock { .. } | Login::Serialization { .. } => {
+            ErrorCode::InternalError
+        }
+        Login::StoredCredentialMalformed { .. } => ErrorCode::StorageUnavailable,
+        _ => ErrorCode::InvalidInput,
+    };
+    envelope_error(id, code, -32000, &error.to_string())
+}
+
+/// One Z.AI refusal mapped to the same classes.
+fn zai_login_error(id: Value, error: &crate::providers::zai_login::LoginError) -> RpcResponse {
+    use crate::providers::zai_login::LoginError as Login;
+    let code = match error {
+        Login::Provider(inner) => match inner {
+            ProviderError::StoreUnavailable { .. }
+            | ProviderError::StoreAmbiguous { .. }
+            | ProviderError::CredentialOutsideNamespace { .. } => ErrorCode::StorageUnavailable,
+            ProviderError::CredentialOccupied { .. } => ErrorCode::Conflict,
+            ProviderError::Transport { .. }
+            | ProviderError::ProviderFailed { .. }
+            | ProviderError::UnknownTerminal { .. }
+            | ProviderError::StreamViolation { .. }
+            | ProviderError::IncompatibleOutput { .. }
+            | ProviderError::Retried { .. } => ErrorCode::OutcomeUnknown,
+            _ => ErrorCode::InvalidInput,
+        },
+        Login::Cancelled | Login::StateMismatch | Login::CallbackNotRecorded { .. } => {
+            ErrorCode::Denied
+        }
+        Login::Entropy { .. } | Login::Clock { .. } => ErrorCode::InternalError,
+        _ => ErrorCode::InvalidInput,
+    };
+    envelope_error(id, code, -32000, &error.to_string())
+}
+
+/// One GitHub Copilot refusal mapped to the same classes.
+fn copilot_login_error(
+    id: Value,
+    error: &crate::providers::copilot_login::LoginError,
+) -> RpcResponse {
+    use crate::providers::copilot_login::LoginError as Login;
+    let code = match error {
+        Login::Provider(inner) => match inner {
+            ProviderError::StoreUnavailable { .. }
+            | ProviderError::StoreAmbiguous { .. }
+            | ProviderError::CredentialOutsideNamespace { .. } => ErrorCode::StorageUnavailable,
+            ProviderError::CredentialOccupied { .. } => ErrorCode::Conflict,
+            ProviderError::Transport { .. }
+            | ProviderError::ProviderFailed { .. }
+            | ProviderError::UnknownTerminal { .. }
+            | ProviderError::StreamViolation { .. }
+            | ProviderError::IncompatibleOutput { .. }
+            | ProviderError::Retried { .. } => ErrorCode::OutcomeUnknown,
+            _ => ErrorCode::InvalidInput,
+        },
+        Login::DeviceDenied
+        | Login::DeviceExpired
+        | Login::Denied { .. }
+        | Login::TokenRejected { .. } => ErrorCode::Denied,
+        Login::Entropy { .. } | Login::Clock { .. } | Login::Serialization { .. } => {
+            ErrorCode::InternalError
+        }
+        Login::StoredCredentialMalformed { .. } => ErrorCode::StorageUnavailable,
+        _ => ErrorCode::InvalidInput,
+    };
+    envelope_error(id, code, -32000, &error.to_string())
+}
+
 /// `auth.login.begin` (AC-040j): mints the browser code+PKCE leg (the
 /// recorded localhost:1455 callback) or the device alias, and retains the one
 /// pending state `auth.login.complete` consumes. The answer carries the
@@ -8098,6 +8454,16 @@ fn auth_login_begin(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Valu
         Ok(value) => value.unwrap_or("browser"),
         Err(error) => return request_error(id, error),
     };
+    if let Some(response) = auth_login_catalogue(
+        rt,
+        id.clone(),
+        connection,
+        mode,
+        login_callback_port(params),
+    ) {
+        return response;
+    }
+    rt.login_callback = None;
     let recorded = crate::providers::openai_login::DeviceEndpoints::recorded();
     // Test-only contract-peer override; the production surface always names
     // the recorded endpoints, and the release gate above refuses the keys
@@ -8189,12 +8555,25 @@ fn auth_login_begin(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Valu
                 &endpoints.exchange,
             ) {
                 Ok(session) => {
+                    let callback = crate::providers::login_catalog::provider("openai-codex")
+                        .and_then(|provider| {
+                            crate::providers::login_catalog::method(provider, "browser")
+                        })
+                        .and_then(|method| method.callback);
+                    rt.login_callback = callback.and_then(|callback| {
+                        crate::providers::login_callback::CallbackListener::start(
+                            "http://localhost:1455",
+                            callback,
+                            login_callback_port(params),
+                        )
+                    });
                     let result = json!({
                         "schema_version": SCHEMA_VERSION,
                         "state": session.state(),
                         "verification_url": session.authorize_url(),
                         "user_code": Value::Null,
                         "expires_in": Value::Null,
+                        "capture": rt.login_callback.is_some(),
                     });
                     rt.pending_login = Some(PendingLogin::Browser(session));
                     RpcResponse::ok(id, result)
@@ -8245,7 +8624,7 @@ fn auth_login_complete(
     if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.login.complete") {
         return response;
     }
-    if let Some(error) = unknown_param(params, LOGIN_COMPLETE_PARAMS) {
+    if let Some(error) = unknown_login_complete_param(params) {
         return request_error(id, error);
     }
     let Some(pending) = rt.pending_login.take() else {
@@ -8262,13 +8641,20 @@ fn auth_login_complete(
         rt.pending_login = Some(pending);
         return request_error(id, RequestError::LoginStateMismatch);
     }
-    let redirect = match optional_string(params, "redirect") {
-        Ok(redirect) => redirect,
+    let pasted = match optional_string(params, "redirect") {
+        Ok(redirect) => redirect.map(str::to_string),
         Err(error) => {
             rt.pending_login = Some(pending);
             return request_error(id, error);
         }
     };
+    // A browser leg captured on the loopback completes without a paste; an
+    // explicit caller value always wins, so a manual fallback stays possible.
+    let redirect = pasted.or_else(|| {
+        rt.login_callback
+            .as_ref()
+            .and_then(crate::providers::login_callback::CallbackListener::take)
+    });
     let config = rt.config_for_broker();
     match pending {
         PendingLogin::Browser(session) => {
@@ -8287,16 +8673,19 @@ fn auth_login_complete(
                 &config,
                 session.connection(),
                 &session,
-                redirect,
+                &redirect,
                 store.as_ref(),
             ) {
-                Ok(profile) => RpcResponse::ok(
-                    id,
-                    json!({
-                        "schema_version": SCHEMA_VERSION,
-                        "profile": profile,
-                    }),
-                ),
+                Ok(profile) => {
+                    rt.login_callback = None;
+                    RpcResponse::ok(
+                        id,
+                        json!({
+                            "schema_version": SCHEMA_VERSION,
+                            "profile": profile,
+                        }),
+                    )
+                }
                 Err(error) => {
                     rt.pending_login = Some(PendingLogin::Browser(session));
                     login_error(id, &error)
@@ -8399,6 +8788,115 @@ fn auth_login_complete(
                 }
             }
         }
+        PendingLogin::AnthropicBrowser(session) => {
+            let Some(redirect) = redirect else {
+                rt.pending_login = Some(PendingLogin::AnthropicBrowser(session));
+                return request_error(id, RequestError::Required { field: "redirect" });
+            };
+            let store = match provider_login_store(rt, &config, "anthropic") {
+                Ok(store) => store,
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::AnthropicBrowser(session));
+                    return provider_login_error(id, &error);
+                }
+            };
+            let token_endpoint = match anthropic_token_endpoint(params) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::AnthropicBrowser(session));
+                    return request_error(id, error);
+                }
+            };
+            match crate::providers::anthropic_login::complete_login(
+                &config,
+                "anthropic",
+                &session,
+                &redirect,
+                token_endpoint,
+                store.as_ref(),
+            ) {
+                Ok(profile) => {
+                    rt.login_callback = None;
+                    RpcResponse::ok(
+                        id,
+                        json!({"schema_version": SCHEMA_VERSION, "profile": profile}),
+                    )
+                }
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::AnthropicBrowser(session));
+                    anthropic_login_error(id, &error)
+                }
+            }
+        }
+        PendingLogin::ZaiBrowser(session) => {
+            let Some(redirect) = redirect else {
+                rt.pending_login = Some(PendingLogin::ZaiBrowser(session));
+                return request_error(id, RequestError::Required { field: "redirect" });
+            };
+            let store = match provider_login_store(rt, &config, "zai") {
+                Ok(store) => store,
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::ZaiBrowser(session));
+                    return provider_login_error(id, &error);
+                }
+            };
+            match crate::providers::zai_login::complete_login(
+                &config,
+                "zai",
+                &session,
+                &redirect,
+                store.as_ref(),
+            ) {
+                Ok(profile) => {
+                    rt.login_callback = None;
+                    RpcResponse::ok(
+                        id,
+                        json!({"schema_version": SCHEMA_VERSION, "profile": profile}),
+                    )
+                }
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::ZaiBrowser(session));
+                    zai_login_error(id, &error)
+                }
+            }
+        }
+        PendingLogin::CopilotDevice(mut device) => {
+            let store = match provider_login_store(rt, &config, "github-copilot") {
+                Ok(store) => store,
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::CopilotDevice(device));
+                    return provider_login_error(id, &error);
+                }
+            };
+            match crate::providers::copilot_login::advance(
+                &config,
+                "github-copilot",
+                &mut device,
+                store.as_ref(),
+            ) {
+                Ok(crate::providers::copilot_login::Advance::Complete(profile)) => RpcResponse::ok(
+                    id,
+                    json!({"schema_version": SCHEMA_VERSION, "profile": profile}),
+                ),
+                Ok(advance) => {
+                    let state =
+                        if matches!(advance, crate::providers::copilot_login::Advance::SlowDown) {
+                            "slow_down"
+                        } else {
+                            "pending"
+                        };
+                    rt.pending_login = Some(PendingLogin::CopilotDevice(device));
+                    RpcResponse::ok(
+                        id,
+                        json!({"schema_version": SCHEMA_VERSION, "state": state}),
+                    )
+                }
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::CopilotDevice(device));
+                    copilot_login_error(id, &error)
+                }
+            }
+        }
     }
 }
 
@@ -8413,6 +8911,7 @@ fn auth_login_cancel(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Val
         return request_error(id, error);
     }
     let cancelled = rt.pending_login.take().is_some();
+    rt.login_callback = None;
     RpcResponse::ok(
         id,
         json!({

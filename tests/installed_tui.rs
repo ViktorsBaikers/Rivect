@@ -3245,24 +3245,37 @@ fn installed_fresh_project_prepares_and_cancels_login() {
         "{fresh}"
     );
     assert!(!fresh.contains("NOT_RUN"), "{fresh}");
-    tui.send(b"/login\r").expect("prepare login");
+    tui.send(b"/login\r").expect("open the provider picker");
+    tui.wait("Sign in to a provider", WAIT)
+        .expect("provider picker");
+    let picker = tui
+        .wait_settled_after("OpenAI (ChatGPT)", 0, WAIT)
+        .expect("core-served provider row");
+    assert!(
+        picker.contains("Anthropic (Claude)") && picker.contains("Kimi Code"),
+        "missing sign-in providers"
+    );
+    // The list is ordered by id; OpenAI is the fourth row.
+    tui.send(b"\x1b[B\x1b[B\x1b[B").expect("move to OpenAI");
+    tui.wait("▪ OpenAI (ChatGPT)", WAIT).expect("selected row");
+    tui.send(b"\r").expect("open the method list");
+    tui.wait("Sign in · OpenAI (ChatGPT)", WAIT)
+        .expect("method step");
+    tui.send(b"\r").expect("start the browser leg");
     let pending = tui
-        .wait_settled_after("Paste the callback URL", 0, WAIT)
+        .wait_settled_after("Paste the redirect URL", 0, WAIT)
         .expect("private callback prompt");
     assert!(
-        pending.contains("Private login") && pending.contains("Open OpenAI sign-in"),
+        pending.contains("Sign in · browser") && pending.contains("Open sign-in page"),
         "missing sign-in link in private panel"
     );
     tui.send(b"\x1b")
         .expect("leave private entry without completing login");
-    tui.wait("Login pending · /login cancel", WAIT)
-        .expect("pending status and cancel action");
-    tui.send(b"/login cancel\r").expect("cancel login");
     let cancelled = tui
         .wait_settled_after("Login cancelled.", 0, WAIT)
         .expect("cancelled receipt");
     assert!(
-        cancelled.contains("not connected") && !cancelled.contains("Login pending"),
+        cancelled.contains("not connected") && !cancelled.contains("Sign in · browser"),
         "{cancelled}"
     );
     tui.send(b"/exit\r").expect("exit");

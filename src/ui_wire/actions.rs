@@ -24,6 +24,14 @@ enum Action<'a> {
     },
     LoginBrowser {},
     LoginDevice {},
+    LoginProviders {},
+    LoginConnect {
+        provider: &'a str,
+    },
+    LoginStart {
+        provider: &'a str,
+        method: &'a str,
+    },
     LoginComplete {},
     LoginCallback {
         redirect: &'a str,
@@ -163,23 +171,58 @@ fn accounting(e: &EconomySnapshot, pending_sends: Option<u64>) -> Vec<String> {
 }
 
 fn login(rt: &mut Runtime, action: Action<'_>) -> Result<Value, Refusal> {
-    let (method, params) = match action {
-        Action::LoginBrowser {} => (
-            "auth.login.begin",
-            json!({"schema_version":1,"mode":"browser"}),
-        ),
-        Action::LoginDevice {} => (
-            "auth.login.begin",
-            json!({"schema_version":1,"mode":"device"}),
-        ),
-        Action::LoginCancel {} => ("auth.login.cancel", json!({"schema_version":1})),
-        Action::LoginComplete {} => ("auth.login.complete", json!({"schema_version":1})),
-        Action::LoginCallback { redirect } => (
-            "auth.login.complete",
-            json!({"schema_version":1,"redirect":redirect}),
-        ),
-        _ => return Err(Refusal::Invalid),
+    // The picker reads the catalogue without minting anything.
+    if let Action::LoginProviders {} = action {
+        let result = call(
+            rt,
+            Ingress::Machine,
+            "auth.providers",
+            json!({"schema_version":1}),
+        )?;
+        return Ok(json!({"lines":[], "login":"idle", "providers":result["providers"]}));
+    }
+    // Selecting a row declares its connection through the journaled config
+    // admission before any leg is minted.
+    if let Action::LoginConnect { provider } = action {
+        let result = call(
+            rt,
+            Ingress::Machine,
+            "provider.connect",
+            json!({"schema_version":1,"id":provider}),
+        )?;
+        let line = if result.get("declared").is_some() {
+            format!("{} is already declared.", sanitize_status_cause(provider))
+        } else {
+            format!("Declared {} for sign-in.", sanitize_status_cause(provider))
+        };
+        return Ok(json!({"lines":[line], "login":"idle"}));
+    }
+    let start = match &action {
+        Action::LoginStart { provider, method } => Some((*provider, *method)),
+        Action::LoginBrowser {} => Some(("openai-codex", "browser")),
+        Action::LoginDevice {} => Some(("openai-codex", "device")),
+        _ => None,
     };
+    let (method, params) = if let Some((provider, mode)) = start {
+        (
+            "auth.login.begin",
+            json!({"schema_version":1,"connection":provider,"mode":mode}),
+        )
+    } else {
+        match action {
+            Action::LoginCancel {} => ("auth.login.cancel", json!({"schema_version":1})),
+            Action::LoginComplete {} => ("auth.login.complete", json!({"schema_version":1})),
+            Action::LoginCallback { redirect } => (
+                "auth.login.complete",
+                json!({"schema_version":1,"redirect":redirect}),
+            ),
+            _ => return Err(Refusal::Invalid),
+        }
+    };
+    let provider = start
+        .map(|(provider, _)| provider)
+        .unwrap_or("openai-codex");
+    let mode = start.map(|(_, mode)| mode).unwrap_or("browser");
     let result = call(rt, Ingress::Machine, method, params)?;
     match method {
         "auth.login.cancel" => {
@@ -191,20 +234,29 @@ fn login(rt: &mut Runtime, action: Action<'_>) -> Result<Value, Refusal> {
             Ok(json!({"lines":[line], "login":"idle"}))
         }
         "auth.login.begin" => {
-            let mut lines = vec![format!(
-                "Login pending: {}",
-                sanitize_status_cause(string(&result, "verification_url")?)
-            )];
-            if let Some(code) = result["user_code"].as_str() {
-                lines.push(format!("Enter code: {}", sanitize_status_cause(code)));
-                lines.push("Run /login complete to check authorization.".to_owned());
+            let url = sanitize_status_cause(string(&result, "verification_url")?);
+            let code = result["user_code"].as_str().map(sanitize_status_cause);
+            let capture = result["capture"].as_bool().unwrap_or(false);
+            let mut lines = vec![format!("Login pending: {url}")];
+            if let Some(code) = &code {
+                lines.push(format!("Enter code: {code}"));
+            } else if capture {
+                lines.push("Waiting for the browser redirect.".to_owned());
             } else {
-                lines.push(
-                    "Open the link. Return to Private login, or reopen it with /login callback."
-                        .to_owned(),
-                );
+                lines.push("Paste the redirect URL when the browser returns here.".to_owned());
             }
-            Ok(json!({"lines":lines, "login":"pending"}))
+            Ok(json!({
+                "lines":lines,
+                "login":"pending",
+                "pending":{
+                    "provider":provider,
+                    "method":mode,
+                    "url":url,
+                    "user_code":code,
+                    "expires_in":result["expires_in"].clone(),
+                    "capture":capture,
+                },
+            }))
         }
         _ => {
             if let Some(profile) = result["profile"].as_str() {

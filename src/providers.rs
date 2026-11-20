@@ -140,6 +140,8 @@ pub mod gitlab_agent_login;
 pub mod gitlab_workflow;
 pub mod kimi;
 pub mod local;
+pub mod login_callback;
+pub mod login_catalog;
 pub(crate) mod login_common;
 pub mod muse_login;
 pub mod ollama_cloud;

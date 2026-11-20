@@ -3,7 +3,7 @@ import { SyntaxStyle, TextAttributes, type ScrollBoxRenderable, type TextareaRen
 import { createEffect, createSignal, For, Index, onCleanup, onMount, Show } from 'solid-js';
 import { BootFailure, connectCore, type CoreClient, type Image } from './core';
 import { restoredFailure, type Startup } from './startup';
-import { operatorAction, type OperatorAction, type Question, type Selection } from './actions';
+import { operatorAction, type LoginPending, type OperatorAction, type Question, type Selection } from './actions';
 import { DecisionView } from './decision';
 import { currentFork, sameFork } from './question-watch';
 import { PermissionView } from './permission';
@@ -14,7 +14,8 @@ import { goalAuthor, type Task } from './wire';
 import { waitingVerifier } from './activity';
 import { goalByteLimit, mouseCommand, pasteDraft } from './input';
 import { loginStatus, looksLikeOAuthCallback } from './auth-input';
-import { PrivateLogin, type LoginInput } from './private-login';
+import { ProviderPicker } from './provider-picker';
+import { PrivateLogin } from './private-login';
 import { modeOutput, surfaceCommand } from './modes-output';
 import { palette } from './theme';
 import { compactNotShorter, dockObservation, dockSubject, emptyDock } from './dock-data';
@@ -67,7 +68,10 @@ export function Thread(opened: Startup) {
   const trackedReview = () => question() ?? dismissedFork;
   const [permission, setPermission] = createSignal<Permission | undefined>(opened.permission);
   const [settings,setSettings] = createSignal<SettingsStart>();
-  const [loginInput,setLoginInput] = createSignal<LoginInput>();
+  const [picker,setPicker] = createSignal<string>();
+  const [loginPending,setLoginPending] = createSignal<LoginPending>();
+  const loginOpen = () => picker() !== undefined || loginPending() !== undefined;
+  let lastLogin: LoginPending | undefined;
   let image: Image | undefined;
   let core = opened.owner;
   let replacement: CoreClient | undefined;
@@ -93,12 +97,13 @@ export function Thread(opened: Startup) {
   let history!: ScrollBoxRenderable;
   function discardCallback(text:string) {
     if (!looksLikeOAuthCallback(text)) return false;
-    clearTimeout(timer); setLoginInput('blocked'); setChoices([]); setActionLines([]); setPrivatePanel(true); setNotice('');
+    clearTimeout(timer); setChoices([]); setActionLines([]); setPrivatePanel(false);
+    setNotice('Callback discarded. It was not sent to Main. Use /login to start sign-in.');
     editor.editBuffer.setText(''); // Also clears native undo history.
     return true;
   }
   usePaste(event => {
-    if (permission() || question() || settings() || loginInput()) return;
+    if (permission() || question() || settings() || loginOpen()) return;
     if (event.bytes.length <= goalByteLimit && discardCallback(new TextDecoder().decode(event.bytes))) { event.preventDefault(); return; }
     if (selected() !== undefined) { event.preventDefault(); setNotice('Close task details before pasting.'); return; }
     const refused = pasteDraft(editor, event);
@@ -110,7 +115,7 @@ export function Thread(opened: Startup) {
       void interrupt();
       return;
     }
-    if (permission() || question() || settings() || loginInput()) return;
+    if (permission() || question() || settings() || loginOpen()) return;
     if (key.ctrl && key.name === 't' && key.eventType === 'press' && !key.repeated) {
       key.preventDefault();
       setNotice(surfaceCommand(renderer, renderer.screenMode === 'split-footer' ? '/tui fullscreen' : '/tui inline') ?? '');
@@ -284,7 +289,7 @@ export function Thread(opened: Startup) {
   }
   async function sampleDock(owner: CoreClient) {
     const task = subject();
-    if (!task || disposed || sending || question() || permission() || loginInput() || settings() || performance.now() < nextDock) return;
+    if (!task || disposed || sending || question() || permission() || loginOpen() || settings() || performance.now() < nextDock) return;
     nextDock = performance.now() + 1000;
     let result;
     try { result = await owner.dock(task); }
@@ -294,11 +299,11 @@ export function Thread(opened: Startup) {
   function watch() {
     clearTimeout(timer);
     const owner = core, task = live, observed = trackedReview();
-    if (disposed || sending || permission() || settings() || loginInput() || !owner || (!subject() && !observed)) return;
+    if (disposed || sending || permission() || settings() || loginOpen() || !owner || (!subject() && !observed)) return;
     const review = observed && turns().find(t => t.session === observed.session && t.id === observed.pin.task_id);
     timer = setTimeout(() => {
       reading = (async () => {
-        if (disposed || sending || permission() || settings() || loginInput() || owner !== core) return;
+        if (disposed || sending || permission() || settings() || loginOpen() || owner !== core) return;
         if (!owner.disconnected) {
           try {
             if (observed && review) await pollReview(owner,review,observed);
@@ -349,9 +354,73 @@ export function Thread(opened: Startup) {
     } catch { if (!disposed) setNotice('Cancellation not confirmed. Check session history.'); }
     finally { sending = false; watch(); }
   }
+  async function ensureOwner(): Promise<CoreClient | undefined> {
+    if (core) return core;
+    setNotice('Starting the runtime…');
+    try { core = await newOwner(); }
+    catch { setNotice('The runtime could not start. Check the data root and retry.'); return; }
+    if (disposed) return;
+    setNotice('');
+    return core;
+  }
+  async function openLoginPicker(query: string) {
+    if (!(await ensureOwner())) return;
+    setPicker(query); setNotice('');
+  }
+  async function loginStart(provider: string, method: string) {
+    const owner = await ensureOwner();
+    if (!owner) return;
+    setPicker(undefined); setNotice('Starting sign-in…');
+    try {
+      await owner.login({kind: 'login_connect', provider});
+      const receipt = await owner.login({kind: 'login_start', provider, method});
+      setActionLines(receipt.lines);
+      if (receipt.pending) {
+        lastLogin = receipt.pending;
+        setLoginPending(receipt.pending);
+        setPrivatePanel(false);
+        setConnection(owner.loginStatus);
+        setNotice('');
+      } else {
+        setLoginPending(undefined);
+        setConnection(owner.loginStatus);
+        setNotice(receipt.lines.at(-1) ?? '');
+      }
+    } catch {
+      setNotice('Sign-in could not start. Check the provider configuration.');
+    }
+  }
+  async function loginCheck() {
+    const owner = core;
+    if (!owner || !loginPending()) { setNotice('No sign-in is pending.'); return; }
+    try {
+      const receipt = await owner.login({kind: 'login_complete'});
+      if (receipt.pending) { setNotice('Still waiting for the provider.'); return; }
+      setActionLines(receipt.lines);
+      lastLogin = undefined;
+      setLoginPending(undefined);
+      setConnection(owner.loginStatus);
+      setNotice('');
+    } catch {
+      setNotice('Sign-in not confirmed. Check the pending page or cancel with /login cancel.');
+    }
+  }
+  async function loginCancel() {
+    const owner = core;
+    if (!owner) return;
+    try {
+      const receipt = await owner.login({kind: 'login_cancel'});
+      setActionLines(receipt.lines);
+    } catch {
+      setNotice('Cancellation not confirmed.');
+    }
+    lastLogin = undefined;
+    setLoginPending(undefined);
+    setConnection(owner.loginStatus);
+  }
   async function submit() {
     const goal = editor.plainText;
-    if (sending || permission() || question() || settings() || loginInput() || !goal.trim() || discardCallback(goal)) return;
+    if (sending || permission() || question() || settings() || loginOpen() || !goal.trim() || discardCallback(goal)) return;
     const command = goal;
     if (/^\s*\/login(?:\s|$)/u.test(command)) editor.clear();
     if (command.trimStart().startsWith('/') && (command !== command.trim() || /[\r\n]/u.test(command))) {
@@ -361,6 +430,22 @@ export function Thread(opened: Startup) {
     if (command === '/cancel') {
       editor.clear();
       if (live) await interrupt(); else setNotice('No local task to cancel.');
+      return;
+    }
+    const login = /^\s*\/login(?:\s+(.*))?$/u.exec(command);
+    if (login) {
+      editor.clear();
+      const argument = (login[1] ?? '').trim();
+      if (!argument) { void openLoginPicker(''); return; }
+      if (argument === 'cancel') { await loginCancel(); return; }
+      if (argument === 'complete') { await loginCheck(); return; }
+      if (argument === 'device') { await loginStart('openai-codex', 'device'); return; }
+      if (argument === 'callback') {
+        if (lastLogin) setLoginPending(lastLogin); else setNotice('No sign-in is pending.');
+        return;
+      }
+      if (!/[\s\p{Cc}]/u.test(argument)) { void openLoginPicker(argument); return; }
+      setNotice('Enter /login on one line.');
       return;
     }
     const localNotice = mouseCommand(renderer, command) ?? surfaceCommand(renderer, command);
@@ -467,15 +552,12 @@ export function Thread(opened: Startup) {
         await loadPermission(owner);
         const waiting = result.tasks.findLast(task => task.state === 'waiting');
         if (waiting) await loadQuestion(owner, waiting);
-      } else if (command === '/login callback') {
-        setPrivatePanel(true); setLoginInput('callback'); setNotice('');
       } else if (action) {
         const lines = await owner.action(action);
         if (disposed) return;
         setConnection(owner.loginStatus);
         const usage = action.kind === 'accounting' && dock().page;
         setActionLines(usage ? [...lines, ...usage.rows, ...(usage.profile ? [usage.profile] : []), usage.economy] : lines);
-        if (action.kind === 'login_browser') setLoginInput('callback');
         setNotice('');
       } else {
         const task = await owner.submit(project ?? goal, project ? 'project' : undefined);
@@ -608,9 +690,21 @@ export function Thread(opened: Startup) {
         </>}</Show>
       </scrollbox>}</Show>
       </box>
-      {loginInput() && <PrivateLogin mode={loginInput()!} owner={core} lines={actionLines()} close={result=>{
+      {picker() !== undefined && core && <ProviderPicker owner={core} initialQuery={picker()} close={result => {
+        setPicker(undefined);
+        if (!result) { setNotice(''); return; }
+        setActionLines(result.lines);
+        if (result.pending) {
+          lastLogin = result.pending; setLoginPending(result.pending);
+          if (core) setConnection(core.loginStatus);
+        }
+        else setNotice(result.lines.at(-1) ?? '');
+        watch();
+      }}/>}
+      {loginPending() && core && <PrivateLogin pending={loginPending()!} owner={core} lines={actionLines()} close={result => {
         if (core) setConnection(core.loginStatus);
-        setActionLines(result ?? []); setLoginInput(undefined); setNotice(''); watch();
+        lastLogin = undefined; setLoginPending(undefined);
+        setActionLines(result ?? []); setNotice(''); watch();
       }}/>}
       {settings() && core && <SettingsCenter initial={settings()!} owner={core} close={()=>{setSettings(undefined);watch();}}/>}
       {!permission() && question() && core && <DecisionView question={question()!} confirm={answer} reveal={reveal} dismiss={() => {
@@ -621,15 +715,15 @@ export function Thread(opened: Startup) {
         {choices().length > 0 && <text fg={secondary}>↑↓ · Tab: {choices()[choice()]} ({choice() + 1}/{choices().length})</text>}
         <box flexDirection="row" gap={2}>
           <text fg={accent} attributes={TextAttributes.BOLD} flexShrink={0}>{detail() ? '↑↓ Tasks · Esc back' : 'Message → Main'}</text>
-          <textarea ref={editor} focused={selected() === undefined && !permission() && !question() && !settings() && !loginInput()}
+          <textarea ref={editor} focused={selected() === undefined && !permission() && !question() && !settings() && !loginOpen()}
             height={size().height < 12 ? 1 : size().height < 26 ? 2 : 3} flexGrow={1} minWidth={0} textColor={ink} focusedTextColor={ink}
             backgroundColor={surface} focusedBackgroundColor={surface} placeholderColor={secondary}
             placeholder={detail() ? '' : 'Reply to Main…'}
-            onContentChange={() => { if (!loginInput() && editor?.plainText && discardCallback(editor.plainText)) return; if (choices().length) setChoices([]); }}
+            onContentChange={() => { if (!loginOpen() && editor?.plainText && discardCallback(editor.plainText)) return; if (choices().length) setChoices([]); }}
             keyBindings={[{ name: 'return', action: 'submit' }, { name: 'return', shift: true, action: 'newline' }]}
             onSubmit={submit} />
         </box>
-        {!question() && !permission() && !settings() && !loginInput() && <>
+        {!question() && !permission() && !settings() && !loginOpen() && <>
           <Show when={fullscreen() && turns().at(-1)?.preview?.status}>{status =>
             <text fg={secondary}>{status()}</text>
           }</Show>

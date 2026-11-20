@@ -1983,3 +1983,178 @@ fn kimi_variant(error: &kimi::KimiLoginError) -> &'static str {
         kimi::KimiLoginError::NotRefreshable { .. } => "NotRefreshable",
     }
 }
+
+/// `auth.providers` answers the catalogue every surface shares: the same ids,
+/// methods and capture flags, with the document's own declaration state.
+#[test]
+fn auth_providers_lists_every_sign_in_row() {
+    let config = support::codex_login_config();
+    let mut world = support::open_world("auth-providers", Some(&config));
+    let answer = rpc_ok(&mut world, "auth.providers", json!({ "schema_version": 1 }));
+    assert_eq!(answer["kind"], "auth.providers");
+    let rows = answer["providers"].as_array().expect("provider rows");
+    let ids: Vec<&str> = rows
+        .iter()
+        .map(|row| row["id"].as_str().expect("provider id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "anthropic",
+            "github-copilot",
+            "kimi-code",
+            "openai-codex",
+            "zai"
+        ]
+    );
+    let codex = rows
+        .iter()
+        .find(|row| row["id"] == "openai-codex")
+        .expect("the codex row");
+    assert_eq!(codex["declared"], true);
+    let methods: Vec<&str> = codex["methods"]
+        .as_array()
+        .expect("methods")
+        .iter()
+        .map(|method| method["id"].as_str().expect("method id"))
+        .collect();
+    assert_eq!(methods, ["browser", "device"]);
+    assert_eq!(codex["methods"][0]["capture"], true);
+    let anthropic = rows
+        .iter()
+        .find(|row| row["id"] == "anthropic")
+        .expect("the anthropic row");
+    assert_eq!(anthropic["declared"], false);
+    assert_eq!(anthropic["methods"][0]["capture"], true);
+    let zai = rows
+        .iter()
+        .find(|row| row["id"] == "zai")
+        .expect("the zai row");
+    assert_eq!(
+        zai["methods"][0]["capture"], false,
+        "a private-scheme redirect cannot be captured"
+    );
+}
+
+/// `provider.connect` declares a catalogue row once: the connection and its
+/// credential profile land, a second selection changes no byte, and an
+/// unknown id is refused instead of materializing a stub.
+#[test]
+fn provider_connect_declares_a_row_once() {
+    let root = tempfile::TempDir::with_prefix("rivect-provider-connect-").expect("root");
+    let data = root.path().join(".rivect");
+    std::fs::create_dir(&data).expect("data root");
+    let config = support::codex_login_config();
+    std::fs::write(data.join("config.toml"), &config).expect("write config");
+    let mut world = support::open_world_at(&data, Some(&config));
+
+    let first = rpc_ok(
+        &mut world,
+        "provider.connect",
+        json!({ "schema_version": 1, "id": "anthropic" }),
+    );
+    assert_eq!(first["command"], "provider.connect");
+    let session_id = session(&mut world);
+    let read = rpc_ok(
+        &mut world,
+        "config.read",
+        json!({
+            "schema_version": 1,
+            "session_id": session_id,
+            "keys": [
+                "connections.anthropic.profile",
+                "profiles.anthropic.credential_ref",
+            ],
+        }),
+    );
+    let exported = read.to_string();
+    assert!(exported.contains("anthropic"), "{exported}");
+    assert!(exported.contains("keyring:rivect/anthropic"), "{exported}");
+
+    let bytes = std::fs::read(data.join("config.toml")).expect("config bytes");
+    let second = rpc_ok(
+        &mut world,
+        "provider.connect",
+        json!({ "schema_version": 1, "id": "anthropic" }),
+    );
+    assert_eq!(second["declared"], true);
+    assert_eq!(
+        std::fs::read(data.join("config.toml")).expect("config bytes"),
+        bytes,
+        "a repeated selection publishes nothing"
+    );
+
+    let refusal = rpc(
+        &mut world,
+        "provider.connect",
+        json!({ "schema_version": 1, "id": "not-a-provider" }),
+    );
+    assert_eq!(
+        refusal["error"]["data"]["code"], "invalid_input",
+        "{refusal}"
+    );
+}
+
+/// A browser leg captures its loopback redirect: the terminal is never asked
+/// for a paste. The test plays the browser against the real recorded port and
+/// then calls the same `auth.login.complete` the panel polls, with no redirect
+/// argument. The exchange itself still goes to the loopback peer.
+#[test]
+fn browser_redirect_completes_without_a_paste() {
+    let peer = TestPeer::start(|path, _body| match path {
+        "/oauth/token" => (200, token_reply(CODEX_WORKSPACE, CODEX_EMAIL)),
+        _ => (404, "{}".to_string()),
+    });
+    let config = support::codex_login_config();
+    let parsed = Config::parse_validated(&config).expect("the codex config parses");
+    let mut world = support::open_world("codex-login-capture", Some(&config));
+    let store = Arc::new(support::MapStore::new(StoreKind::Keychain));
+    world.runtime.login_credentials = Some(store.clone());
+    let reference = resolve_credential(&parsed, "openai-codex").expect("canonical ref");
+    // The debug-only bind seam moves the socket so the proof never races a
+    // real Codex CLI or a parallel login test for port 1455; the captured
+    // redirect keeps the recorded origin the exchange validates.
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .expect("probe port")
+        .local_addr()
+        .expect("probe address")
+        .port();
+
+    let begin = rpc_ok(
+        &mut world,
+        "auth.login.begin",
+        json!({
+            "schema_version": 1,
+            "mode": "browser",
+            "token_endpoint": peer.url("/oauth/token"),
+            "callback_port": port,
+        }),
+    );
+    let state = begin["state"].as_str().expect("pending state").to_string();
+    assert_eq!(begin["capture"], true, "the loopback capture binds");
+
+    // The browser lands on the recorded callback path; the listener answers.
+    let target = callback(&state, "good-code")
+        .strip_prefix("http://localhost:1455")
+        .expect("recorded origin")
+        .to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect the capture");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read deadline");
+    stream
+        .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .expect("redirect request");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).expect("capture page");
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+
+    // No `redirect`: the captured request is the one the leg consumes.
+    let completed = rpc_ok(
+        &mut world,
+        "auth.login.complete",
+        json!({ "schema_version": 1 }),
+    );
+    assert_eq!(completed["profile"], CANONICAL_PROFILE);
+    assert!(store.occupied(&reference).expect("the store answers"));
+}

@@ -15,6 +15,15 @@ def terminal_reader(*forbidden):
         nonlocal checked
         fresh = bytearray()
         deadline = time.monotonic() + 5
+        # A marker painted by an earlier frame is still on screen: match the
+        # current frame before waiting for a new repaint.
+        screen = painted_text(fd, history) if history else b''
+        if any(token in screen for token in forbidden):
+            raise AssertionError('private callback appeared in terminal output')
+        if screen_matches is not None and screen_matches(screen):
+            return fresh
+        if screen_matches is None and marker in screen:
+            return fresh
         while time.monotonic() < deadline and select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
             part = os.read(fd, 65536)
             if not part:

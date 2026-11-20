@@ -95,6 +95,20 @@ test('operator projections use the bound core; pasted or extended commands do no
       await assert.rejects(core.action({kind: 'login_complete'})); // Browser leg requires a callback; no exchange.
       assert.deepEqual(await core.action({kind: 'login_cancel'}), ['Login cancelled.']);
       assert.equal(core.loginStatus,'Session not connected · Run /login');
+      // The picker reads the core catalogue, not a client-side provider list.
+      const providers = await core.loginProviders();
+      assert.deepEqual(providers.map(provider => provider.id),
+        ['anthropic', 'github-copilot', 'kimi-code', 'openai-codex', 'zai']);
+      const codex = providers.find(provider => provider.id === 'openai-codex');
+      assert.deepEqual(codex?.methods.map(method => method.id), ['browser', 'device']);
+      assert.equal(codex?.methods[0]?.capture, true);
+      assert.equal(providers.find(provider => provider.id === 'zai')?.methods[0]?.capture, false);
+      // Selecting a row declares its connection through the journaled edit.
+      await core.login({kind:'login_connect', provider:'anthropic'});
+      const declared = await core.loginProviders();
+      assert.equal(declared.find(provider => provider.id === 'anthropic')?.declared, true);
+      // A method the row does not record is refused by the core.
+      await assert.rejects(core.login({kind:'login_start', provider:'zai', method:'device'}));
       for (const input of ['/settings now', '/login cancel\n/permissions', '/grant everything', '/config\n'])
         assert.equal(operatorAction(input), undefined);
       // An older client could persist a callback as a goal. Reopening must not echo it.

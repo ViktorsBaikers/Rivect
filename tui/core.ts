@@ -2,7 +2,7 @@ import { constants, lstatSync, readFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { applyDelivery, decodeImage, record, snapshot, type Image, type Task } from './wire';
-import { decodeQuestion, type OperatorAction, type Question, type Selection } from './actions';
+import { decodeQuestion, loginPending, loginProviders, type LoginAction, type LoginProvider, type LoginReceipt, type OperatorAction, type Question, type Selection } from './actions';
 import { decodeSettings, missingUserConfig, type SettingsAction, type SettingsPage } from './settings-data';
 import { loginStatus } from './auth-input';
 import { terminalText } from './modes-output';
@@ -60,6 +60,8 @@ export interface CoreClient {
   close(): Promise<number>;
   complete(token: string): Promise<string[]>;
   action(action: OperatorAction): Promise<string[]>;
+  loginProviders(): Promise<LoginProvider[]>;
+  login(action: LoginAction): Promise<LoginReceipt>;
   settings(action: SettingsAction): Promise<SettingsPage>;
   dock(task: Task): Promise<Dock>;
   permission(): Promise<Permission | undefined>;
@@ -207,6 +209,19 @@ export async function connectCore(): Promise<CoreClient> {
         pendingLogin = reply.login === 'pending';
       }
       return lines;
+    },
+    async loginProviders() {
+      const reply = await request('operator.action', {session_id: await currentSession(), action:{kind:'login_providers'}});
+      if (reply.login !== 'idle') throw new Error('invalid sign-in catalogue');
+      return loginProviders(reply.providers);
+    },
+    async login(action) {
+      const reply = await request('operator.action', {session_id: await currentSession(), action});
+      const lines = strings(reply.lines);
+      if (reply.login === 'connected' && typeof reply.status === 'string') authenticated = reply.status;
+      else if (reply.login !== 'pending' && reply.login !== 'idle') throw new Error('invalid login receipt');
+      pendingLogin = reply.login === 'pending';
+      return {lines, pending: loginPending(reply.pending)};
     },
     async dock(task) {
       if (!session || task.session !== session) throw new CoreRefusal('inactive dock subject');
