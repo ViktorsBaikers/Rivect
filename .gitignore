@@ -1,4 +1,6 @@
 /target
+.DS_Store
+__pycache__/
 .codegraph
 .devrites/work/*/.lock
 .rivect-proof/
