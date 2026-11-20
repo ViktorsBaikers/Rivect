@@ -1859,9 +1859,11 @@ fn installed_compact_targets_newest_recovered_conversation_p10() {
 
     let before = fixture.fill(&newer);
     let mut tui = fixture.attach(Geometry::W160H50);
-    let frame = tui
-        .wait(CONTEXT_WARNING, WAIT)
+    tui.wait(CONTEXT_WARNING, WAIT)
         .expect("full newer conversation");
+    let frame = tui
+        .wait(&format!("task {}", newer.0), WAIT)
+        .expect("fully painted context warning");
     let warning = warning_line(&frame);
     assert!(
         warning.contains(&format!("task {}", newer.0)) && !warning.contains(&older.0),

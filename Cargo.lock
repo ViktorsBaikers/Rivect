@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "rivect"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "apple-native-keyring-store",
  "ast-grep-core",
