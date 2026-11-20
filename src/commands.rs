@@ -8151,6 +8151,21 @@ fn auth_providers(rt: &Runtime, id: Value) -> RpcResponse {
     )
 }
 
+/// The first user document, written atomically beside its destination so a
+/// failed or interrupted seed leaves no partial config: either the shipped
+/// bytes land whole or the next declaration retries.
+fn seed_config(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the config path has no parent",
+        )
+    })?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(config::SHIPPED_DEFAULTS_TOML.as_bytes())?;
+    temp.persist(path).map(|_| ()).map_err(|error| error.error)
+}
+
 /// `provider.connect`: declares the catalogue row an operator selected — its
 /// connection and credential profile — through the same journaled config
 /// admission every other edit uses. An already declared row is a no-op, so a
@@ -8173,6 +8188,27 @@ fn provider_connect(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Valu
             id,
             json!({"schema_version": SCHEMA_VERSION, "id": name, "declared": true}),
         );
+    }
+    // A fresh install has no user document yet. The first declaration seeds
+    // it from the shipped base so the required rows and model defaults stay
+    // valid; without this seed a first sign-in could not be journaled. The
+    // seed lands through the runtime's own single-owner path before the
+    // journaled edit, so a crash between the two leaves a valid shipped
+    // document rather than a partial one.
+    if rt.effective.parsed.is_none() {
+        match config::Config::parse(config::SHIPPED_DEFAULTS_TOML) {
+            Ok(seeded) => rt.effective.parsed = Some(seeded),
+            Err(error) => return config_error(id, &error),
+        }
+        if !rt.config_path.exists() && seed_config(&rt.config_path).is_err() {
+            rt.effective.parsed = None;
+            return envelope_error(
+                id,
+                ErrorCode::StorageUnavailable,
+                -32000,
+                "the first config document could not be written",
+            );
+        }
     }
     let before = retained_view(rt);
     let edit = match retained_edit(rt, |config| config.declare_connection(provider)) {

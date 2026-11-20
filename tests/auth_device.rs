@@ -2095,6 +2095,43 @@ fn provider_connect_declares_a_row_once() {
     );
 }
 
+/// A fresh install has no user config file; the first provider declaration
+/// must still land by seeding that document from the shipped base.
+#[test]
+fn provider_connect_seeds_a_fresh_root() {
+    let mut world = support::open_world("provider-connect-fresh", None);
+    assert!(!world.root.join("config.toml").exists());
+    let first = rpc_ok(
+        &mut world,
+        "provider.connect",
+        json!({ "schema_version": 1, "id": "anthropic" }),
+    );
+    assert_eq!(first["command"], "provider.connect");
+    let config = std::fs::read_to_string(world.root.join("config.toml")).expect("seeded config");
+    assert!(config.contains("[connections.anthropic]"), "{config}");
+    assert!(
+        config.contains("[connections.openai-codex]"),
+        "the shipped default row is retained: {config}"
+    );
+    let session_id = session(&mut world);
+    let read = rpc_ok(
+        &mut world,
+        "config.read",
+        json!({
+            "schema_version": 1,
+            "session_id": session_id,
+            "keys": ["connections.anthropic.profile"],
+        }),
+    );
+    assert!(read.to_string().contains("anthropic"), "{read}");
+    let second = rpc_ok(
+        &mut world,
+        "provider.connect",
+        json!({ "schema_version": 1, "id": "anthropic" }),
+    );
+    assert_eq!(second["declared"], true);
+}
+
 /// A browser leg captures its loopback redirect: the terminal is never asked
 /// for a paste. The test plays the browser against the real recorded port and
 /// then calls the same `auth.login.complete` the panel polls, with no redirect
