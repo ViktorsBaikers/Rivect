@@ -24,7 +24,6 @@ esac
 for command in curl python3 awk cmp mktemp mkdir ln grep rm rmdir; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
-gh=$(command -v gh) || fail 'GitHub CLI with attestation verify is required'
 if command -v sha256sum >/dev/null 2>&1; then
     hash_command=sha256sum
 elif command -v shasum >/dev/null 2>&1; then
@@ -206,7 +205,7 @@ esac
 
 [ ! -e "$root/bin" ] || [ -L "$root/bin" ] || fail 'installation bin path is not a symlink'
 # Publish immutable objects first; only the final rename changes the active bundle.
-python3 -I - "$staging" "$release" "$work/receipt" "$receipt" "$work/bin" "$root/bin" "$tag" "$target" "$#" "$gh" "$work/$archive" <<'PY' || fail 'cannot activate verified bundle'
+python3 -I - "$staging" "$release" "$work/receipt" "$receipt" "$work/bin" "$root/bin" "$tag" "$target" "$#" <<'PY' || fail 'cannot activate verified bundle'
 import fcntl
 import json
 import os
@@ -223,7 +222,7 @@ import termios
 import time
 
 stage, release, candidate, receipt, link, active = map(Path, sys.argv[1:7])
-tag, target, argc, gh, archive = sys.argv[7:]
+tag, target, argc = sys.argv[7:]
 rollback = argc != "0"
 commands = release.with_suffix(".commands")
 published = received = created_commands = False
@@ -326,12 +325,6 @@ def probe_bundle():
     probe_renderer(work, env)
 
 try:
-    verifier_env = {k: os.environ[k] for k in ("HOME", "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN") if k in os.environ}
-    verifier_env.update(PATH="/usr/bin:/bin", GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1")
-    subprocess.run([gh, "attestation", "verify", archive, "--repo", "ViktorsBaikers/Rivect",
-                    "--signer-workflow", "github.com/ViktorsBaikers/Rivect/.github/workflows/ci.yml",
-                    "--source-ref", f"refs/tags/{tag}"],
-                   env=verifier_env, stdin=subprocess.DEVNULL, check=True, timeout=90)
     subprocess.run([stage / "rivect", "--version"], env={"HOME": str(link.parent), "PATH": "/usr/bin:/bin"},
                    cwd=link.parent, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True, timeout=10)
     if not release.exists():

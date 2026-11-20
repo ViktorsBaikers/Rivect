@@ -35,9 +35,9 @@ curl -fsSL https://github.com/ViktorsBaikers/Rivect/releases/latest/download/ins
 Поддерживаются macOS Apple Silicon (`aarch64-apple-darwin`) и Linux x86_64
 с glibc (`x86_64-unknown-linux-gnu`, build/runtime baseline Ubuntu 24.04).
 Intel macOS, Linux ARM64 и musl этой поставкой не поддерживаются.
-Установщик принимает только пятифайловый OpenTUI-пакет v2. Нужны Python 3
-и GitHub CLI с `gh attestation verify`: установщик проверяет подпись архива,
-workflow и исходный тег при установке и откате. Cargo и jq не нужны.
+Установщик принимает только пятифайловый OpenTUI-пакет v2. Нужен Python 3;
+GitHub CLI, Cargo и jq не нужны. При установке и откате сверяются SHA-256
+архива и файлов комплекта. CI по-прежнему публикует аттестации; установщик их не проверяет.
 Опубликованные и установленные пакеты v1 остаются нетронутыми. Новый
 установщик не выбирает v1 даже для отката: цель отката — только ранее
 активированный и повторно проверенный v2. Подробности — в [контракте установки](installed-release.md).

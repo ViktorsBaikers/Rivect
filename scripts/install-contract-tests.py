@@ -41,21 +41,6 @@ class InstallerContract(unittest.TestCase):
         self.assets = self.root / "assets"
         self.assets.mkdir()
         self.log = self.root / "requests"
-        self.attestations = self.root / "signed-assets"
-        self.attestations.mkdir()
-        self.tool("gh", f"#!{sys.executable}\n" + f"""import hashlib, pathlib, sys
-args = sys.argv[1:]
-if (len(args) != 9 or args[:2] != ['attestation', 'verify']
-        or args[3:8] != ['--repo', 'ViktorsBaikers/Rivect', '--signer-workflow',
-                          'github.com/ViktorsBaikers/Rivect/.github/workflows/ci.yml', '--source-ref']
-        or not args[8].startswith('refs/tags/')):
-    sys.exit('invalid GitHub CLI attestation scope: --repo requires owner/repo')
-tag, asset = args[8].removeprefix('refs/tags/'), pathlib.Path(args[2])
-if not asset.name.startswith('rivect-' + tag + '-'):
-    sys.exit(2)
-record = pathlib.Path({str(self.attestations)!r}) / asset.name
-sys.exit(0 if record.is_file() and hashlib.sha256(asset.read_bytes()).hexdigest() == record.read_text() else 1)
-""")
         self.env = {"HOME": str(self.home), "PATH": f"{self.tools}:/usr/bin:/bin",
                     "SHELL": "/bin/zsh", "LC_ALL": "C",
                     "FIXTURES": str(self.assets), "REQUESTS": str(self.log),
@@ -154,7 +139,6 @@ finally:
         self.checksum = assets / f"{target}.sha256"
         self.checksum.write_text(hashlib.sha256(self.archive.read_bytes()).hexdigest() +
                                  f"  ./{self.archive.name}\n")
-        (self.attestations / self.archive.name).write_text(self.checksum.read_text().split()[0])
 
     def install(self, *args):
         return subprocess.run(["sh", str(ROOT / "install.sh"), *args], env=self.env,
@@ -243,7 +227,6 @@ finally:
         shutil.copyfile(self.archive, old_archive)
         self.archive, self.checksum = old_archive, old_checksum
         self.rewrite_checksum()
-        (self.attestations / self.archive.name).write_text(self.checksum.read_text().split()[0])
         self.assert_rollback_refused_before_execution("v0.1.1")
 
     def test_rollback_refuses_another_platform_archive(self):
@@ -300,29 +283,17 @@ finally:
         self.assert_rollback_refused_before_execution("v0.1.1")
         self.assertFalse(receipt.exists(), "rollback minted a receipt")
 
-    def test_v2_requires_release_attestation_before_any_execution(self):
+    def test_checksum_mismatch_prevents_execution_and_preserves_active_bundle(self):
         self.assertEqual(self.install().returncode, 0)
         before = self.selected_bundle().readlink()
         self.make_release(version=2, tag="v0.1.2")
         self.env["LATEST_URL"] = RELEASES + "/tag/v0.1.2"
-        attestation = self.attestations / self.archive.name
-        attestation.unlink()
-        for failure in ("unsigned", "wrong asset", "missing verifier"):
-            with self.subTest(failure=failure):
-                if failure == "wrong asset":
-                    attestation.write_text("0" * 64)
-                elif failure == "missing verifier":
-                    attestation.write_text(self.checksum.read_text().split()[0])
-                    (self.tools / "gh").unlink()
-                    for command in "sh python3 awk cmp mktemp mkdir ln grep rm rmdir sha256sum shasum".split():
-                        found = shutil.which(command, path="/usr/bin:/bin")
-                        if found:
-                            (self.tools / command).symlink_to(found)
-                    self.env["PATH"] = str(self.tools)
-                refused = self.install()
-                self.assertFalse((self.root / "candidate-ran").exists(), "unsigned candidate executed")
-                self.assertNotEqual(refused.returncode, 0, refused.stderr)
-                self.assertEqual(self.selected_bundle().readlink(), before)
+        self.checksum.write_text(f"{'0' * 64}  ./{self.archive.name}\n")
+        refused = self.install()
+        self.assertIn("archive checksum mismatch", refused.stderr)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse((self.root / "candidate-ran").exists())
+        self.assertEqual(self.selected_bundle().readlink(), before)
 
     def test_renderer_must_load_candidate_library_not_only_draw_frame(self):
         self.assertEqual(self.install().returncode, 0)
@@ -650,7 +621,6 @@ finally:
                 if not part.is_dir():
                     archive.add(part, arcname=str(part.relative_to(bundle)), recursive=False)
         self.rewrite_checksum()
-        (self.attestations / self.archive.name).write_text(self.checksum.read_text().split()[0])
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         command = self.selected_bundle() / "rivect"
