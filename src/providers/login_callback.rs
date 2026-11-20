@@ -115,8 +115,11 @@ fn accept(
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                capture(&mut stream, path, captured);
-                return;
+                // A stray request is answered and the leg keeps waiting; only
+                // the captured redirect ends the capture.
+                if capture(&mut stream, path, captured) {
+                    return;
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return,
@@ -185,9 +188,13 @@ fn respond(stream: &mut TcpStream, status: &str) {
     if stream.write_all(reply.as_bytes()).is_err() {
         return;
     }
-    // The browser already received or dropped the connection; a failed flush
-    // leaves the capture itself unaffected and the leg completes on its own.
-    drop(stream.flush());
+    if stream.flush().is_err() {
+        return;
+    }
+    // A graceful write shutdown sends FIN after the bytes; dropping a socket
+    // the peer is still reading can answer RST on some platforms. A failed
+    // shutdown means the peer already closed; there is nothing left to send.
+    drop(stream.shutdown(std::net::Shutdown::Write));
 }
 
 #[cfg(test)]
