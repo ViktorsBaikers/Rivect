@@ -22,9 +22,12 @@ with chat_terminal(Path(sys.argv[1]).resolve(strict=True), 'loopback', '', befor
     see(master, b'Open OpenAI sign-in')
     see(master, b'Paste the callback URL')
     os.write(master, b'\x19')
-    see(master, b'https://auth.openai.com/oauth/authorize?')
-    # The parameter name can straddle physical rows in a narrow viewport.
-    see(master, b'=omp')
+    def complete_url(screen):
+        # Join visible content cells across wraps, excluding the sidebar.
+        content = b''.join(row.rsplit('│'.encode(), 1)[-1].strip() for row in screen.splitlines())
+        return b'https://auth.openai.com/oauth/authorize?' in content and b'&originator=omp' in content
+
+    see(master, b'complete authorization URL', screen_matches=complete_url)
     os.write(master, b'\x1b[200~' + callback.replace(b'/callback?', b'/wrong?') + b'\x1b[201~\r')
     assert secret not in see(master, b'Input discarded')
     os.write(master, b'\x1b')

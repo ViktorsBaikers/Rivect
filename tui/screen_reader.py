@@ -11,7 +11,7 @@ def terminal_reader(*forbidden):
     checked = 0
     frame_end = b'\x1b[?2026l'
 
-    def wait_text(fd, marker):
+    def wait_text(fd, marker, *, screen_matches=None):
         nonlocal checked
         fresh = bytearray()
         deadline = time.monotonic() + 5
@@ -26,12 +26,16 @@ def terminal_reader(*forbidden):
             screen = b''
             while (end := history.find(frame_end, checked)) >= 0:
                 checked = end + len(frame_end)
-                if forbidden or marker not in fresh:
+                if forbidden or screen_matches is not None or marker not in fresh:
                     screen = painted_text(fd, history[:checked])
                 if any(token in screen for token in forbidden):
                     raise AssertionError('private callback appeared in terminal output')
-            if marker in fresh or marker in screen:
+                if screen_matches is not None and screen_matches(screen):
+                    return fresh
+            if screen_matches is None and (marker in fresh or marker in screen):
                 return fresh
+        if forbidden:
+            raise AssertionError(f'missing {marker!r} on private screen')
         raise AssertionError(f'missing {marker!r} on screen: {painted_text(fd, history)!r}')
 
     return wait_text
