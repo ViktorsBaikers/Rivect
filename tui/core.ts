@@ -31,7 +31,9 @@ function installedCoreDigest(): string {
 // Pin at startup: a reconnect must not adopt a later manifest or active release.
 const pinnedCore = packaged ? installedCoreDigest() : undefined;
 
-class CoreRefusal extends Error {}
+class CoreRefusal extends Error {
+  constructor(message: string, readonly code?: string) { super(message); }
+}
 export type { Image } from './wire';
 
 const bootCauses = ['another owner already holds this data root', 'owner configuration failed',
@@ -172,8 +174,11 @@ export async function connectCore(): Promise<CoreClient> {
           if (reply.error.code === 'conflict') throw new CoreRefusal('conflict: refresh before retrying');
           if (reply.error.code === 'not_found' && method === 'operator.action' && record(params.action) && params.action.kind === 'settings_center')
             throw new CoreRefusal(missingUserConfig);
-          if (reply.error.code === 'outcome_unknown') throw new CoreRefusal('command outcome unknown; inspect session before retrying');
-          throw new CoreRefusal('core refused request');
+          if (reply.error.code === 'outcome_unknown') throw new CoreRefusal('command outcome unknown; inspect session before retrying', 'outcome_unknown');
+          const code = typeof reply.error.code === 'string' ? reply.error.code : 'unknown';
+          const cause = typeof reply.error.message === 'string' && reply.error.message
+            ? ': ' + reply.error.message : '';
+          throw new CoreRefusal('core refused ' + code + cause, code);
         }
         if (!record(reply.result)) throw new Error('invalid core result');
         return reply.result;

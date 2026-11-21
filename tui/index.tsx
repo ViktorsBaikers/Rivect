@@ -386,8 +386,8 @@ export function Thread(opened: Startup) {
         setConnection(owner.loginStatus);
         setNotice(receipt.lines.at(-1) ?? '');
       }
-    } catch {
-      setNotice('Sign-in could not start. Check the provider configuration.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Sign-in could not start.');
     }
   }
   async function loginCheck() {

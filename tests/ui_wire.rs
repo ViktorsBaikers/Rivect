@@ -550,3 +550,28 @@ fn wire_recovery_snapshot_failure_releases_owner_without_sending() -> std::io::R
     assert_eq!(sends, 0);
     Ok(())
 }
+
+#[test]
+fn wire_refusal_carries_the_core_cause() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("config.toml"), LOOPBACK_CONFIG)?;
+    let mut child = private_child(root.path())?;
+    let opened = request(&mut child, "session.project", json!({}))?;
+    let session = &opened["result"]["session_id"];
+    let refused = request(
+        &mut child,
+        "operator.action",
+        json!({"session_id":session,
+               "action":{"kind":"login_key","provider":"deepseek","key":""}}),
+    )?;
+    assert_eq!(refused["error"]["code"], "invalid_input", "{refused}");
+    let message = refused["error"]["message"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("the wire refusal lost the core cause"))?;
+    assert!(message.contains("key"), "{message}");
+    assert!(
+        !message.contains('\u{1b}'),
+        "control text reached the terminal"
+    );
+    Ok(())
+}

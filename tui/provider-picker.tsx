@@ -59,6 +59,11 @@ export function ProviderPicker(props: {owner: CoreClient; initialQuery?: string;
     props.close();
   }
 
+  function refusal(error: unknown): string {
+    const text = error instanceof Error ? error.message : String(error);
+    return text.replace(/[\p{Cc}]+/gu, ' ').slice(0, 240);
+  }
+
   async function start(provider: LoginProvider, method: LoginMethod) {
     if (busy()) return;
     // A stored-key row collects the key here; the write action declares the
@@ -81,8 +86,8 @@ export function ProviderPicker(props: {owner: CoreClient; initialQuery?: string;
       }
       const receipt = await props.owner.login({kind: 'login_start', provider: provider.id, method: method.id});
       if (!disposed) props.close(receipt);
-    } catch {
-      if (!disposed) { setBusy(false); setNotice('Sign-in could not start. Check the provider configuration and retry.'); }
+    } catch (error) {
+      if (!disposed) { setBusy(false); setNotice(`Sign-in refused: ${refusal(error)}`); }
     }
   }
 
@@ -94,8 +99,11 @@ export function ProviderPicker(props: {owner: CoreClient; initialQuery?: string;
       const receipt = await props.owner.login({kind: 'login_apikey', provider: provider.id, key: key()});
       setKey('');
       if (!disposed) props.close(receipt);
-    } catch {
-      if (!disposed) { setBusy(false); setNotice('The key was refused. Check it and retry.'); }
+    } catch (error) {
+      if (!disposed) {
+        setBusy(false);
+        setNotice(`Key refused: ${refusal(error)}. Check the key and retry.`);
+      }
     }
   }
 

@@ -9015,12 +9015,24 @@ fn auth_login_apikey(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Val
         Ok(reference) => reference,
         Err(error) => return provider_login_error(id, &error),
     };
-    match store.login(&reference, key.as_bytes()) {
+    let occupied = match store.occupied(&reference) {
+        Ok(occupied) => occupied,
+        Err(error) => return provider_login_error(id, &error),
+    };
+    // An explicitly pasted key is the operator's current key: a re-entry
+    // replaces the stored material instead of reading as a collision.
+    let written = if occupied {
+        store.refresh(&reference, key.as_bytes())
+    } else {
+        store.login(&reference, key.as_bytes())
+    };
+    match written {
         Ok(()) => RpcResponse::ok(
             id,
             json!({
                 "schema_version": SCHEMA_VERSION,
                 "profile": reference.profile(),
+                "replaced": occupied,
             }),
         ),
         Err(error) => provider_login_error(id, &error),

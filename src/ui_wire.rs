@@ -10,7 +10,7 @@ use rivect::commands::{
     Ingress, LoopEvent, Runtime, UiAnswer, UiMessage, dispatch_runtime_request,
 };
 use rivect::contracts::{ErrorCode, Event, Lifecycle, SessionId, TaskId};
-use rivect::resources::{Delivery, OutputSettlement, OutputStream};
+use rivect::resources::{Delivery, OutputSettlement, OutputStream, sanitize_status_cause};
 use rivect::state::{StoreError, TaskActivity, TaskProjection};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
@@ -220,6 +220,13 @@ enum Refusal {
     Unknown,
     #[error("core refused operation: {0}")]
     Core(ErrorCode),
+    #[error("core refused operation: {code}")]
+    CoreCause {
+        code: ErrorCode,
+        /// The core's sanitized cause, so the operator sees why a store or
+        /// binding refused instead of a generic terminal notice.
+        message: String,
+    },
     #[error("projection unavailable after command")]
     AfterCommand(#[source] StoreError),
     #[error(transparent)]
@@ -234,8 +241,15 @@ impl Refusal {
             Self::Denied | Self::Witness(_) => ErrorCode::Denied,
             Self::Unknown | Self::Reply(_) | Self::AfterCommand(_) => ErrorCode::OutcomeUnknown,
             Self::FileRead(_) => ErrorCode::StorageUnavailable,
-            Self::Core(code) => *code,
+            Self::Core(code) | Self::CoreCause { code, .. } => *code,
             Self::Store(source) => source.code(),
+        }
+    }
+
+    fn message(&self) -> Option<&str> {
+        match self {
+            Self::CoreCause { message, .. } => Some(message),
+            _ => None,
         }
     }
 }
@@ -255,7 +269,15 @@ fn dispatch_common(runtime: &mut Runtime, ingress: Ingress, raw: &str) -> Result
     let reply = dispatch_runtime_request(runtime, ingress, "ui-pipe", raw);
     let mut envelope: Value = serde_json::from_str(&reply)?;
     if let Some(code) = envelope.pointer_mut("/error/data/code") {
-        return Err(Refusal::Core(serde_json::from_value(code.take())?));
+        let code = serde_json::from_value(code.take())?;
+        let message = envelope
+            .pointer_mut("/error/data/message")
+            .map(Value::take)
+            .and_then(|value| value.as_str().map(sanitize_status_cause));
+        return Err(match message {
+            Some(message) => Refusal::CoreCause { code, message },
+            None => Refusal::Core(code),
+        });
     }
     envelope
         .get_mut("result")
@@ -456,7 +478,13 @@ fn project(
         }
         "command.execute" => {
             let next = match machine(runtime, raw) {
-                Err(Refusal::Core(ErrorCode::Conflict)) => {
+                Err(
+                    Refusal::Core(ErrorCode::Conflict)
+                    | Refusal::CoreCause {
+                        code: ErrorCode::Conflict,
+                        ..
+                    },
+                ) => {
                     let session = SessionId(string(params, "session_id")?.to_owned());
                     let running = runtime
                         .session_switch_blocker(&session)?
@@ -589,7 +617,12 @@ fn envelope(id: Value, answer: Result<Value, Refusal>) -> Value {
         ))) => {
             json!({"jsonrpc":"2.0","id":id,"error":{"code":ErrorCode::Conflict,"cause":"compaction_not_shorter"}})
         }
-        Err(error) => json!({"jsonrpc":"2.0","id":id,"error":{"code":error.code()}}),
+        Err(error) => match error.message() {
+            Some(message) => {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":error.code(),"message":message}})
+            }
+            None => json!({"jsonrpc":"2.0","id":id,"error":{"code":error.code()}}),
+        },
     }
 }
 

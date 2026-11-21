@@ -2198,22 +2198,22 @@ fn api_key_login_stores_the_bearer_at_the_profile_scope() {
         }),
     );
     assert_eq!(login["profile"], "deepseek");
+    assert_eq!(login["replaced"], false);
     assert_eq!(
         store.resolve(&reference).expect("stored key"),
         KEY.as_bytes(),
         "the adapter resolves the operator's key verbatim"
     );
-    assert_refusal(
+    let replaced = rpc_ok(
         &mut world,
         "auth.login.apikey",
         json!({"schema_version": 1, "connection": "deepseek", "key": "second-key"}),
-        "conflict",
-        "already holds material",
     );
+    assert_eq!(replaced["replaced"], true);
     assert_eq!(
-        store.resolve(&reference).expect("prior key kept"),
-        KEY.as_bytes(),
-        "a refused enrollment leaves the prior bytes"
+        store.resolve(&reference).expect("replaced key"),
+        b"second-key",
+        "an explicit re-entry is the operator's current key"
     );
     assert_refusal(
         &mut world,
