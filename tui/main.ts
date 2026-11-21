@@ -1,12 +1,9 @@
 import { lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { runClient } from './modes';
-import { installNativeGuard } from './native-guard';
 
 declare const RIVECT_NATIVE_SHA256: string;
 declare const RIVECT_NATIVE_BYTES: number;
-
-installNativeGuard();
 
 if (!process.stdin.isTTY || !process.stdout.isTTY) {
   process.stderr.write('interactive client requires a terminal\n');

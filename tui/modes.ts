@@ -1,5 +1,6 @@
 import { writeSync } from 'node:fs';
 import type { CliRendererExternalOutputEvent } from '@opentui/core';
+import { guardSplitScrollback } from './native-guard';
 
 export async function runClient(args: string[]) {
   try { await start(args); }
@@ -29,6 +30,7 @@ async function start(args: string[]) {
       /^(?:tmux|screen)(?:-|$)/iu.test(process.env.TERM ?? '') ? 'never' : 'auto',
     screenMode: mode === 'inline' ? 'split-footer' : 'alternate-screen', footerHeight: 12,
     postProcessFns: [terminalPaletteFrame]}).catch(async error => { await opened?.owner?.close(); throw error; });
+  guardSplitScrollback(renderer);
   // Inline scrollback commits its own buffers outside the footer paint callback.
   renderer.on(CliRenderEvents.EXTERNAL_OUTPUT, ({snapshot}: CliRendererExternalOutputEvent) => terminalPaletteFrame(snapshot));
   let failing = false;
