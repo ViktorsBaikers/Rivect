@@ -80,8 +80,16 @@ const AUTH_CLASSES: &[&str] = &[
 /// through `keychain:`/`secret-service:` refs.
 const NATIVE_KIND: StoreKind = StoreKind::File;
 
-fn scoped_ref(scope_tail: &str) -> SecretRef {
-    SecretRef::parse(&format!("keyring:{TEST_NAMESPACE}/{scope_tail}")).expect("test ref is scoped")
+/// A ref whose class matches a pinned backend: the kind guard refuses a
+/// `keyring:` (local document) ref handed to a keychain/secret-service store.
+fn class_ref(kind: StoreKind, scope_tail: &str) -> SecretRef {
+    let label = match kind {
+        StoreKind::File => "file",
+        StoreKind::Keychain => "keychain",
+        StoreKind::SecretService => "secret-service",
+    };
+    SecretRef::parse(&format!("{label}:{TEST_NAMESPACE}/{scope_tail}"))
+        .expect("class ref is scoped")
 }
 
 /// A ref pinned to the Keychain class regardless of host platform: the
@@ -306,8 +314,7 @@ enum Probe {
 fn probe_store(kind: StoreKind) -> Probe {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let probe_ref =
-            SecretRef::parse(&format!("keyring:{TEST_NAMESPACE}/probe")).expect("probe ref parses");
+        let probe_ref = class_ref(kind, "probe");
         let outcome = native_store(kind, TEST_NAMESPACE, std::path::Path::new("."))
             .and_then(|store| store.occupied(&probe_ref).map(|_| store));
         match tx.send(outcome) {
@@ -544,7 +551,7 @@ fn credential_lifecycle_login_refresh_revoke_logout_roundtrips_on_the_store_seam
         return;
     };
     for class in AUTH_CLASSES {
-        let credential = scoped_ref(&format!("lifecycle-{class}"));
+        let credential = keychain_ref(&format!("lifecycle-{class}"));
         precheck(&store, &[&credential], &mut journal);
         lifecycle_leg(&store, &credential, &mut journal);
         journal.record("lifecycle", credential.raw(), TEST_NAMESPACE, "pass");
@@ -561,8 +568,8 @@ fn neighbor_profile_is_byte_identical_after_another_profiles_lifecycle() {
     let Some(store) = keychain_or_report("neighbor", &mut journal) else {
         return;
     };
-    let subject = scoped_ref("neighbor-subject");
-    let control = scoped_ref("neighbor-control");
+    let subject = keychain_ref("neighbor-subject");
+    let control = keychain_ref("neighbor-control");
     precheck(&store, &[&subject, &control], &mut journal);
     let control_secret = b"control-material-9f3ac2";
     store
@@ -614,7 +621,7 @@ fn keychain_rivect_test_namespaced_entries_are_created_and_deleted_by_the_test()
     let Some(store) = keychain_or_report("namespaced", &mut journal) else {
         return;
     };
-    let credential = scoped_ref("namespaced-entry");
+    let credential = keychain_ref("namespaced-entry");
     precheck(&store, &[&credential], &mut journal);
     let secret = format!("{SECRET_CANARY}-namespaced");
     store
@@ -643,7 +650,7 @@ fn keychain_rivect_test_namespaced_entries_are_created_and_deleted_by_the_test()
         "the journal recorded the precheck before the first write"
     );
     assert!(
-        journal_on_disk.contains("\"boundary_id\":\"keyring:rivect-test/namespaced-entry\""),
+        journal_on_disk.contains("\"boundary_id\":\"keychain:rivect-test/namespaced-entry\""),
         "the journal records this case's boundary id"
     );
     assert!(
@@ -709,7 +716,7 @@ fn a_foreign_prefix_collision_fails_before_any_write() {
     let Some(store) = keychain_or_report("collision", &mut journal) else {
         return;
     };
-    let held = scoped_ref("collision-held");
+    let held = keychain_ref("collision-held");
     precheck(&store, &[&held], &mut journal);
     store
         .login(&held, b"held")
@@ -889,8 +896,8 @@ fn keychain_store_absent_or_locked_records_honest_status_without_hanging() {
             // left at a planned scope reads occupied, the precheck reaps
             // it inside the rivect-test boundary, and an unplanned
             // neighbor is untouched.
-            let stale = scoped_ref("probe-stale");
-            let unplanned = scoped_ref("probe-unplanned");
+            let stale = keychain_ref("probe-stale");
+            let unplanned = keychain_ref("probe-unplanned");
             for entry in [&stale, &unplanned] {
                 // Clear a crashed-run remnant first — absent is the norm.
                 let _ = store.revoke(entry);
@@ -1003,7 +1010,7 @@ fn secret_service_leg_records_not_run_when_the_headless_store_is_absent() {
             std::path::Path::new("."),
         ) {
             Ok(store) => {
-                let credential = scoped_ref("secret-service-lifecycle");
+                let credential = class_ref(StoreKind::SecretService, "secret-service-lifecycle");
                 precheck(&store, &[&credential], &mut journal);
                 lifecycle_leg(&store, &credential, &mut journal);
                 journal.record("lifecycle", credential.raw(), TEST_NAMESPACE, "pass");
@@ -1982,7 +1989,7 @@ impl keyring_core::api::CredentialStoreApi for ParkingStore {
 fn secrets_never_appear_in_config_export_log_output_or_debug() {
     let _store_cases = STORE_CASES.lock().unwrap_or_else(|e| e.into_inner());
     let secret = format!("{SECRET_CANARY}-redaction-material");
-    let credential = scoped_ref("redaction-scope");
+    let credential = keychain_ref("redaction-scope");
     let mut journal = AuthJournal::open("redaction");
 
     // The canary enrolls through the real seam, then a real
@@ -2128,7 +2135,7 @@ fn secrets_never_appear_in_config_export_log_output_or_debug() {
             "manifest surfaces never contain secret material"
         );
         assert!(
-            rendered.contains("keyring:rivect-test/redaction-scope"),
+            rendered.contains("keychain:rivect-test/redaction-scope"),
             "the manifest names the scoped ref, not the material"
         );
     }

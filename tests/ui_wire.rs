@@ -600,21 +600,28 @@ fn wire_api_key_login_writes_the_local_credential_document() -> std::io::Result<
             "the owner-only credential document is the store"
         );
     }
-    let document: Value =
-        serde_json::from_slice(&std::fs::read(&path)?).map_err(std::io::Error::other)?;
-    assert_eq!(document["version"], 1);
-    let stored = document["entries"]["rivect/deepseek"]
-        .as_array()
-        .ok_or_else(|| std::io::Error::other("the key landed in no entry"))?;
-    let bytes = stored
-        .iter()
-        .map(Value::as_u64)
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| std::io::Error::other("entry is not a byte array"))?;
-    let expected = b"sk-wire-test"
-        .iter()
-        .map(|byte| u64::from(*byte))
-        .collect::<Vec<_>>();
-    assert_eq!(bytes, expected);
+    let read_key = || -> std::io::Result<Vec<u64>> {
+        let document: Value =
+            serde_json::from_slice(&std::fs::read(&path)?).map_err(std::io::Error::other)?;
+        assert_eq!(document["version"], 1);
+        let stored = document["entries"]["rivect/deepseek"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("the key landed in no entry"))?;
+        stored
+            .iter()
+            .map(Value::as_u64)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| std::io::Error::other("entry is not a byte array"))
+    };
+    let expected = |key: &[u8]| key.iter().map(|byte| u64::from(*byte)).collect::<Vec<_>>();
+    assert_eq!(read_key()?, expected(b"sk-wire-test"));
+    let replaced = request(
+        &mut child,
+        "operator.action",
+        json!({"session_id":session,
+               "action":{"kind":"login_key","provider":"deepseek","key":"sk-wire-second"}}),
+    )?;
+    assert_eq!(replaced["result"]["login"], "connected", "{replaced}");
+    assert_eq!(read_key()?, expected(b"sk-wire-second"));
     Ok(())
 }
