@@ -575,3 +575,46 @@ fn wire_refusal_carries_the_core_cause() -> std::io::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn wire_api_key_login_writes_the_local_credential_document() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("config.toml"), LOOPBACK_CONFIG)?;
+    let mut child = private_child(root.path())?;
+    let opened = request(&mut child, "session.project", json!({}))?;
+    let session = &opened["result"]["session_id"];
+    let done = request(
+        &mut child,
+        "operator.action",
+        json!({"session_id":session,
+               "action":{"kind":"login_key","provider":"deepseek","key":"sk-wire-test"}}),
+    )?;
+    assert_eq!(done["result"]["login"], "connected", "{done}");
+    let path = root.path().join("runtime/credentials.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600,
+            "the owner-only credential document is the store"
+        );
+    }
+    let document: Value =
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(std::io::Error::other)?;
+    assert_eq!(document["version"], 1);
+    let stored = document["entries"]["rivect/deepseek"]
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("the key landed in no entry"))?;
+    let bytes = stored
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| std::io::Error::other("entry is not a byte array"))?;
+    let expected = b"sk-wire-test"
+        .iter()
+        .map(|byte| u64::from(*byte))
+        .collect::<Vec<_>>();
+    assert_eq!(bytes, expected);
+    Ok(())
+}

@@ -1820,7 +1820,8 @@ impl Runtime {
         // admitted config rather than a second read of the document. The
         // factory is kept for reload; a fixture provider is installed as-is
         // and never rebuilt.
-        let provider_credentials = crate::providers::platform_credential_store();
+        let provider_credentials =
+            crate::providers::platform_credential_store(data_root.to_path_buf());
         let (provider, provider_factory) = match source {
             ProviderSource::Fixture(provider) => (provider, None),
             ProviderSource::Factory(factory) => {
@@ -5445,7 +5446,7 @@ fn docs_search(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
     let store = rt
         .search_credentials
         .clone()
-        .unwrap_or_else(crate::providers::platform_credential_store);
+        .unwrap_or_else(|| crate::providers::platform_credential_store(rt.data_root.clone()));
     match crate::docs::search(&request, &config, store.as_ref()) {
         Ok(result) => match serde_json::to_value(result) {
             Ok(result) => RpcResponse::ok(id, result),
@@ -8343,7 +8344,7 @@ fn provider_login_store(
     }
     let reference = crate::providers::resolve_credential(config, connection)?;
     let store: Arc<dyn crate::providers::CredentialStore> = Arc::new(
-        crate::providers::native_store(reference.store(), reference.service())?,
+        crate::providers::native_store(reference.store(), reference.service(), &rt.data_root)?,
     );
     rt.login_credentials = Some(Arc::clone(&store));
     Ok(store)
@@ -8784,6 +8785,7 @@ fn auth_login_complete(
                 &config,
                 &connection,
                 rt.login_credentials.as_ref(),
+                &rt.data_root,
             ) {
                 Ok(store) => store,
                 Err(error) => {
@@ -9102,6 +9104,7 @@ fn kimi_lifecycle(
         &config,
         connection,
         rt.login_credentials.as_ref(),
+        &rt.data_root,
     ) {
         Ok(store) => store,
         Err(error) => return Err(Box::new(kimi_login_error(id, &error))),
@@ -9207,9 +9210,9 @@ fn auth_revoke(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) ->
 }
 
 /// The credential seam a login writes through: the injected store, or the
-/// platform backend the bound scope's class and namespace name. The backend
-/// construction is the only open; a headless or locked class answers its
-/// typed store denial and no plaintext fallback exists.
+/// backend the bound scope's class and namespace name. The backend
+/// construction is the only open; a headless or locked native class answers
+/// its typed store denial and no env or inline path exists.
 fn login_store(
     rt: &mut Runtime,
     config: &config::Config,
@@ -9221,7 +9224,7 @@ fn login_store(
         return Ok(Arc::clone(store));
     }
     let store: Arc<dyn crate::providers::CredentialStore> = Arc::new(
-        crate::providers::native_store(reference.store(), reference.service())?,
+        crate::providers::native_store(reference.store(), reference.service(), &rt.data_root)?,
     );
     rt.login_credentials = Some(Arc::clone(&store));
     Ok(store)

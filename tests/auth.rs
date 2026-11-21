@@ -75,14 +75,10 @@ const AUTH_CLASSES: &[&str] = &[
     "custom-region-aware",
 ];
 
-/// The platform's native store class — the same mapping `keyring:`
-/// applies inside the seam under test (macOS → Keychain, Linux → Secret
-/// Service, other platforms resolve Keychain and simply never admit a
-/// store).
-#[cfg(target_os = "linux")]
-const NATIVE_KIND: StoreKind = StoreKind::SecretService;
-#[cfg(not(target_os = "linux"))]
-const NATIVE_KIND: StoreKind = StoreKind::Keychain;
+/// The default store class — the mapping `keyring:` keeps as a legacy
+/// alias inside the seam under test. Native classes are pinned explicitly
+/// through `keychain:`/`secret-service:` refs.
+const NATIVE_KIND: StoreKind = StoreKind::File;
 
 fn scoped_ref(scope_tail: &str) -> SecretRef {
     SecretRef::parse(&format!("keyring:{TEST_NAMESPACE}/{scope_tail}")).expect("test ref is scoped")
@@ -312,7 +308,7 @@ fn probe_store(kind: StoreKind) -> Probe {
     std::thread::spawn(move || {
         let probe_ref =
             SecretRef::parse(&format!("keyring:{TEST_NAMESPACE}/probe")).expect("probe ref parses");
-        let outcome = native_store(kind, TEST_NAMESPACE)
+        let outcome = native_store(kind, TEST_NAMESPACE, std::path::Path::new("."))
             .and_then(|store| store.occupied(&probe_ref).map(|_| store));
         match tx.send(outcome) {
             Ok(()) | Err(_) => {}
@@ -754,7 +750,11 @@ fn unavailable_or_ambiguous_store_returns_a_named_typed_error_without_plaintext_
     let mut journal = AuthJournal::open("store-errors");
     // Platform-absent backend: the Secret Service class exists only where a
     // D-Bus session store can answer.
-    match native_store(StoreKind::SecretService, TEST_NAMESPACE) {
+    match native_store(
+        StoreKind::SecretService,
+        TEST_NAMESPACE,
+        std::path::Path::new("."),
+    ) {
         Err(
             err @ ProviderError::StoreUnavailable {
                 store: StoreKind::SecretService,
@@ -997,7 +997,11 @@ fn secret_service_leg_records_not_run_when_the_headless_store_is_absent() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut journal = journal;
-        match native_store(StoreKind::SecretService, TEST_NAMESPACE) {
+        match native_store(
+            StoreKind::SecretService,
+            TEST_NAMESPACE,
+            std::path::Path::new("."),
+        ) {
             Ok(store) => {
                 let credential = scoped_ref("secret-service-lifecycle");
                 precheck(&store, &[&credential], &mut journal);
@@ -2253,17 +2257,20 @@ fn credential_resolution_follows_profile_then_connection_precedence() {
     );
 }
 
-/// SecretRef shape discipline: only `store:scope` tokens parse, `keyring`
-/// resolves to the platform's native class, and every segment is validated
-/// on the trust boundary even though config ingress already checked.
+/// SecretRef shape discipline: only `store:scope` tokens parse, `file` and
+/// the legacy `keyring` alias name the local document, and every segment is
+/// validated on the trust boundary even though config ingress already checked.
 #[test]
 fn secret_ref_parses_only_scoped_store_tokens() {
     let keyring = SecretRef::parse("keyring:rivect/work").expect("keyring parses");
-    assert_eq!(keyring.store(), NATIVE_KIND); // the platform's native class
+    assert_eq!(keyring.store(), NATIVE_KIND); // the local credential document
     assert_eq!(keyring.service(), "rivect");
     assert_eq!(keyring.profile(), "work");
     assert_eq!(keyring.scope(), "rivect/work");
     assert_eq!(keyring.raw(), "keyring:rivect/work");
+
+    let local = SecretRef::parse("file:rivect/work").expect("file parses");
+    assert_eq!(local.store(), StoreKind::File);
 
     let pinned = SecretRef::parse("keychain:rivect/work").expect("keychain parses");
     assert_eq!(pinned.store(), StoreKind::Keychain);
@@ -2279,7 +2286,6 @@ fn secret_ref_parses_only_scoped_store_tokens() {
         "keyring:/leading",
         "keyring:trailing/",
         "plaintext:rivect/work",
-        "file:rivect/work",
         "env:OPENAI_API_KEY",
     ] {
         assert!(
@@ -2297,10 +2303,10 @@ fn secret_ref_parses_only_scoped_store_tokens() {
 }
 
 /// INV-006 in two layers: `credential_ref` rejects non-scoped shapes at
-/// config ingress, and a well-formed ref naming a store this build does
-/// not serve — `env:`, `file:`, `vault:` — is refused by the same
-/// grammar at the same boundary. No path turns either into plaintext
-/// credential material.
+/// config ingress, and a well-formed ref naming a store this build does not
+/// serve — `env:`, `vault:` — is refused by the same grammar at the same
+/// boundary. `file:` is the admitted local document. No path turns a
+/// refused spelling into credential material.
 #[test]
 fn config_rejects_inline_and_secret_looking_credential_values() {
     for value in [SECRET_CANARY, "plaintext", "keyring:has whitespace"] {
@@ -2310,7 +2316,9 @@ fn config_rejects_inline_and_secret_looking_credential_values() {
             "inline or non-scoped credential_ref is rejected at ingress: {value}"
         );
     }
-    for value in ["env:OPENAI_API_KEY", "vault:corp/key", "file:tmp/secret"] {
+    let local = dec013_config().replace("keyring:rivect/direct", "file:rivect/direct");
+    Config::parse_validated(&local).expect("the local credential document is admitted");
+    for value in ["env:OPENAI_API_KEY", "vault:corp/key"] {
         let toml = dec013_config().replace("keyring:rivect/direct", value);
         let Err(error) = Config::parse_validated(&toml) else {
             panic!("an unsupported store label is refused at ingress: {value}")
@@ -4173,9 +4181,9 @@ fn minimax_code_cn_api_key_binding_resolves_through_scoped_secret_ref() {
 
 /// The env/credential-chain class leg (AC-040f), exercised on a
 /// `mistral` fixture (DEC-006): the recorded class resolves through
-/// the scoped `SecretRef` seam — this build admits no env, file or
-/// plaintext store kind, so an `env:`, `file:`-spelled or bare-token
-/// `credential_ref` is the typed ingress refusal and never a
+/// the scoped `SecretRef` seam — this build admits the local credential
+/// document but no env or plaintext store kind, so an `env:`-spelled or
+/// bare-token `credential_ref` is the typed ingress refusal and never a
 /// plaintext or env resolution path; traversal itself stays
 /// credential-substrate debt (D4). The stored binding resolves
 /// through the scoped `SecretRef`/DEC-013 precedence — the
@@ -4196,28 +4204,29 @@ fn mistral_env_chain_resolves_through_the_scoped_secret_ref_seam() {
          [profiles.mistral-team]\ncredential_ref = \"keyring:rivect-test/mistral-team\"\n\
          [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
 
-    // the recorded env spelling names no admitted store class — nor
-    // does a file indirection; both are the typed store refusal
-    for (spelling, store) in [
-        ("env:MISTRAL_API_KEY", "env"),
-        ("file:rivect/mistral-key", "file"),
-    ] {
-        let refused = toml.replace("keyring:rivect-test/mistral-direct", spelling);
-        let Err(error) = Config::parse_validated(&refused) else {
-            panic!("a {spelling} credential reference is refused at ingress")
-        };
-        assert!(
-            matches!(
-                &error.issue,
-                ConfigIssue::UnsupportedCredentialStore { store: refused } if refused.as_str() == store
-            ),
-            "the refusal names the refused store class: {error}"
-        );
-        assert!(
-            !error.to_string().contains(spelling),
-            "the refusal never echoes the credential value: {error}"
-        );
-    }
+    // the recorded env spelling names no admitted store class; file is the
+    // admitted local document.
+    let spelling = "env:MISTRAL_API_KEY";
+    let refused = toml.replace("keyring:rivect-test/mistral-direct", spelling);
+    let Err(error) = Config::parse_validated(&refused) else {
+        panic!("a {spelling} credential reference is refused at ingress")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::UnsupportedCredentialStore { store } if store == "env"
+        ),
+        "the refusal names the refused store class: {error}"
+    );
+    assert!(
+        !error.to_string().contains(spelling),
+        "the refusal never echoes the credential value: {error}"
+    );
+    let local = toml.replace(
+        "keyring:rivect-test/mistral-direct",
+        "file:rivect-test/mistral-key",
+    );
+    Config::parse_validated(&local).expect("a file reference is admitted at ingress");
     // a bare token is not a store:scope reference — the same typed
     // refusal, never a plaintext credential path
     let bare = toml.replace(

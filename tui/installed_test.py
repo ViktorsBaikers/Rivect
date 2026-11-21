@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import fcntl
 from http.client import parse_headers
+import json
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -300,6 +302,25 @@ def check_renderer_refusal(binary):
                 os.close(slave)
 
 
+def check_api_key_login(binary):
+    with chat_terminal(binary, 'loopback', '') as (master, database, _child):
+        os.write(master, b'/login\r')
+        wait_text(master, b'Sign in to a provider')
+        os.write(master, b'deepseek')
+        wait_text(master, b'DeepSeek')
+        os.write(master, b'\r')
+        wait_text(master, b'API key')
+        os.write(master, b'sk-local-test-key\r')
+        wait_text(master, b'Login complete: deepseek')
+        credentials = database.parent / 'credentials.json'
+        assert credentials.is_file(), 'the key landed in no local credential file'
+        assert stat.S_IMODE(credentials.stat().st_mode) == 0o600, oct(
+            credentials.stat().st_mode)
+        document = json.loads(credentials.read_text())
+        assert document['version'] == 1
+        assert bytes(document['entries']['rivect/deepseek']) == b'sk-local-test-key', document
+
+
 if __name__ == '__main__':
     binary = Path(sys.argv[1]).resolve(strict=True)
     with tempfile.TemporaryDirectory() as home:
@@ -314,5 +335,6 @@ if __name__ == '__main__':
         os.write(master, 'черновик'.encode())
         wait_text(master, 'черновик'.encode())
     check_provider_reply(binary)
+    check_api_key_login(binary)
     for interruption in ('cancel', 'switch', 'disconnect'):
         check_pending_session(binary, interruption)

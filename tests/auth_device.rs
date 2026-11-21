@@ -2092,7 +2092,7 @@ fn provider_connect_declares_a_row_once() {
     );
     let exported = read.to_string();
     assert!(exported.contains("anthropic"), "{exported}");
-    assert!(exported.contains("keyring:rivect/anthropic"), "{exported}");
+    assert!(exported.contains("file:rivect/anthropic"), "{exported}");
 
     let bytes = std::fs::read(data.join("config.toml")).expect("config bytes");
     let second = rpc_ok(

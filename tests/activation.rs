@@ -696,7 +696,7 @@ fn a_reload_that_refuses_one_row_installs_the_set_without_it()
 fn the_configured_set_serves_only_the_entry_it_was_built_from()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse_validated(&config_for("http://127.0.0.1:11434/v1", None))?;
-    let store = rivect::providers::platform_credential_store();
+    let store = rivect::providers::platform_credential_store(std::env::temp_dir());
     let build = rivect::providers::configured_provider(&config, &store)?;
     let entry = config.connections["vllm"].clone();
     assert!(

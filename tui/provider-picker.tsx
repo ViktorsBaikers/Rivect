@@ -96,7 +96,7 @@ export function ProviderPicker(props: {owner: CoreClient; initialQuery?: string;
     if (!provider || !key() || busy()) return;
     setBusy(true);
     try {
-      const receipt = await props.owner.login({kind: 'login_apikey', provider: provider.id, key: key()});
+      const receipt = await props.owner.login({kind: 'login_key', provider: provider.id, key: key()});
       setKey('');
       if (!disposed) props.close(receipt);
     } catch (error) {
@@ -194,7 +194,7 @@ export function ProviderPicker(props: {owner: CoreClient; initialQuery?: string;
         </Show>
       }>
         <text fg={palette.ink}>Paste the key · input hidden</text>
-        <text fg={palette.secondary}>{key() ? 'Key entered · hidden' : 'The key is stored in the OS credential store.'}</text>
+        <text fg={palette.secondary}>{key() ? 'Key entered · hidden' : 'The key is stored in the owner-only credential file.'}</text>
       </Show>
       <Show when={mode() === 'providers' && providers() && !matches().length}>
         <text fg={palette.secondary}>No provider matches this search.</text>

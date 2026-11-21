@@ -133,8 +133,9 @@
 //! catalogue — no vendored roster exists (D4), so an empty or failed
 //! answer has no floor to fall back to — and whose recorded
 //! env/credential-chain class resolves through the scoped `SecretRef`
-//! seam the same way `groq`'s does: an `env:`/`file:`/plaintext ref
-//! is refused at ingress, traversal stays substrate debt (DEC-006) —
+//! seam the same way `groq`'s does: `file:` is the admitted local
+//! document while an `env:` or plaintext ref is refused at ingress,
+//! traversal stays substrate debt (DEC-006) —
 //! and the configured-or-recorded `api.moonshot.ai/v1` base of
 //! `moonshot`, whose `requireApiKey` `/models` listing and the send
 //! leg alike follow the configured base — never the recorded default
@@ -2125,9 +2126,10 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // has no floor to fall back to and keeps the leg's typed
         // denial. The recorded env class resolves at the scoped
         // `SecretRef` seam the same way `groq`'s does — the plain
-        // bearer arm carries the stored material, an
-        // `env:`/`file:`/plaintext ref is refused at ingress, and the
-        // traversal itself stays credential-substrate debt (D4). The
+        // bearer arm carries the stored material, `file:` is the
+        // admitted local document, an `env:`/plaintext ref is refused
+        // at ingress, and the traversal itself stays credential-substrate
+        // debt (D4). The
         // recorded parameter-naming notes (`random_seed`,
         // `prediction`, `prompt_cache_key`, `safe_prompt`,
         // `prompt_mode`) are contract notes, not adapter fields — no

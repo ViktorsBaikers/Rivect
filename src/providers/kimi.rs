@@ -384,6 +384,7 @@ pub fn login_store(
     config: &Config,
     connection: &str,
     injected: Option<&Arc<dyn CredentialStore>>,
+    root: &std::path::Path,
 ) -> Result<Arc<dyn CredentialStore>, KimiLoginError> {
     let reference = credential_reference(config, connection)?;
     if let Some(store) = injected {
@@ -392,6 +393,7 @@ pub fn login_store(
     Ok(Arc::new(super::native_store(
         reference.store(),
         reference.service(),
+        root,
     )?))
 }
 

@@ -118,6 +118,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -134,6 +135,7 @@ pub mod copilot_login;
 pub mod cursor_login;
 pub mod devin_login;
 mod eventstream;
+mod file_store;
 pub mod gemini;
 pub mod gemini_cli_login;
 pub mod gitlab_agent_login;
@@ -693,9 +695,9 @@ pub enum ProviderError {
     #[error("provider capability unavailable: {kind} connection requires a separate live grant")]
     LiveGrantRequired { kind: ConnKind },
     /// DEC-014: the named store class cannot serve the call — absent,
-    /// locked or denied. `reason` is the platform's own Display text
+    /// locked or denied. `reason` is the store's own Display text
     /// verbatim — expected to name the condition; the seam cannot detect
-    /// material a platform embeds in it. No plaintext fallback exists
+    /// material a store embeds in it. No env or inline path exists
     /// (INV-006).
     #[error("credential store {store} is unavailable: {reason}")]
     StoreUnavailable { store: StoreKind, reason: String },
@@ -903,11 +905,14 @@ impl ProviderError {
     }
 }
 
-/// The native secret-store class a credential reference resolves to
-/// (SRC-010). `keyring:` in a config ref binds the platform's native class;
-/// `keychain:`/`secret-service:` pin a class explicitly.
+/// The secret-store class a credential reference resolves to.
+/// `file:` (and the legacy `keyring:` label) names the owner-only credential
+/// document under the data root; `keychain:`/`secret-service:` pin a native
+/// class explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StoreKind {
+    /// The owner-only JSON document beside the runtime database.
+    File,
     /// macOS Keychain (`apple-native-keyring-store`, keychain feature).
     Keychain,
     /// Linux Secret Service over D-Bus (`zbus-secret-service-keyring-store`).
@@ -917,6 +922,7 @@ pub enum StoreKind {
 impl std::fmt::Display for StoreKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            StoreKind::File => "file",
             StoreKind::Keychain => "keychain",
             StoreKind::SecretService => "secret-service",
         })
@@ -950,10 +956,11 @@ pub struct SecretRef {
 }
 
 impl SecretRef {
-    /// Parses `store:scope`. `keyring` resolves to this platform's native
-    /// store class; `keychain`/`secret-service` pin a class. Anything else
-    /// — including `env:`, `file:` or a bare token — is refused, so an
-    /// adapter can never be handed a plaintext-or-env indirection (INV-006).
+    /// Parses `store:scope`. `file:` names the owner-only credential
+    /// document under the data root; the legacy `keyring:` label resolves to
+    /// that same document, while `keychain`/`secret-service` pin a native
+    /// class. Anything else — including `env:` or a bare token — is refused,
+    /// so an adapter can never be handed an environment indirection.
     ///
     /// # Errors
     /// [`SecretRefError::NotScoped`] for shape violations;
@@ -977,7 +984,7 @@ impl SecretRef {
             return Err(SecretRefError::NotScoped);
         }
         let store = match store {
-            "keyring" => native_store_kind(),
+            "file" | "keyring" => StoreKind::File,
             "keychain" => StoreKind::Keychain,
             "secret-service" | "secret_service" => StoreKind::SecretService,
             _ => {
@@ -1082,32 +1089,11 @@ impl std::fmt::Debug for WireAuth {
     }
 }
 
-/// `keyring:` binds this platform's native store class. On platforms
-/// without an admitted native store the class still resolves — the backend
-/// constructor then answers `StoreUnavailable` (INV-006).
-#[cfg(target_os = "macos")]
-const fn native_store_kind() -> StoreKind {
-    StoreKind::Keychain
-}
-
-/// Linux: `keyring:` binds Secret Service.
-#[cfg(target_os = "linux")]
-const fn native_store_kind() -> StoreKind {
-    StoreKind::SecretService
-}
-
-/// Other platforms have no admitted native store; resolving to a class
-/// keeps parsing total while [`native_store`] reports it unavailable.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const fn native_store_kind() -> StoreKind {
-    StoreKind::Keychain
-}
-
-/// The credential-store seam (SRC-010): the only path between a native
-/// secret store and an adapter. Secret bytes cross this boundary only as
+/// The credential-store seam (SRC-010): the only path between stored
+/// material and an adapter. Secret bytes cross this boundary only as
 /// `&[u8]` arguments and `Vec<u8>` returns — every other surface sees the
 /// scoped [`SecretRef`] (INV-001). Implementations fail closed with typed
-/// errors; none may substitute plaintext or env storage (INV-006).
+/// errors; none may substitute env or inline material (INV-006).
 ///
 /// Lifecycle: `login` enrolls and refuses an occupied scope
 /// (`CredentialOccupied` — enrollment never overwrites); `refresh` replaces
@@ -1594,23 +1580,33 @@ impl CredentialStore for FlightedStore {
     }
 }
 
-/// Opens the platform backend for `kind` under `namespace` and returns it
-/// with per-profile refresh serialization installed (INV-009). This is the
-/// only constructor adapters use — SRC-010 explicit stores, never a
-/// plaintext or env-substituted store.
+/// Opens the backend for `kind` under `namespace` and returns it with
+/// per-profile refresh serialization installed (INV-009). This is the only
+/// constructor adapters use: the local document or an explicitly pinned
+/// native class, never an env-substituted store.
 ///
 /// # Errors
-/// [`ProviderError::StoreUnavailable`] when the class has no usable store
-/// on this platform — a locked or absent backend surfaces its platform
+/// [`ProviderError::StoreUnavailable`] when the class has no usable store on
+/// this platform — a locked or absent native backend surfaces its platform
 /// reason; there is no fallback (INV-006).
-pub fn native_store(kind: StoreKind, namespace: &str) -> Result<FlightedStore, ProviderError> {
-    let backend = match kind {
-        StoreKind::Keychain => keychain_backend()?,
-        StoreKind::SecretService => secret_service_backend()?,
+pub fn native_store(
+    kind: StoreKind,
+    namespace: &str,
+    root: &Path,
+) -> Result<FlightedStore, ProviderError> {
+    let backend: Box<dyn CredentialStore> = match kind {
+        StoreKind::File => Box::new(file_store::FileBackend::new(
+            file_store::path(root),
+            namespace,
+        )),
+        StoreKind::Keychain => Box::new(KeyringBackend::new(keychain_backend()?, kind, namespace)),
+        StoreKind::SecretService => Box::new(KeyringBackend::new(
+            secret_service_backend()?,
+            kind,
+            namespace,
+        )),
     };
-    Ok(FlightedStore::new(Box::new(KeyringBackend::new(
-        backend, kind, namespace,
-    ))))
+    Ok(FlightedStore::new(backend))
 }
 
 /// macOS: the login-Keychain backend (SRC-010; `keychain` feature — the
@@ -1663,7 +1659,7 @@ fn secret_service_backend() -> Result<Arc<keyring_core::CredentialStore>, Provid
 /// `profiles.<name>.credential_ref` first; without a profile binding the
 /// connection's own `credential_ref` applies. Catalogue presence is never
 /// entitlement — the returned [`SecretRef`] only scopes a store lookup —
-/// and every failure is a typed denial, never a plaintext fallback
+/// and every failure is a typed denial, never an env or inline path
 /// (INV-006).
 ///
 /// A profile-bound ref's trailing scope segment must equal the profile
@@ -2284,6 +2280,7 @@ impl Provider for LoopbackProvider {
 /// per-profile refresh serialization holds across sends; the map is bounded
 /// by the distinct scopes config can reference.
 struct PlatformStore {
+    root: std::path::PathBuf,
     opened: Mutex<BTreeMap<(StoreKind, String), Arc<FlightedStore>>>,
 }
 
@@ -2299,7 +2296,7 @@ impl PlatformStore {
         if let Some(store) = opened.get(&key) {
             return Ok(Arc::clone(store));
         }
-        let store = Arc::new(native_store(key.0, &key.1)?);
+        let store = Arc::new(native_store(key.0, &key.1, &self.root)?);
         opened.insert(key, Arc::clone(&store));
         drop(opened);
         Ok(store)
@@ -2308,7 +2305,7 @@ impl PlatformStore {
 
 impl CredentialStore for PlatformStore {
     fn kind(&self) -> StoreKind {
-        native_store_kind()
+        StoreKind::File
     }
 
     fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
@@ -2316,7 +2313,7 @@ impl CredentialStore for PlatformStore {
     }
 
     fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
-        native_store(native_store_kind(), service)?.entry_accounts(service)
+        native_store(StoreKind::File, service, &self.root)?.entry_accounts(service)
     }
 
     fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
@@ -2341,11 +2338,12 @@ impl CredentialStore for PlatformStore {
 }
 
 /// The platform credential seam a configured runtime hands its provider
-/// factory: both native classes open lazily, one backend per
+/// factory: the local document opens lazily, one backend per
 /// `(class, account)` scope the config references.
 #[must_use]
-pub fn platform_credential_store() -> Arc<dyn CredentialStore> {
+pub fn platform_credential_store(root: std::path::PathBuf) -> Arc<dyn CredentialStore> {
     Arc::new(PlatformStore {
+        root,
         opened: Mutex::new(BTreeMap::new()),
     })
 }

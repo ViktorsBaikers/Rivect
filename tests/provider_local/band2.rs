@@ -3777,41 +3777,42 @@ async fn mistral_auto_pick_resolves_through_the_listing() {
 // ----- TP-PROVIDER-AUTH::mistral ----------------------------------------------
 
 /// The recorded env/credential-chain class resolves through the
-/// scoped `SecretRef` seam and never through an env, file or
-/// plaintext spelling (DEC-006): an `env:`, `file:`-spelled or
-/// bare-token `credential_ref` is refused at config ingress — the
-/// typed store/refusal that never echoes the value — and on a
+/// scoped `SecretRef` seam and never through an env or plaintext
+/// spelling (DEC-006): an `env:`-spelled or bare-token
+/// `credential_ref` is refused at config ingress — the typed
+/// store/refusal that never echoes the value; `file:` is the admitted
+/// local document — and on a
 /// connection that binds both the connection ref and a profile,
 /// DEC-013 precedence sends the profile's scoped material — the
 /// connection-scope key never bears the wire.
 #[tokio::test]
 async fn mistral_env_chain_resolves_through_the_scoped_secret_ref_seam() {
-    // the recorded env spelling names no admitted store class — nor
-    // does a file indirection or a bare token
-    for (spelling, store) in [
-        ("env:MISTRAL_API_KEY", "env"),
-        ("file:rivect/mistral-key", "file"),
-    ] {
-        let refused = mistral_config("http://127.0.0.1:1/v1").replace(
-            &format!("credential_ref = \"{MISTRAL_REF}\""),
-            &format!("credential_ref = \"{spelling}\""),
-        );
-        let Err(error) = Config::parse_validated(&refused) else {
-            panic!("a {spelling} credential reference is refused at ingress")
-        };
-        assert!(
-            matches!(
-                &error.issue,
-                ConfigIssue::UnsupportedCredentialStore { store: refused }
-                    if refused.as_str() == store
-            ),
-            "the refusal names the refused store class: {error}"
-        );
-        assert!(
-            !error.to_string().contains(spelling),
-            "the refusal never echoes the credential value: {error}"
-        );
-    }
+    // the recorded env spelling names no admitted store class; file is the
+    // admitted local document.
+    let spelling = "env:MISTRAL_API_KEY";
+    let refused = mistral_config("http://127.0.0.1:1/v1").replace(
+        &format!("credential_ref = \"{MISTRAL_REF}\""),
+        &format!("credential_ref = \"{spelling}\""),
+    );
+    let Err(error) = Config::parse_validated(&refused) else {
+        panic!("a {spelling} credential reference is refused at ingress")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::UnsupportedCredentialStore { store } if store == "env"
+        ),
+        "the refusal names the refused store class: {error}"
+    );
+    assert!(
+        !error.to_string().contains(spelling),
+        "the refusal never echoes the credential value: {error}"
+    );
+    let local = mistral_config("http://127.0.0.1:1/v1").replace(
+        &format!("credential_ref = \"{MISTRAL_REF}\""),
+        "credential_ref = \"file:rivect/mistral-key\"",
+    );
+    Config::parse_validated(&local).expect("a file reference is admitted at ingress");
     let bare = mistral_config("http://127.0.0.1:1/v1").replace(
         &format!("credential_ref = \"{MISTRAL_REF}\""),
         "credential_ref = \"fixture-mistral-plaintext\"",
@@ -3824,35 +3825,32 @@ async fn mistral_env_chain_resolves_through_the_scoped_secret_ref_seam() {
         "the bare token is the scoped-ref refusal, not material: {error}"
     );
 
-    // a profile-bound ref is the same ingress — an env or file
-    // spelling under `profiles.<name>.credential_ref` is refused typed
-    // identically, never resolved through the profile seam
-    for (spelling, store) in [
-        ("env:MISTRAL_API_KEY", "env"),
-        ("file:rivect/mistral-key", "file"),
-    ] {
-        let refused = mistral_config("http://127.0.0.1:1/v1").replace(
-            "[models.defaults]",
-            &format!(
-                "[profiles.mistral-chain]\ncredential_ref = \"{spelling}\"\n[models.defaults]"
-            ),
-        );
-        let Err(error) = Config::parse_validated(&refused) else {
-            panic!("a {spelling} profile credential reference is refused at ingress")
-        };
-        assert!(
-            matches!(
-                &error.issue,
-                ConfigIssue::UnsupportedCredentialStore { store: refused }
-                    if refused.as_str() == store
-            ),
-            "the profile refusal names the refused store class: {error}"
-        );
-        assert!(
-            !error.to_string().contains(spelling),
-            "the refusal never echoes the credential value: {error}"
-        );
-    }
+    // a profile-bound ref is the same ingress — an env spelling under
+    // `profiles.<name>.credential_ref` is refused typed identically,
+    // never resolved through the profile seam; file is admitted
+    let refused = mistral_config("http://127.0.0.1:1/v1").replace(
+        "[models.defaults]",
+        "[profiles.mistral-chain]\ncredential_ref = \"env:MISTRAL_API_KEY\"\n[models.defaults]",
+    );
+    let Err(error) = Config::parse_validated(&refused) else {
+        panic!("a profile env credential reference is refused at ingress")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::UnsupportedCredentialStore { store } if store == "env"
+        ),
+        "the profile refusal names the refused store class: {error}"
+    );
+    assert!(
+        !error.to_string().contains("env:MISTRAL_API_KEY"),
+        "the refusal never echoes the credential value: {error}"
+    );
+    let local = mistral_config("http://127.0.0.1:1/v1").replace(
+        "[models.defaults]",
+        "[profiles.mistral-chain]\ncredential_ref = \"file:rivect/mistral-key\"\n[models.defaults]",
+    );
+    Config::parse_validated(&local).expect("a file profile reference is admitted");
 
     // a stored profile binding wins over the connection's own ref —
     // the chain resolves scoped store material, not an env lookup

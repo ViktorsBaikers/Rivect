@@ -2010,7 +2010,7 @@ impl Config {
                 toml_edit::value(provider.kind.to_string()),
             );
             set_field(connection, "endpoint", toml_edit::value(provider.endpoint));
-            let reference = format!("keyring:rivect/{}", provider.profile);
+            let reference = format!("file:rivect/{}", provider.profile);
             set_field(
                 connection,
                 "credential_ref",
@@ -2146,8 +2146,9 @@ pub fn document_only_message(key: &str) -> String {
 /// `credential_ref` ingress is the credential seam's own grammar (INV-006,
 /// DEC-013): [`SecretRef::parse`] admits only the `store:scope` shape with
 /// a store class this build serves, so an unadmitted label — `env:`,
-/// `file:`, `vault:` — is refused where the value enters, not deferred to
-/// a dispatch-time surprise. The value never enters diagnostics.
+/// `vault:` — is refused where the value enters, not deferred to a
+/// dispatch-time surprise. `file:` and the legacy `keyring:` alias name the
+/// owner-only document; the value never enters diagnostics.
 fn credential_ref_admitted(raw: &str, key: &str) -> Result<(), ConfigIssue> {
     match SecretRef::parse(raw) {
         Ok(_) => Ok(()),
