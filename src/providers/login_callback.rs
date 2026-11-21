@@ -195,6 +195,10 @@ fn respond(stream: &mut TcpStream, status: &str) {
     // the peer is still reading can answer RST on some platforms. A failed
     // shutdown means the peer already closed; there is nothing left to send.
     drop(stream.shutdown(std::net::Shutdown::Write));
+    // Read until the peer closes so the socket is not dropped with unread
+    // request bytes; that close sequence is what keeps FIN from becoming RST.
+    let mut sink = [0_u8; 128];
+    while matches!(stream.read(&mut sink), Ok(read) if read > 0) {}
 }
 
 #[cfg(test)]
