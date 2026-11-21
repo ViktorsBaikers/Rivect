@@ -32,15 +32,25 @@ def chunk(text, finish=None):
 def accept_goal(listener, master, goal):
     os.write(master, goal.encode() + b'\r')
     # Large frames can fill the PTY before the client dispatches its request.
-    deadline = time.monotonic() + listener.gettimeout()
-    while True:
-        ready, _, _ = select.select([listener, master], [], [], max(0, deadline - time.monotonic()))
-        if listener in ready:
+    for attempt in range(2):
+        deadline = time.monotonic() + listener.gettimeout()
+        retry = False
+        while True:
+            ready, _, _ = select.select([listener, master], [], [], max(0, deadline - time.monotonic()))
+            if listener in ready:
+                break
+            if not ready or time.monotonic() >= deadline:
+                # A submit dropped while the client was busy leaves the goal in
+                # its editor; one more Enter submits that draft and cannot
+                # duplicate an already-dispatched goal.
+                if attempt == 0 and os.write(master, b'\r'):
+                    retry = True
+                    break
+                raise TimeoutError(f'no local request for {goal!r}')
+            if not os.read(master, 65536):
+                raise EOFError(goal)
+        if not retry:
             break
-        if not ready or time.monotonic() >= deadline:
-            raise TimeoutError(f'no local request for {goal!r}')
-        if not os.read(master, 65536):
-            raise EOFError(goal)
     peer, _ = listener.accept()
     try:
         peer.settimeout(5)
