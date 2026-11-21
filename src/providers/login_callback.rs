@@ -223,24 +223,27 @@ mod tests {
             .expect("loopback capture starts")
     }
 
-    fn get(port: u16, target: &str) -> String {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .expect("read deadline");
-        stream
-            .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
-            .expect("request");
+    fn get(port: u16, target: &str) -> std::io::Result<String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())?;
         let mut reply = String::new();
-        stream.read_to_string(&mut reply).expect("reply");
-        reply
+        // macOS may answer a closed loopback socket with RST after the reply
+        // bytes arrived; the capture behaviour, not the close class, is under
+        // test here, and a non-empty reply keeps its HTTP status.
+        match stream.read_to_string(&mut reply) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(error) => return Err(error),
+        }
+        Ok(reply)
     }
 
     #[test]
     fn captures_one_redirect_and_ignores_the_rest() {
         let port = free_port();
         let listener = listener_on(port);
-        let reply = get(port, "/callback?code=one&state=two");
+        let reply = get(port, "/callback?code=one&state=two").expect("reply");
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
         assert_eq!(
             listener.take(),
@@ -255,7 +258,7 @@ mod tests {
     fn refuses_another_path_and_traversal() {
         let port = free_port();
         let listener = listener_on(port);
-        let reply = get(port, "/callback/../secret?code=one");
+        let reply = get(port, "/callback/../secret?code=one").expect("reply");
         assert!(reply.starts_with("HTTP/1.1 404"), "{reply}");
         assert_eq!(listener.take(), None);
     }
