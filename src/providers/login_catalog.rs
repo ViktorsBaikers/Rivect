@@ -78,8 +78,29 @@ const DEVICE: Method = Method {
     label: "Device code",
     callback: None,
 };
+const API_KEY: Method = Method {
+    id: "api_key",
+    label: "API key",
+    callback: None,
+};
 
-/// The catalogue rows, sorted by id for a stable picker.
+/// One stored-key row: the connection is declared as an `api_key` scope and
+/// the operator's key is the whole credential the adapter sends.
+macro_rules! api_key {
+    ($id:literal, $name:literal, $endpoint:literal) => {
+        Provider {
+            id: $id,
+            name: $name,
+            kind: ConnKind::ApiKey,
+            endpoint: $endpoint,
+            profile: $id,
+            methods: &[API_KEY],
+        }
+    };
+}
+
+/// The catalogue rows: the interactive legs first, then every served
+/// stored-key provider this build routes, in display order.
 pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "anthropic",
@@ -121,6 +142,135 @@ pub const PROVIDERS: &[Provider] = &[
         profile: "zai",
         methods: &[BROWSER_PASTE],
     },
+    // Stored-key providers: the connection is the adapter's recorded default
+    // base, and the key is the bearer the adapter's credential grammar reads.
+    api_key!("aiand", "ai&", "https://api.aiand.com/v1"),
+    api_key!("aimlapi", "AIML API", "https://api.aimlapi.com/v1"),
+    api_key!(
+        "alibaba-coding-plan",
+        "Alibaba Coding Plan",
+        "https://coding-intl.dashscope.aliyuncs.com/v1"
+    ),
+    api_key!(
+        "alibaba-token-plan",
+        "QwenCloud Token Plan",
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+    ),
+    api_key!("baseten", "Baseten", "https://inference.baseten.co/v1"),
+    api_key!("cerebras", "Cerebras", "https://api.cerebras.ai/v1"),
+    api_key!("cline-pass", "ClinePass", "https://api.cline.bot/api/v1"),
+    api_key!(
+        "coreweave",
+        "CoreWeave Serverless Inference",
+        "https://api.inference.wandb.ai/v1"
+    ),
+    api_key!(
+        "deepinfra",
+        "DeepInfra",
+        "https://api.deepinfra.com/v1/openai"
+    ),
+    api_key!("deepseek", "DeepSeek", "https://api.deepseek.com"),
+    api_key!(
+        "firepass",
+        "Fire Pass (Fireworks subscription)",
+        "https://api.fireworks.ai/inference/v1"
+    ),
+    api_key!(
+        "fireworks",
+        "Fireworks",
+        "https://api.fireworks.ai/inference/v1"
+    ),
+    api_key!("gmi-cloud", "GMI Cloud", "https://api.gmi-serving.com/v1"),
+    api_key!("groq", "Groq", "https://api.groq.com/openai/v1"),
+    api_key!(
+        "huggingface",
+        "Hugging Face Inference",
+        "https://router.huggingface.co/v1"
+    ),
+    api_key!("kilo", "Kilo Gateway", "https://api.kilo.ai/api/gateway"),
+    api_key!("minimax", "MiniMax", "https://api.minimax.io/anthropic"),
+    api_key!(
+        "minimax-code",
+        "MiniMax Token Plan (International)",
+        "https://api.minimax.io/v1"
+    ),
+    api_key!(
+        "minimax-code-cn",
+        "MiniMax Token Plan (China)",
+        "https://api.minimaxi.com/v1"
+    ),
+    api_key!("mistral", "Mistral", "https://api.mistral.ai/v1"),
+    api_key!(
+        "moonshot",
+        "Moonshot (Kimi API)",
+        "https://api.moonshot.ai/v1"
+    ),
+    api_key!("nanogpt", "NanoGPT", "https://nano-gpt.com/api/v1"),
+    api_key!("novita", "Novita", "https://api.novita.ai/openai/v1"),
+    api_key!("nvidia", "NVIDIA", "https://integrate.api.nvidia.com/v1"),
+    api_key!("ollama-cloud", "Ollama Cloud", "https://ollama.com"),
+    api_key!("openai", "OpenAI", "https://api.openai.com/v1"),
+    api_key!(
+        "opencode-go",
+        "OpenCode Go",
+        "https://opencode.ai/zen/go/v1"
+    ),
+    api_key!("opencode-zen", "OpenCode Zen", "https://opencode.ai/zen/v1"),
+    api_key!("openrouter", "OpenRouter", "https://openrouter.ai/api/v1"),
+    api_key!("qianfan", "Qianfan", "https://qianfan.baidubce.com/v2"),
+    api_key!("qwen-portal", "Qwen Portal", "https://portal.qwen.ai/v1"),
+    api_key!("sakana", "Sakana AI", "https://api.sakana.ai/v1"),
+    api_key!(
+        "siliconflow",
+        "SiliconFlow",
+        "https://api.siliconflow.com/v1"
+    ),
+    api_key!(
+        "siliconflow-cn",
+        "SiliconFlow (China)",
+        "https://api.siliconflow.cn/v1"
+    ),
+    api_key!(
+        "synthetic",
+        "Synthetic",
+        "https://api.synthetic.new/openai/v1"
+    ),
+    api_key!("together", "Together", "https://api.together.xyz/v1"),
+    api_key!("umans", "Umans AI Coding Plan", "https://api.code.umans.ai"),
+    api_key!("venice", "Venice", "https://api.venice.ai/api/v1"),
+    api_key!(
+        "vercel-ai-gateway",
+        "Vercel AI Gateway",
+        "https://ai-gateway.vercel.sh"
+    ),
+    api_key!(
+        "wafer-serverless",
+        "Wafer Serverless (pay-as-you-go)",
+        "https://pass.wafer.ai/v1"
+    ),
+    api_key!("xai", "xAI API", "https://api.x.ai/v1"),
+    api_key!("xiaomi", "Xiaomi MiMo", "https://api.xiaomimimo.com/v1"),
+    api_key!(
+        "xiaomi-token-plan-ams",
+        "Xiaomi Token Plan (Europe)",
+        "https://token-plan-ams.xiaomimimo.com/v1"
+    ),
+    api_key!(
+        "xiaomi-token-plan-cn",
+        "Xiaomi Token Plan (China)",
+        "https://token-plan-cn.xiaomimimo.com/v1"
+    ),
+    api_key!(
+        "xiaomi-token-plan-sgp",
+        "Xiaomi Token Plan (Singapore)",
+        "https://token-plan-sgp.xiaomimimo.com/v1"
+    ),
+    api_key!("yolo-auto", "Yolo-Auto", "https://yolo-auto.com/v1"),
+    api_key!(
+        "zhipu-coding-plan",
+        "Zhipu Coding Plan (智谱)",
+        "https://open.bigmodel.cn/api/coding/paas/v4"
+    ),
 ];
 
 /// The catalogue row for a literal provider id.

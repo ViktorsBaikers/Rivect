@@ -26,7 +26,7 @@ with chat_terminal(Path(sys.argv[1]).resolve(strict=True), 'loopback', '', befor
     see(master, b'Sign in to a provider')
     see(master, b'OpenAI (ChatGPT)')
     see(master, b'Anthropic (Claude)')
-    # The list is ordered by id: Anthropic, Copilot, Kimi, OpenAI, Z.AI.
+    # Interactive legs come first: Anthropic, Copilot, Kimi, OpenAI, Z.AI.
     os.write(master, b'\x1b[B\x1b[B\x1b[B')
     see(master, b'\xe2\x96\xaa OpenAI (ChatGPT)')
     os.write(master, b'\r')
@@ -57,6 +57,20 @@ with chat_terminal(Path(sys.argv[1]).resolve(strict=True), 'loopback', '', befor
     os.write(master, b'\x1b[200~' + callback + b'\x1b[201~\r')
     assert secret not in see(master, b'Callback discarded')
     assert secret not in see(master, b'Message')
+
+    # A stored-key provider reaches its hidden key prompt without touching a
+    # credential store; Esc walks back out of the picker.
+    os.write(master, b'/login deepseek\r')
+    see(master, b'DeepSeek')
+    os.write(master, b'\r')
+    see(master, b'API key \xc2\xb7 DeepSeek')
+    see(master, b'Paste the key')
+    os.write(master, b'\x1b')
+    see(master, b'Sign in \xc2\xb7 DeepSeek')
+    os.write(master, b'\x1b')
+    see(master, b'Sign in to a provider')
+    os.write(master, b'\x1b')
+    see(master, b'Message')
 
     os.write(master, b'\x1b[200~/permissions\x1b[201~\r')
     result = see(master, b'Permissions:')

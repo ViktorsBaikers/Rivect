@@ -12,11 +12,12 @@ export type LoginProvider = {id: string; name: string; declared: boolean; method
 export type LoginPending = {provider: string; method: string; url: string; user_code?: string; capture: boolean};
 export type LoginReceipt = {lines: string[]; pending?: LoginPending};
 
-/** The three picker actions plus the leg's own lifecycle. */
+/** The picker actions plus the leg's own lifecycle. */
 export type LoginAction =
   {kind: 'login_providers'} |
   {kind: 'login_connect'; provider: string} |
   {kind: 'login_start'; provider: string; method: string} |
+  {kind: 'login_apikey'; provider: string; key: string} |
   {kind: 'login_complete'} |
   {kind: 'login_cancel'} |
   {kind: 'login_callback'; redirect: string};

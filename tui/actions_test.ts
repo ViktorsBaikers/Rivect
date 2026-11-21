@@ -13,7 +13,8 @@ test('callback-bearing drafts never qualify as ordinary input', () => {
   for (const draft of ['http://localhost:1455/auth/callback', '/task https://app.test/return?%63ode=',
     'https://app.test/old#access_token=', '/login http://wrong']) assert(looksLikeOAuthCallback(draft));
   for (const draft of ['/login', '/login callback', '/login device', '/login cancel', '/login complete',
-    'visit https://example.test/docs?page=2']) assert.equal(looksLikeOAuthCallback(draft),false);
+    '/login deepseek', '/login openai-codex', 'visit https://example.test/docs?page=2'])
+    assert.equal(looksLikeOAuthCallback(draft),false);
 });
 
 test('a provider echo of old private input stays out of previews and restored replies', async () => {
@@ -97,12 +98,15 @@ test('operator projections use the bound core; pasted or extended commands do no
       assert.equal(core.loginStatus,'Session not connected · Run /login');
       // The picker reads the core catalogue, not a client-side provider list.
       const providers = await core.loginProviders();
-      assert.deepEqual(providers.map(provider => provider.id),
+      assert.deepEqual(providers.slice(0, 5).map(provider => provider.id),
         ['anthropic', 'github-copilot', 'kimi-code', 'openai-codex', 'zai']);
+      assert(providers.length >= 50);
       const codex = providers.find(provider => provider.id === 'openai-codex');
       assert.deepEqual(codex?.methods.map(method => method.id), ['browser', 'device']);
       assert.equal(codex?.methods[0]?.capture, true);
       assert.equal(providers.find(provider => provider.id === 'zai')?.methods[0]?.capture, false);
+      assert.deepEqual(providers.find(provider => provider.id === 'deepseek')?.methods.map(method => method.id),
+        ['api_key']);
       // Selecting a row declares its connection through the journaled edit.
       await core.login({kind:'login_connect', provider:'anthropic'});
       const declared = await core.loginProviders();

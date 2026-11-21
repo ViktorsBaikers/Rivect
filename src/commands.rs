@@ -2785,6 +2785,7 @@ const METHODS: &[&str] = &[
     "auth.login.begin",
     "auth.login.complete",
     "auth.login.cancel",
+    "auth.login.apikey",
     "auth.providers",
     "provider.connect",
     "auth.refresh",
@@ -6124,6 +6125,7 @@ fn handle_method(
         "auth.login.begin" => auth_login_begin(rt, ingress, &params, id),
         "auth.login.complete" => auth_login_complete(rt, ingress, &params, id),
         "auth.login.cancel" => auth_login_cancel(rt, ingress, &params, id),
+        "auth.login.apikey" => auth_login_apikey(rt, ingress, &params, id),
         "auth.providers" => auth_providers(rt, id),
         "provider.connect" => provider_connect(rt, ingress, &params, id),
         "auth.refresh" => auth_refresh(rt, ingress, &params, id),
@@ -8955,6 +8957,74 @@ fn auth_login_cancel(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Val
             "state": if cancelled { "cancelled" } else { "none" },
         }),
     )
+}
+
+/// `auth.login.apikey`: stores one operator-supplied key at the declared
+/// row's profile scope. The key is the adapter's whole bearer credential; it
+/// is never echoed, logged or carried by an error. Enrollment is create-only,
+/// like every other login write, so an occupied scope denies instead of
+/// silently replacing the stored key.
+fn auth_login_apikey(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.login.apikey") {
+        return response;
+    }
+    if let Some(error) = unknown_param(params, &["schema_version", "connection", "key"]) {
+        return request_error(id, error);
+    }
+    let Some(connection) = params.get("connection").and_then(Value::as_str) else {
+        return request_error(
+            id,
+            RequestError::Required {
+                field: "connection",
+            },
+        );
+    };
+    let Some(key) = params.get("key").and_then(Value::as_str) else {
+        return request_error(id, RequestError::Required { field: "key" });
+    };
+    if key.is_empty() || key.len() > 8192 || key.chars().any(char::is_control) {
+        return request_error(id, RequestError::InvalidParameter { name: "key" });
+    }
+    let Some(provider) = crate::providers::login_catalog::provider(connection) else {
+        return request_error(id, RequestError::InvalidParameter { name: "connection" });
+    };
+    if crate::providers::login_catalog::method(provider, "api_key").is_none() {
+        return request_error(
+            id,
+            RequestError::CommandUnavailable {
+                command: "auth.login.apikey".to_string(),
+                reason: format!("{connection} records no api_key login"),
+            },
+        );
+    }
+    let config = rt.config_for_broker();
+    if !config.connections.contains_key(connection) {
+        return request_error(
+            id,
+            RequestError::CommandUnavailable {
+                command: "auth.login.apikey".to_string(),
+                reason: format!("{connection} is not declared"),
+            },
+        );
+    }
+    let store = match provider_login_store(rt, &config, connection) {
+        Ok(store) => store,
+        Err(error) => return provider_login_error(id, &error),
+    };
+    let reference = match crate::providers::resolve_credential(&config, connection) {
+        Ok(reference) => reference,
+        Err(error) => return provider_login_error(id, &error),
+    };
+    match store.login(&reference, key.as_bytes()) {
+        Ok(()) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "profile": reference.profile(),
+            }),
+        ),
+        Err(error) => provider_login_error(id, &error),
+    }
 }
 
 /// The `auth.refresh`/`auth.logout`/`auth.revoke` parameter set: the one

@@ -32,6 +32,10 @@ enum Action<'a> {
         provider: &'a str,
         method: &'a str,
     },
+    LoginKey {
+        provider: &'a str,
+        key: &'a str,
+    },
     LoginComplete {},
     LoginCallback {
         redirect: &'a str,
@@ -196,6 +200,33 @@ fn login(rt: &mut Runtime, action: Action<'_>) -> Result<Value, Refusal> {
             format!("Declared {} for sign-in.", sanitize_status_cause(provider))
         };
         return Ok(json!({"lines":[line], "login":"idle"}));
+    }
+    // A stored-key row: the connection is declared, then the key is written
+    // at its profile scope. Nothing is sent to the provider.
+    if let Action::LoginKey { provider, key } = action {
+        call(
+            rt,
+            Ingress::Machine,
+            "provider.connect",
+            json!({"schema_version":1,"id":provider}),
+        )?;
+        let result = call(
+            rt,
+            Ingress::Machine,
+            "auth.login.apikey",
+            json!({"schema_version":1,"connection":provider,"key":key}),
+        )?;
+        let profile = sanitize_status_cause(string(&result, "profile")?);
+        let (status, error) = rivect::ui::connected_status(&rt.config_for_broker(), &profile);
+        let status = sanitize_status_cause(&status);
+        let mut lines = vec![format!("Login complete: {profile}"), status.clone()];
+        if let Some(error) = error {
+            lines.push(format!(
+                "Model selection unavailable: {} stage",
+                error.stage
+            ));
+        }
+        return Ok(json!({"lines":lines, "login":"connected", "status":status}));
     }
     let start = match &action {
         Action::LoginStart { provider, method } => Some((*provider, *method)),

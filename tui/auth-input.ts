@@ -5,8 +5,10 @@ export function looksLikeOAuthCallback(text: string): boolean {
   if (!text) return false;
   const value = text.includes('%') ? text.replace(/%([0-9a-f]{2})/giu, (_, byte:string) => String.fromCharCode(parseInt(byte,16))) : text;
   if (/(?:localhost|127\.0\.0\.1|\[::1\]):1455(?:\/|\b)|\/(?:auth|oauth2?)\/callback\b|[?&#](?:code|state|access_token|id_token|refresh_token|error_description)=/iu.test(value)) return true;
-  const argument = /^\s*\/login\s+([\s\S]+)$/iu.exec(value)?.[1];
-  return argument !== undefined && !['cancel','complete','device','callback'].some(word=>word.startsWith(argument));
+  const argument = /^\s*\/login\s+(\S+)$/iu.exec(value)?.[1];
+  // `/login <provider>` filters the picker; only a URL-shaped argument is the
+  // old private callback entry.
+  return argument !== undefined && /^(?:[a-z][a-z0-9+.-]*:\/\/|(?:localhost|127\.0\.0\.1|\[::1\]):)/iu.test(argument);
 }
 
 export function loginStatus(available:boolean | undefined):string {

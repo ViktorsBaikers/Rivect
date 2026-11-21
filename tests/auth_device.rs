@@ -1997,8 +1997,9 @@ fn auth_providers_lists_every_sign_in_row() {
         .iter()
         .map(|row| row["id"].as_str().expect("provider id"))
         .collect();
+    assert_eq!(ids.len(), 52, "{ids:?}");
     assert_eq!(
-        ids,
+        &ids[..5],
         [
             "anthropic",
             "github-copilot",
@@ -2007,10 +2008,32 @@ fn auth_providers_lists_every_sign_in_row() {
             "zai"
         ]
     );
+    for stored in ["deepseek", "openai", "groq", "openrouter", "mistral"] {
+        let row = rows
+            .iter()
+            .find(|row| row["id"] == stored)
+            .unwrap_or_else(|| panic!("missing {stored}"));
+        assert_eq!(
+            row["methods"][0]["id"], "api_key",
+            "{stored} records its stored-key method"
+        );
+        assert_eq!(row["methods"][0]["capture"], false);
+    }
     let codex = rows
         .iter()
         .find(|row| row["id"] == "openai-codex")
         .expect("the codex row");
+    // Every advertised row must also be a routed dialect in this build.
+    for id in &ids {
+        assert!(
+            rivect::providers::dialect_for(id).is_some(),
+            "catalogue id {id} has no wired dialect"
+        );
+        assert!(
+            rivect::providers::externally_blocked(id).is_none(),
+            "catalogue id {id} is externally blocked"
+        );
+    }
     assert_eq!(codex["declared"], true);
     let methods: Vec<&str> = codex["methods"]
         .as_array()
@@ -2130,6 +2153,82 @@ fn provider_connect_seeds_a_fresh_root() {
         json!({ "schema_version": 1, "id": "anthropic" }),
     );
     assert_eq!(second["declared"], true);
+}
+
+/// One declared stored-key row for the API-key proof: no network is involved,
+/// so the recorded base never receives a byte.
+fn apikey_config(connection: &str, endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.{connection}]\n\
+         kind = \"api_key\"\n\
+         endpoint = \"{endpoint}\"\n\
+         credential_ref = \"keyring:rivect-test/{connection}\"\n\
+         profile = \"{connection}\"\n\
+         [profiles.{connection}]\n\
+         credential_ref = \"keyring:rivect-test/{connection}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"auto\" }}\n"
+    )
+}
+
+/// `auth.login.apikey` writes the operator's key at the declared row's
+/// profile scope: the adapter's later send resolves exactly those bytes, a
+/// repeated enrollment conflicts instead of replacing them, and a control
+/// character or an undeclared row is refused typed.
+#[test]
+fn api_key_login_stores_the_bearer_at_the_profile_scope() {
+    let config = apikey_config("deepseek", "https://api.deepseek.com");
+    let parsed = Config::parse_validated(&config).expect("the deepseek config parses");
+    let mut world = support::open_world("apikey-login", Some(&config));
+    let store = Arc::new(support::MapStore::new(StoreKind::Keychain));
+    world.runtime.login_credentials = Some(store.clone());
+    let reference = resolve_credential(&parsed, "deepseek").expect("deepseek ref");
+    const KEY: &str = "sk-deepseek-fixture-not-real";
+
+    let login = rpc_ok(
+        &mut world,
+        "auth.login.apikey",
+        json!({
+            "schema_version": 1,
+            "connection": "deepseek",
+            "key": KEY,
+        }),
+    );
+    assert_eq!(login["profile"], "deepseek");
+    assert_eq!(
+        store.resolve(&reference).expect("stored key"),
+        KEY.as_bytes(),
+        "the adapter resolves the operator's key verbatim"
+    );
+    assert_refusal(
+        &mut world,
+        "auth.login.apikey",
+        json!({"schema_version": 1, "connection": "deepseek", "key": "second-key"}),
+        "conflict",
+        "already holds material",
+    );
+    assert_eq!(
+        store.resolve(&reference).expect("prior key kept"),
+        KEY.as_bytes(),
+        "a refused enrollment leaves the prior bytes"
+    );
+    assert_refusal(
+        &mut world,
+        "auth.login.apikey",
+        json!({"schema_version": 1, "connection": "deepseek", "key": "bad\nkey"}),
+        "invalid_input",
+        "parameter key has the wrong type",
+    );
+    assert_refusal(
+        &mut world,
+        "auth.login.apikey",
+        json!({"schema_version": 1, "connection": "groq", "key": KEY}),
+        "capability_unavailable",
+        "groq is not declared",
+    );
 }
 
 /// A browser leg captures its loopback redirect: the terminal is never asked
