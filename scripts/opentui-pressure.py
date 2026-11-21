@@ -57,7 +57,10 @@ def accept_goal(listener, master, goal):
 
 def sample(binary, count):
     with socket.create_server(('127.0.0.1', 0)) as listener:
-        listener.settimeout(5)
+        # Dispatch liveness, not a budget: a loaded CI runner can take many
+        # seconds to hand one task to the provider. The measured input and
+        # cancellation figures keep their own budgets.
+        listener.settimeout(30)
         endpoint = f'http://127.0.0.1:{listener.getsockname()[1]}/v1'
         with chat_terminal(binary, 'vllm', endpoint) as (master, database, child):
             for n in range(count):
