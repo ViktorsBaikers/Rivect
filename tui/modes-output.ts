@@ -13,7 +13,15 @@ export function sourceLines(source: string, text: string) {
   return prefix + text.replaceAll('\n', '\n' + prefix);
 }
 
+let mouseAllowed = true;
+
+export function setMouseAllowed(enabled: boolean) { mouseAllowed = enabled; }
+
 export function setSurface(renderer: CliRenderer, inline: boolean) {
+  // Inline hands the transcript to native scrollback, so capture must not
+  // keep swallowing the wheel; returning to fullscreen restores the
+  // operator's choice (default on, --no-mouse or /tui mouse off opt out).
+  renderer.useMouse = !inline && mouseAllowed;
   if (!inline) renderer.externalOutputMode = 'passthrough';
   renderer.screenMode = inline ? 'split-footer' : 'alternate-screen';
   if (inline) renderer.externalOutputMode = 'capture-stdout';

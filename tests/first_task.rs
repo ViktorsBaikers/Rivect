@@ -3046,10 +3046,15 @@ fn packaged_command() -> portable_pty::CommandBuilder {
 }
 
 fn spawn_thread_at(data: &Path, project: &Path) -> support::PtySession {
+    spawn_thread_at_args(data, project, &[])
+}
+
+fn spawn_thread_at_args(data: &Path, project: &Path, args: &[&str]) -> support::PtySession {
     let scratch = tempfile::TempDir::new().expect("terminal scratch");
     let mut command = packaged_command();
     command.env("HOME", scratch.path());
     command.env("RIVECT_DATA_ROOT", data);
+    command.args(args);
     command.cwd(project);
     let pty = support::PtySession::spawn(command, TUI_ROWS, TUI_COLS, scratch, data.to_owned())
         .expect("spawn packaged TUI");
@@ -3058,6 +3063,13 @@ fn spawn_thread_at(data: &Path, project: &Path) -> support::PtySession {
 }
 
 fn isolated_thread(config: Option<&str>) -> (tempfile::TempDir, support::PtySession) {
+    isolated_thread_with_args(config, &[])
+}
+
+fn isolated_thread_with_args(
+    config: Option<&str>,
+    args: &[&str],
+) -> (tempfile::TempDir, support::PtySession) {
     let root = tempfile::TempDir::new().expect("fixture root");
     let data = root.path().join("data");
     let project = root.path().join("project");
@@ -3066,7 +3078,7 @@ fn isolated_thread(config: Option<&str>) -> (tempfile::TempDir, support::PtySess
     if let Some(config) = config {
         std::fs::write(data.join("config.toml"), config).expect("fixture config");
     }
-    let pty = spawn_thread_at(&data, &project);
+    let pty = spawn_thread_at_args(&data, &project, args);
     (root, pty)
 }
 
@@ -3346,8 +3358,9 @@ fn held_messages() -> (
         entered.send(()).expect("request observer");
         gate.recv_timeout(WAIT)
             .expect("explicit release of held response");
-        // Message ingress admits text only. This real tool reply settles it as blocked.
-        chat_stream("read_file", json!({"path":"not-read.txt"}))
+        // A held response is the ordinary direct answer a local chat returns:
+        // the task waits for the operator's next message, it does not block.
+        chat_text_stream("held reply")
     });
     (peer, requests, release)
 }
@@ -3573,7 +3586,7 @@ fn new_and_clear_create_an_independent_conversation_p4() {
     refuse_running(&mut pty, "/clear", "stored conversation");
     assert_eq!(session_counts(&pty), (1, 2));
     release.send(()).expect("release response");
-    see(&pty, "You blocked");
+    see(&pty, "You waiting");
     pty.send(b"/help\r").expect("help after refusal");
     let help = see(&pty, "/compact");
     for name in ["/new", "/clear", "/compact"] {
@@ -3607,7 +3620,7 @@ fn new_and_clear_create_an_independent_conversation_p5() {
     assert_saved_goal(&pty, &id, b"notes\n/clear\nend");
     assert_eq!(session_counts(&pty), (1, 2));
     release.send(()).expect("release response");
-    see(&pty, "You blocked");
+    see(&pty, "You waiting");
     assert_eq!(peer.requests(), 1);
     exit_thread(pty);
 }
@@ -3673,7 +3686,7 @@ fn new_requires_an_idle_session_p8() {
         )
         .expect("source session");
     release.send(()).expect("release first response");
-    see(&pty, "You blocked");
+    see(&pty, "You waiting");
     switch_idle(&mut pty, "/new");
     let current: String = task_store(&pty)
         .query_row(
@@ -3696,7 +3709,7 @@ fn new_requires_an_idle_session_p8() {
     assert_ne!(id, second);
     assert_eq!(session_counts(&pty), (2, 3));
     release.send(()).expect("release second response");
-    see(&pty, "You blocked");
+    see(&pty, "You waiting");
     assert_eq!(peer.requests(), 2);
     exit_thread(pty);
 }
@@ -3926,33 +3939,78 @@ fn tui_error_restores_terminal() {
 }
 
 #[test]
-fn tui_mouse_off_default() {
+fn tui_mouse_on_by_default_and_no_mouse_disables() {
+    let captures = |stream: &[u8]| {
+        [
+            &b"\x1b[?1000h"[..],
+            b"\x1b[?1002h",
+            b"\x1b[?1003h",
+            b"\x1b[?1006h",
+        ]
+        .iter()
+        .any(|needle| support::find_subsequence(stream, needle).is_some())
+    };
     let (_root, mut pty) = isolated_thread(None);
     assert!(
         pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
             .expect("pty read"),
         "alternate screen must be entered on start"
     );
-    let stream = pty.collected().expect("pty read");
-    for mouse_enable in [
-        &b"\x1b[?1000h"[..],
-        b"\x1b[?1002h",
-        b"\x1b[?1003h",
-        b"\x1b[?1006h",
-        b"\x1b[?1015h",
-    ] {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if captures(&pty.collected().expect("pty read")) {
+            break;
+        }
         assert!(
-            support::find_subsequence(&stream, mouse_enable).is_none(),
-            "mouse capture must stay off by default: found {mouse_enable:?}"
+            std::time::Instant::now() < deadline,
+            "fullscreen must capture the mouse by default for wheel scrolling"
         );
+        pty.pump_for(Duration::from_millis(25)).expect("pty pump");
     }
-    // Ctrl-C cancels and still restores the terminal.
+    // Ctrl-C cancels and still restores the terminal, including capture.
     pty.send(&[0x03]).expect("pty send");
     let code = pty.wait_exit(Duration::from_secs(10)).expect("pty wait");
     assert_eq!(code, Some(130), "cancel exits 130");
     let stream = pty.collected().expect("pty read");
     assert!(support::find_subsequence(&stream, b"\x1b[?1049l").is_some());
     assert!(support::find_subsequence(&stream, b"\x1b[?25h").is_some());
+    assert!(
+        [
+            &b"\x1b[?1000l"[..],
+            b"\x1b[?1002l",
+            b"\x1b[?1003l",
+            b"\x1b[?1006l",
+        ]
+        .iter()
+        .any(|needle| support::find_subsequence(&stream, needle).is_some()),
+        "mouse capture must be released on exit"
+    );
+    pty.finish().expect("pty teardown");
+
+    let (_root, mut pty) = isolated_thread_with_args(None, &["--no-mouse"]);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+    pty.pump_for(Duration::from_millis(250)).expect("pty pump");
+    let stream = pty.collected().expect("pty read");
+    for mouse_enable in [
+        &b"\x1b[?1000h"[..],
+        b"\x1b[?1002h",
+        b"\x1b[?1003h",
+        b"\x1b[?1006h",
+    ] {
+        assert!(
+            support::find_subsequence(&stream, mouse_enable).is_none(),
+            "--no-mouse must keep capture off: found {mouse_enable:?}"
+        );
+    }
+    pty.send(&[0x03]).expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(130)
+    );
     pty.finish().expect("pty teardown");
 }
 
@@ -6684,8 +6742,15 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
 }
 
 #[test]
-fn ordinary_tui_input_displays_the_provider_reply() {
-    let peer = ChatPeer::scripted(|_, _| {
+fn ordinary_tui_prompt_dispatches_a_tool_capable_task() {
+    let peer = ChatPeer::scripted(|_, payload| {
+        let request = String::from_utf8_lossy(payload);
+        assert!(request.contains("\"tools\""), "{request}");
+        assert!(request.contains("read_file"), "{request}");
+        assert!(
+            !request.contains("No tools are available"),
+            "the ordinary prompt still claims tools are unavailable: {request}"
+        );
         let response = json!({
             "id": "c1",
             "object": "chat.completion.chunk",

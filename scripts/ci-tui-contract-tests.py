@@ -64,6 +64,7 @@ class TuiRunnerContract(unittest.TestCase):
             "thread_test": "libexec/rivect-tui",
             "input_test": "libexec/rivect-tui",
             "operator_test": "libexec/rivect-tui",
+            "scroll_test": "libexec/rivect-tui",
             "session_test": "libexec/rivect-tui",
             "streaming_test": "libexec/rivect-tui",
             "startup_test": "rivect",

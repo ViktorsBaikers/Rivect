@@ -1379,7 +1379,7 @@ fn help_names_every_run_flag_and_the_surface_precedence() {
         "--tui fullscreen|inline",
         "fullscreen is the default",
         "--linear",
-        "capture is off by default",
+        "disable mouse capture",
         "--headless",
         "--data-root PATH",
         "--ui-review <state>",

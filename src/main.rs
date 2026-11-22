@@ -142,6 +142,7 @@ fn main() {
         cli::Invocation::Run {
             headless,
             render,
+            mouse,
             data_root,
         } => {
             let stdin_tty = io::stdin().is_tty();
@@ -159,7 +160,11 @@ fn main() {
                 std::process::exit(2);
             }
             if !headless && stdin_tty {
-                let source = ui_launch::exec(&["--surface", render.label()], Some(&data_root));
+                let mut args = vec!["--surface", render.label()];
+                if !mouse {
+                    args.push("--no-mouse");
+                }
+                let source = ui_launch::exec(&args, Some(&data_root));
                 report_cli_error(&CliError::Tui(source));
                 std::process::exit(1);
             }

@@ -1,6 +1,7 @@
 import { writeSync } from 'node:fs';
 import type { CliRendererExternalOutputEvent } from '@opentui/core';
 import { guardSplitScrollback } from './native-guard';
+import { setMouseAllowed } from './modes-output';
 
 export async function runClient(args: string[]) {
   try { await start(args); }
@@ -10,6 +11,9 @@ export async function runClient(args: string[]) {
 async function start(args: string[]) {
   if (args[0] === '--terminal-client') args = args.slice(1);
   if (args.length === 1 && args[0] === '--decision-witness') return (await import('./witness')).runWitness();
+  const noMouse = args.includes('--no-mouse');
+  args = args.filter(arg => arg !== '--no-mouse');
+  setMouseAllowed(!noMouse);
   const review = args[0] === '--ui-review' && args.length === 2 ? args[1] : undefined;
   const mode = review ? 'fullscreen' : args.length === 0 ? (process.env.RIVECT_LINEAR === '1' ? 'linear' : 'fullscreen')
     : args.length === 1 && args[0] === '--linear' ? 'linear'
@@ -23,7 +27,10 @@ async function start(args: string[]) {
   const events = ['uncaughtException', 'unhandledRejection'] as const;
   const prior = new Map(events.map(event => [event, new Set(process.listeners(event))]));
   const opened = review ? undefined : await (await import('./startup')).startup();
-  const renderer = await createCliRenderer({exitOnCtrlC: false, useMouse: false, consoleMode: 'disabled',
+  const renderer = await createCliRenderer({exitOnCtrlC: false,
+    // Fullscreen owns no native scrollback to protect, so the wheel scrolls the
+    // transcript by default; inline and --no-mouse keep native selection.
+    useMouse: !noMouse && mode === 'fullscreen', consoleMode: 'disabled',
     // Immediate edits cannot meet a 16 ms budget behind the default 60 Hz gate; live frames stay at 30 Hz.
     maxFps: 120,
     synchronizedOutput: process.env.RIVECT_HOST_MUX === '1' || process.env.TMUX || process.env.STY || process.env.ZELLIJ ||

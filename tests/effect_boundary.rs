@@ -2240,7 +2240,6 @@ fn hostile_output_renders_inert_without_approval_or_egress() {
     );
     for query in [
         "SELECT count(*) FROM preapprovals",
-        "SELECT count(*) FROM answer_attempts",
         "SELECT count(*) FROM attempts WHERE effect_class IN ('read','write','exec')",
     ] {
         assert_eq!(
@@ -2250,6 +2249,14 @@ fn hostile_output_renders_inert_without_approval_or_egress() {
             "{query}"
         );
     }
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM answer_attempts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count start witnesses"),
+        1,
+        "only the operator's start answer is witnessed; hostile text adds none"
+    );
     assert_eq!(
         egress_attempts(),
         admitted,

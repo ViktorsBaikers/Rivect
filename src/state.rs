@@ -4979,6 +4979,24 @@ impl TaskStore {
         tx.commit().map_err(storage)
     }
 
+    /// Persists the final reply of an ordinary task-path prompt so a restored
+    /// session shows it without a second provider call. The controller owns
+    /// the lifecycle; this row owns only the private projection bytes.
+    pub(crate) fn record_ui_reply(
+        &mut self,
+        task: &TaskId,
+        reply: std::result::Result<&str, ErrorCode>,
+    ) -> Result<()> {
+        let (text, code) = match reply {
+            Ok(text) => (Some(text), None),
+            Err(code) => (None, Some(code.as_str())),
+        };
+        self.conn_mut()?
+            .execute(sql::UPSERT_UI_REPLY, params![task.0, text, code])
+            .map_err(storage)?;
+        Ok(())
+    }
+
     pub(crate) fn reconcile_ui_messages(&mut self) -> Result<()> {
         while let Some((session, task, revision)) = self
             .conn()?
@@ -5543,6 +5561,19 @@ impl TaskStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
         Self::block_foreign(&tx, &task_id.0, sql::BLOCK_TASK_OPEN)?;
+        tx.commit().map_err(storage)
+    }
+
+    /// A direct model answer with no tool action still leaves the task able to
+    /// receive the operator's next message; only a missing action without an
+    /// answer blocks it.
+    pub fn mark_waiting(&mut self, task_id: &TaskId) -> Result<()> {
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        tx.execute(sql::WAIT_TASK_OPEN, params![task_id.0])
+            .map_err(storage)?;
         tx.commit().map_err(storage)
     }
 

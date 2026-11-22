@@ -552,7 +552,7 @@ fn project(
                 return Err(Refusal::Invalid);
             }
             let (receipt, work) = runtime
-                .begin_ui_message(&session, command, goal)
+                .begin_ui_message(&session, command, goal, pipe.witness)
                 .map_err(|error| Refusal::Core(error.error_code()))?;
             *launch = work.map(|message| Work::Message(Box::new(message)));
             let snapshot = committed_snapshot(runtime, &session, &receipt.task_id)?;
@@ -725,12 +725,9 @@ pub fn serve(
                     }
                 };
                 let result = match work {
-                    Work::Answer(answer) => runtime.finish_terminal_answer(
-                        answer,
-                        Arc::clone(&stop),
-                        &ledger_pending,
-                        &observe,
-                    ),
+                    Work::Answer(answer) => {
+                        runtime.finish_terminal_answer(answer, Arc::clone(&stop), &observe)
+                    }
                     Work::Message(work) => {
                         runtime.finish_ui_message(*work, &stop, &ledger_pending, &observe)
                     }

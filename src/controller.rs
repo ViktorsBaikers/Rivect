@@ -625,8 +625,16 @@ impl Runtime {
     }
 
     pub fn drain_scheduler(&mut self, session_id: &SessionId) -> Result<(), ControllerError> {
+        self.drain_scheduler_with_preview(session_id, None)
+    }
+
+    pub(crate) fn drain_scheduler_with_preview(
+        &mut self,
+        session_id: &SessionId,
+        preview: Option<&dyn Fn(&str)>,
+    ) -> Result<(), ControllerError> {
         for _ in 0..SCHEDULER_DRAIN_LIMIT {
-            match self.scheduler_step(session_id)? {
+            match self.scheduler_step_with_preview(session_id, preview)? {
                 SchedulerStep::Idle => return Ok(()),
                 SchedulerStep::Ran { .. } => {}
             }
@@ -649,12 +657,32 @@ impl Runtime {
         grant_id: &str,
         crash_after_dispatch: bool,
     ) -> Result<StepOutcome, ControllerError> {
+        self.run_decision_step_with_preview(
+            session_id,
+            task_id,
+            answer,
+            grant_id,
+            crash_after_dispatch,
+            None,
+        )
+    }
+
+    fn run_decision_step_with_preview(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        answer: &AnswerSelection,
+        grant_id: &str,
+        crash_after_dispatch: bool,
+        preview: Option<&dyn Fn(&str)>,
+    ) -> Result<StepOutcome, ControllerError> {
         let outcome = self.run_decision_step_inner(
             session_id,
             task_id,
             answer,
             grant_id,
             crash_after_dispatch,
+            preview,
         )?;
         let settled = match &outcome {
             StepOutcome::Completed { snapshot } => Some((snapshot, "output.complete")),
@@ -687,6 +715,7 @@ impl Runtime {
         answer: &AnswerSelection,
         grant_id: &str,
         crash_after_dispatch: bool,
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<StepOutcome, ControllerError> {
         if let Some(cancelled) = self.foreground_cancellation(session_id, task_id)? {
             return Ok(cancelled);
@@ -735,7 +764,7 @@ impl Runtime {
         {
             return self.run_saved_segment(session_id, task_id, &binding, &segment);
         }
-        let resolved = self.resolve_read_target(session_id, task_id, answer);
+        let resolved = self.resolve_read_target(session_id, task_id, answer, preview);
         if let Some(cancelled) = self.foreground_cancellation(session_id, task_id)? {
             return Ok(cancelled);
         }
@@ -1088,6 +1117,7 @@ impl Runtime {
         session_id: &SessionId,
         task_id: &TaskId,
         answer: &AnswerSelection,
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
         // The manifest freezes the execution world (AC-013): the
         // scope root the request's sources and proofs live in,
@@ -1107,7 +1137,7 @@ impl Runtime {
         if let Some(question) = &answered
             && question.0.starts_with(FILE_SHARE_QUESTION)
         {
-            return self.resume_file_share(session_id, task_id, question, answer);
+            return self.resume_file_share(session_id, task_id, question, answer, preview);
         }
         if let Some(question) = &answered
             && question.0.starts_with(FILE_WRITE_QUESTION)
@@ -1289,11 +1319,12 @@ impl Runtime {
         let scopes = self.budget_scopes(task_id)?;
         let sent = {
             let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
-            self.broker.dispatch_with_cancel(
+            self.broker.dispatch_with_preview(
                 &mut ledger,
                 &world,
                 &manifest,
                 foreground_signal(self.foreground.as_ref(), task_id),
+                preview,
             )
         };
         // The refusal is known here, so the admission and its frozen inputs
@@ -1571,10 +1602,14 @@ impl Runtime {
             ));
         }
         let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
-            self.owner.store.mark_no_ready(task_id)?;
+            let direct = reply.tool_calls.is_empty() && !reply.text.trim().is_empty();
+            if direct {
+                self.owner.store.mark_waiting(task_id)?;
+            } else {
+                self.owner.store.mark_no_ready(task_id)?;
+            }
             let snapshot = self.owner.store.snapshot(task_id)?;
-            if reply.tool_calls.is_empty()
-                && !reply.text.trim().is_empty()
+            if direct
                 && let Some(work) = self.foreground.as_mut()
                 && &work.task_id == task_id
             {
@@ -1814,6 +1849,7 @@ impl Runtime {
         task: &TaskId,
         question: &QuestionId,
         answer: &AnswerSelection,
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
         let Some(share) = self.file_share.take_if(|share| &share.question == question) else {
             return Ok(Err(
@@ -1849,6 +1885,7 @@ impl Runtime {
             &share.recipient,
             &share.inputs.to_string(),
             &["read_file", crate::providers::WRITE_FILE_TOOL],
+            preview,
         )?;
         let (reply, attempt_id) = match result {
             Ok(result) => result,
@@ -1890,6 +1927,7 @@ impl Runtime {
         recipient: &ApprovedRecipient,
         inputs: &str,
         tools: &[&str],
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<Result<(ProviderReply, String), StepOutcome>, ControllerError> {
         use crate::config::{FallbackAssign, ModelAssign};
         let purpose = self.purpose.clone();
@@ -1928,11 +1966,12 @@ impl Runtime {
         let scopes = self.budget_scopes(task)?;
         let sent = {
             let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
-            self.broker.dispatch_with_cancel(
+            self.broker.dispatch_with_preview(
                 &mut ledger,
                 &world,
                 &manifest,
                 foreground_signal(self.foreground.as_ref(), task),
+                preview,
             )
         };
         if let Some(stopped) = self.note_send_outcome(session, task, &sent, Some(&manifest))? {
@@ -2108,6 +2147,7 @@ impl Runtime {
             &write.recipient,
             &inputs,
             &[crate::providers::RUN_CHECK_TOOL],
+            None,
         )? {
             Ok((reply, attempt)) => {
                 if let [call] = reply.tool_calls.as_slice()
@@ -2282,7 +2322,14 @@ impl Runtime {
                 "goal": String::from_utf8_lossy(&self.owner.store.goal_bytes(task)?),
                 "tool_result": { "tool": "run_check", "exit_code": run.exit_code, "signal": run.signal },
             }).to_string();
-            match self.dispatch_tool_observation(session, task, &pending.recipient, &inputs, &[]) {
+            match self.dispatch_tool_observation(
+                session,
+                task,
+                &pending.recipient,
+                &inputs,
+                &[],
+                None,
+            ) {
                 Ok(Ok((reply, _))) if !reply.text.trim().is_empty() => {
                     output = format!("{observed}\n{}", reply.text);
                 }
@@ -2665,6 +2712,14 @@ impl Runtime {
         &mut self,
         session_id: &SessionId,
     ) -> Result<SchedulerStep, ControllerError> {
+        self.scheduler_step_with_preview(session_id, None)
+    }
+
+    fn scheduler_step_with_preview(
+        &mut self,
+        session_id: &SessionId,
+        preview: Option<&dyn Fn(&str)>,
+    ) -> Result<SchedulerStep, ControllerError> {
         for delivery in self.notifications.drain(SCHEDULER_DRAIN_LIMIT) {
             match delivery {
                 Delivery::Event(event) => {
@@ -2688,12 +2743,13 @@ impl Runtime {
             }
         };
         let context = self.scheduler.node_context(node)?;
-        let outcome = match self.run_decision_step(
+        let outcome = match self.run_decision_step_with_preview(
             session_id,
             &context.task,
             &context.answer,
             &context.grant_id,
             false,
+            preview,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {

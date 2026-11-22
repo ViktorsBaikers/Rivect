@@ -196,6 +196,8 @@ pub const SETTLE_UI_MESSAGE: &str = "UPDATE tasks SET revision=revision+1,
                 WHERE session_id=?1 AND task_id=?2 AND revision=?4 AND lifecycle='running'";
 pub const INSERT_UI_REPLY: &str =
     "INSERT INTO ui_message_replies(task_id,reply,error_code) VALUES(?1,?2,?3)";
+pub const UPSERT_UI_REPLY: &str = "INSERT INTO ui_message_replies(task_id,reply,error_code) VALUES(?1,?2,?3)
+                ON CONFLICT(task_id) DO UPDATE SET reply=excluded.reply, error_code=excluded.error_code";
 pub const INTERRUPTED_UI_MESSAGE: &str = "SELECT t.session_id,t.task_id,t.revision FROM tasks t
                 JOIN events e ON e.aggregate_id=t.task_id AND e.aggregate_revision=1
                 WHERE t.lifecycle='running' AND e.origin='ui-message'
@@ -312,6 +314,8 @@ pub const BLOCK_TASK_NOT_CANCELLED: &str = "UPDATE tasks SET revision = revision
                  WHERE task_id = ?1 AND lifecycle != 'cancelled'";
 pub const EVIDENCE_VALIDITY: &str = "SELECT validity FROM evidence WHERE evidence_id = ?1";
 pub const BLOCK_TASK_OPEN: &str = "UPDATE tasks SET revision = revision + 1, lifecycle = 'blocked', event_cursor = event_cursor + 1
+                 WHERE task_id = ?1 AND lifecycle NOT IN ('completed', 'cancelled')";
+pub const WAIT_TASK_OPEN: &str = "UPDATE tasks SET revision = revision + 1, lifecycle = 'waiting', event_cursor = event_cursor + 1
                  WHERE task_id = ?1 AND lifecycle NOT IN ('completed', 'cancelled')";
 pub const MISSING_OBLIGATIONS: &str =
     "SELECT criterion_id FROM criteria WHERE task_id = ?1 AND criterion_id NOT IN

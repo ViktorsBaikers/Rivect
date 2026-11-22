@@ -562,7 +562,7 @@ pub fn help_lines(page: &Page<CommandDescriptor>) -> Vec<String> {
             .to_string(),
         "  --linear                 append-only screen-reader surface; the last of --tui/--linear wins"
             .to_string(),
-        "  --no-mouse               mouse capture is off by default; this flag states that explicitly"
+        "  --no-mouse               disable mouse capture (keeps native selection; wheel scroll uses the transcript)"
             .to_string(),
         "  --headless               run the JSON-RPC loop even on a terminal".to_string(),
         "  --data-root PATH         private data root (default $RIVECT_DATA_ROOT, else $HOME/.rivect)"

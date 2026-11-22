@@ -40,6 +40,7 @@ pub enum Invocation {
     Run {
         headless: bool,
         render: RenderMode,
+        mouse: bool,
         data_root: PathBuf,
     },
     /// Render one seeded review state on a terminal and exit.
@@ -126,6 +127,7 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
     }
     let mut data_root = default_data_root;
     let mut headless = false;
+    let mut mouse = true;
     // The screen-reader surface is selected by flag or by the standard's
     // environment variable; an explicit `--tui` still overrides the default.
     let mut render = if linear_requested() {
@@ -170,7 +172,7 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
                 };
             }
             "--linear" if subcommand.is_none() => render = RenderMode::Linear,
-            "--no-mouse" if subcommand.is_none() => {}
+            "--no-mouse" if subcommand.is_none() => mouse = false,
             "--headless" if subcommand.is_none() => headless = true,
             "--data-root" => {
                 index += 1;
@@ -214,6 +216,7 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
     Ok(Invocation::Run {
         headless,
         render,
+        mouse,
         data_root,
     })
 }

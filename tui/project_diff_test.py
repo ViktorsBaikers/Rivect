@@ -111,9 +111,10 @@ def exercise(binary, allow, secret, *, delayed=False, chat=False, connection='vl
                             if lifecycle != 'running':
                                 break
                         time.sleep(.05)
-                    assert len(posts) == 1 and not posts[0].get('tools') and file.read_text() == original
+                    assert len(posts) == 1 and posts[0].get('tools') and file.read_text() == original
                     with sqlite3.connect((data/'runtime/rivect.db').as_uri()+'?mode=ro', uri=True) as db:
-                        assert not db.execute('select 1 from attempts').fetchone()
+                        assert not db.execute(
+                            "select 1 from attempts where effect_class in ('write','exec')").fetchone()
                     return
                 if delay is not None:
                     entered, closed = delay

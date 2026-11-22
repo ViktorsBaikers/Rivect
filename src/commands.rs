@@ -710,7 +710,6 @@ impl Runtime {
         &mut self,
         work: UiAnswer,
         stop: Arc<AtomicBool>,
-        pending: &AtomicBool,
         preview: &dyn Fn(&str),
     ) -> Result<Option<crate::resources::OutputSettlement>, StoreError> {
         let UiAnswer {
@@ -726,23 +725,11 @@ impl Runtime {
             .0
             .pop()
             .ok_or_else(|| StoreError::NotFound(crate::state::Missing::Task(task.0.clone())))?;
-        if row.origin == crate::state::UI_MESSAGE_PRINCIPAL {
-            let mut goal = row.goal;
-            if let AnswerSelection::Custom { text } = selection {
-                goal.push('\n');
-                goal.push_str(&text);
-            }
-            let message = UiMessage {
-                session,
-                task,
-                goal,
-                config: self.config_for_broker(),
-                image,
-                revision: row.revision,
-                intent,
-            };
-            return self.finish_ui_message(message, &stop, pending, preview);
-        }
+        // An ordinary prompt starts the same tool-capable task run as /task:
+        // the reserved start answer resumes the controller, never a second
+        // tool-free completion. Only the unpaired private route keeps the
+        // direct UI message.
+        let ui_message = row.origin == crate::state::UI_MESSAGE_PRINCIPAL;
         if stop.load(Ordering::Acquire) {
             self.owner.store.cancel_task(
                 &session,
@@ -754,17 +741,42 @@ impl Runtime {
         }
         self.foreground = Some(ForegroundWork {
             task_id: task.clone(),
-            cancel: stop,
+            cancel: Arc::clone(&stop),
             reply: None,
             share_reads: false,
         });
-        let resumed = self.resume_answered_with_image(&session, &task, selection, image);
+        let resumed =
+            self.resume_answered_with_image(&session, &task, selection, image, Some(preview));
         let reply = self.foreground.take().and_then(|work| work.reply);
         let result = match resumed {
-            Ok(_) => reply.map(Ok),
+            Ok(_) => match reply {
+                Some(text) if text.len() > crate::contracts::TEXT_MAX_BYTES => {
+                    self.owner.store.mark_no_ready(&task)?;
+                    Some(Err(ErrorCode::OutputLimit))
+                }
+                Some(text) => Some(Ok(text)),
+                None => None,
+            },
             Err(error) => {
                 self.owner.store.mark_no_ready(&task)?;
                 Some(Err(error.error_code()))
+            }
+        };
+        if ui_message {
+            match &result {
+                Some(Ok(text)) => self.owner.store.record_ui_reply(&task, Ok(text))?,
+                Some(Err(code)) => self.owner.store.record_ui_reply(&task, Err(*code))?,
+                None => {}
+            }
+        }
+        let settlement = if stop.load(Ordering::Acquire) {
+            None
+        } else {
+            match &result {
+                Some(Ok(_)) | None => Some(crate::resources::OutputSettlement::Complete),
+                Some(Err(code)) => Some(crate::resources::OutputSettlement::Failed {
+                    cause: code.as_str().replace('_', " "),
+                }),
             }
         };
         self.terminal_result = if let Some(result) = result {
@@ -778,7 +790,7 @@ impl Runtime {
         } else {
             None
         };
-        Ok(None)
+        Ok(settlement)
     }
 
     pub fn terminal_result(
@@ -859,13 +871,16 @@ impl Runtime {
             .map(|(session, _, _, _)| session)
     }
 
-    /// Durably accepts an ordinary message. An absent local route retains the
-    /// existing first-question workflow; a receipt never authorizes a second send.
+    /// Durably accepts an ordinary message. The paired terminal route starts
+    /// the same tool-capable task as `/task` and lets its witnessed start
+    /// answer resume the controller; only the unpaired private pipe keeps the
+    /// direct local completion. A receipt never authorizes a second send.
     pub fn begin_ui_message(
         &mut self,
         session: &SessionId,
         command: &str,
         goal: &str,
+        witness: bool,
     ) -> Result<(CommandResult, Option<UiMessage>), crate::controller::ControllerError> {
         let config = self.config_for_broker();
         let local = if config.models.defaults.is_some() {
@@ -878,7 +893,7 @@ impl Runtime {
                     crate::providers::ui_local_endpoint(&model.connection, entry)))
         } else {
             false
-        };
+        } && !witness;
         let prior = self.owner.store.receipt(command)?;
         let first_question = match &prior {
             Some((_, receipt)) => {
@@ -2229,13 +2244,14 @@ impl Runtime {
         session_id: &SessionId,
         task: &TaskId,
         selection: AnswerSelection,
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<ResumeAdmission, crate::controller::ControllerError> {
         match self
             .scheduler
             .submit_answered(task.clone(), selection, self.scoped_grant.clone())
         {
             Ok(Some(_)) => {
-                self.drain_scheduler(session_id)?;
+                self.drain_scheduler_with_preview(session_id, preview)?;
                 Ok(ResumeAdmission::Drained)
             }
             Ok(None) => {
@@ -2329,6 +2345,7 @@ impl Runtime {
         task: &TaskId,
         selection: AnswerSelection,
         image: Option<crate::model::PendingImage>,
+        preview: Option<&dyn Fn(&str)>,
     ) -> Result<ResumeAdmission, crate::controller::ControllerError> {
         match image {
             Some(image) => {
@@ -2338,7 +2355,7 @@ impl Runtime {
                 self.pending_images.remove(&task.0);
             }
         }
-        let resumed = self.resume_answered(session_id, task, selection);
+        let resumed = self.resume_answered(session_id, task, selection, preview);
         if resumed.is_err() || matches!(resumed, Ok(ResumeAdmission::Tombstoned)) {
             self.pending_images.remove(&task.0);
         }
@@ -7792,6 +7809,7 @@ fn submit_task(
                         &task,
                         selection.clone(),
                         pending_image,
+                        None,
                     ) {
                         // `result` is the answer-commit snapshot — read
                         // before the resume ran, and either arm can move

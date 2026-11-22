@@ -1,4 +1,5 @@
 import type { CliRenderer, PasteEvent, TextareaRenderable } from '@opentui/core';
+import { setMouseAllowed } from './modes-output';
 
 // Rust contracts::TEXT_MAX_BYTES bounds a composed goal, not the larger transport frame.
 export const goalByteLimit = 65_536;
@@ -7,7 +8,9 @@ const utf8 = new TextDecoder('utf-8', { fatal: true });
 export function mouseCommand(renderer: CliRenderer, command: string): string | undefined {
   const match = /^\/tui\s+mouse\s+(on|off)$/u.exec(command);
   if (!match) return;
-  renderer.useMouse = match[1] === 'on';
+  const enabled = match[1] === 'on';
+  renderer.useMouse = enabled;
+  setMouseAllowed(enabled);
   return 'tui: mouse ' + match[1];
 }
 

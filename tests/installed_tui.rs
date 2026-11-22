@@ -2210,17 +2210,17 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
             tui.wait("Message", WAIT)?;
             exercise_resize(&mut tui, geometry)?;
             let before = tui.bytes()?;
-            if has_mouse_capture(&before) {
-                return Err("mouse capture was on by default".to_string());
+            if !has_mouse_capture(&before) {
+                return Err("mouse capture was not on by default".to_string());
             }
+            tui.send(b"/tui mouse off\r")?;
+            tui.wait("tui: mouse off", WAIT)?;
             tui.send(b"/tui mouse on\r")?;
             tui.wait("tui: mouse on", WAIT)?;
             let enabled = tui.bytes()?;
             if !has_mouse_capture(&enabled) {
-                return Err("mouse capture did not enable".to_string());
+                return Err("mouse capture did not re-enable".to_string());
             }
-            tui.send(b"/tui mouse off\r")?;
-            tui.wait("tui: mouse off", WAIT)?;
             tui.send(b"\x1b")?;
             let (bytes, code) = tui.finish()?;
             if code != Some(0) {

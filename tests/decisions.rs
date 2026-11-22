@@ -5390,12 +5390,7 @@ fn terminal_answer_on_a_settled_tree_commits_without_resuming() {
         .expect("answer commit");
     world
         .runtime
-        .finish_terminal_answer(
-            work,
-            std::sync::Arc::default(),
-            &std::sync::atomic::AtomicBool::new(false),
-            &|_| {},
-        )
+        .finish_terminal_answer(work, std::sync::Arc::default(), &|_| {})
         .expect("settle without dispatch");
     assert_eq!(
         world
