@@ -188,6 +188,9 @@ pub const UI_TASK_PAGE: &str = "SELECT t.task_id, t.revision, t.lifecycle, t.eve
                 LEFT JOIN ui_message_replies r ON r.task_id=t.task_id
                 WHERE t.session_id=?1 AND (?2 IS NULL OR t.task_id=?2)
                 AND t.rowid <= ?4 ORDER BY t.rowid DESC LIMIT ?3";
+pub const TASK_IS_UI_MESSAGE: &str = "SELECT EXISTS(SELECT 1 FROM events
+                WHERE aggregate_id=?1 AND aggregate_revision=1
+                AND event_type='task.created' AND origin='ui-message')";
 pub const LAST_STEP_OUTPUT: &str = "SELECT aggregate_revision,event_type FROM events
     WHERE aggregate_id=?1 AND session_id=?2 AND task_id=?3 ORDER BY aggregate_revision DESC LIMIT 1";
 pub const UI_TASK_PAGE_ANCHOR: &str = "SELECT rowid FROM tasks WHERE session_id=?1 AND task_id=?2";

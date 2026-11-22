@@ -454,10 +454,16 @@ struct ConfirmedRead<'a> {
     digest: &'a str,
     retained_attempt_id: Option<String>,
     effect_attempt: String,
+    grant_id: &'a str,
+    preview: Option<&'a dyn Fn(&str)>,
+    auto_reads: u8,
 }
 
 pub(crate) const FILE_SHARE_QUESTION: &str = "share-file:";
 const SHARE_ONCE: &str = "share-once";
+/// One ordinary prompt may read this many files before the step stops for a
+/// fresh operator turn; each read is one model reply and one scoped effect.
+const AUTO_FILE_READS: u8 = 64;
 pub(crate) const FILE_WRITE_QUESTION: &str = "write-file:";
 pub(crate) const PROJECT_CHECK_QUESTION: &str = "run-check:";
 const ALLOW_WRITE: &str = "allow-write-once";
@@ -772,6 +778,37 @@ impl Runtime {
             Ok(pair) => pair,
             Err(waiting) => return Ok(waiting),
         };
+        self.execute_read(
+            session_id,
+            task_id,
+            target,
+            retained_attempt_id,
+            grant_id,
+            preview,
+            crash_after_dispatch,
+            AUTO_FILE_READS,
+        )
+    }
+
+    /// Admits and executes one scoped read, then hands the confirmed bytes to
+    /// the evidence/share continuation. An ordinary prompt's automatic share
+    /// may recurse here for the next file; the bound keeps one scheduler step
+    /// from becoming an unbounded model/file loop.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a read carries its task, target, retained model attempt, grant, preview sink and loop bound"
+    )]
+    fn execute_read(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        target: PathBuf,
+        retained_attempt_id: Option<String>,
+        grant_id: &str,
+        preview: Option<&dyn Fn(&str)>,
+        crash_after_dispatch: bool,
+        auto_reads: u8,
+    ) -> Result<StepOutcome, ControllerError> {
         let request = EffectRequest::Read {
             grant_id: grant_id.to_string(),
             path: target,
@@ -809,6 +846,9 @@ impl Runtime {
                     digest: &digest,
                     retained_attempt_id,
                     effect_attempt,
+                    grant_id,
+                    preview,
+                    auto_reads,
                 })
             }
             Ok(EffectOutcome::Denied { reason }) => {
@@ -1720,6 +1760,9 @@ impl Runtime {
             digest,
             retained_attempt_id,
             effect_attempt,
+            grant_id,
+            preview,
+            auto_reads,
         } = read;
         let observation = format!(
             "read {} bytes from {}; sha256={}",
@@ -1752,6 +1795,11 @@ impl Runtime {
             .as_ref()
             .is_some_and(|work| &work.task_id == task_id && work.share_reads)
         {
+            if self.owner.store.task_is_ui_message(task_id)? {
+                return self.auto_share_read(
+                    session_id, task_id, target, bytes, digest, grant_id, preview, auto_reads,
+                );
+            }
             return self.pause_for_file_share(session_id, task_id, target, bytes, digest);
         }
         let snapshot = self.owner.store.complete_if_eligible(session_id, task_id)?;
@@ -1766,6 +1814,107 @@ impl Runtime {
         bytes: &[u8],
         digest: &str,
     ) -> Result<StepOutcome, ControllerError> {
+        let (pending, question) = match self.file_share_pending(task, path, bytes, digest)? {
+            Ok(pair) => pair,
+            Err(outcome) => return Ok(outcome),
+        };
+        let snapshot = self.owner.store.publish_question(session, &question)?;
+        self.file_share = Some(pending);
+        Ok(StepOutcome::Waiting { snapshot })
+    }
+
+    /// The ordinary-prompt route: the operator's prompt selected this provider
+    /// and asked it to work on the project, so project reads are shared with
+    /// the same connection without a second card. `/task` keeps the explicit
+    /// per-file question in [`Self::pause_for_file_share`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the automatic share carries the read, its grant, the preview sink and the loop bound"
+    )]
+    fn auto_share_read(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        path: &std::path::Path,
+        bytes: &[u8],
+        digest: &str,
+        grant_id: &str,
+        preview: Option<&dyn Fn(&str)>,
+        auto_reads: u8,
+    ) -> Result<StepOutcome, ControllerError> {
+        if auto_reads == 0 {
+            return self.refuse_effect(task, "automatic file read limit reached");
+        }
+        let (share, _) = match self.file_share_pending(task, path, bytes, digest)? {
+            Ok(pair) => pair,
+            Err(outcome) => return Ok(outcome),
+        };
+        if self.policy.covers(&share.path) || !self.recipient_current(&share.recipient) {
+            return self.refuse_effect(task, "file disclosure recipient or policy changed");
+        }
+        self.dispatch_shared_read(session, task, share, grant_id, preview, auto_reads)
+    }
+
+    /// The one continuation after a read is shared: send the observation to
+    /// the model and either offer the next write/check or execute the next
+    /// scoped read. The caller's bound makes the recursion finite.
+    fn dispatch_shared_read(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        share: PendingFileShare,
+        grant_id: &str,
+        preview: Option<&dyn Fn(&str)>,
+        auto_reads: u8,
+    ) -> Result<StepOutcome, ControllerError> {
+        let result = self.dispatch_tool_observation(
+            session,
+            task,
+            &share.recipient,
+            &share.inputs.to_string(),
+            &["read_file", crate::providers::WRITE_FILE_TOOL],
+            preview,
+        )?;
+        let (reply, attempt_id) = match result {
+            Ok(result) => result,
+            Err(waiting) => return Ok(waiting),
+        };
+        if let [call] = reply.tool_calls.as_slice()
+            && call.tool == crate::providers::WRITE_FILE_TOOL
+        {
+            return self.offer_file_write(session, task, share, call);
+        }
+        match self.read_target_from_reply(task, reply, Some(attempt_id))? {
+            Ok((target, retained_attempt_id)) => {
+                if auto_reads == 0 {
+                    return self.refuse_effect(task, "automatic file read limit reached");
+                }
+                self.execute_read(
+                    session,
+                    task,
+                    target,
+                    retained_attempt_id,
+                    grant_id,
+                    preview,
+                    false,
+                    auto_reads - 1,
+                )
+            }
+            Err(outcome) => Ok(outcome),
+        }
+    }
+
+    /// Builds the pending disclosure and its card from the connection that
+    /// served the current reply. The gate is shared by the explicit `/task`
+    /// card and the ordinary-prompt automatic share, so neither can name a
+    /// recipient the other would reject.
+    fn file_share_pending(
+        &mut self,
+        task: &TaskId,
+        path: &std::path::Path,
+        bytes: &[u8],
+        digest: &str,
+    ) -> Result<Result<(PendingFileShare, Question), StepOutcome>, ControllerError> {
         let config = self.config_for_broker();
         // The latest served connection is the one the reply came from; the
         // bound profile covers the first dispatch before the economy
@@ -1776,20 +1925,28 @@ impl Runtime {
             .clone()
             .or_else(|| self.broker.bound_profile().map(|bound| bound.connection));
         let Some(connection) = selected else {
-            return self.refuse_effect(task, "file disclosure is unavailable for this connection");
+            return Ok(Err(self.refuse_effect(
+                task,
+                "file disclosure is unavailable for this connection",
+            )?));
         };
         let Some(entry) = config.connections.get(&connection) else {
-            return self.refuse_effect(task, "file disclosure is unavailable for this connection");
+            return Ok(Err(self.refuse_effect(
+                task,
+                "file disclosure is unavailable for this connection",
+            )?));
         };
         let Some(identity) = self.disclosure_recipient(&config, &connection) else {
-            return self.refuse_effect(
+            return Ok(Err(self.refuse_effect(
                 task,
                 "file disclosure requires a verified connection identity",
-            );
+            )?));
         };
         let endpoint = entry.endpoint.as_str();
         let Ok(text) = std::str::from_utf8(bytes) else {
-            return self.refuse_effect(task, "file disclosure requires utf-8");
+            return Ok(Err(
+                self.refuse_effect(task, "file disclosure requires utf-8")?
+            ));
         };
         let display_path = path
             .strip_prefix(&self.scope_root)
@@ -1841,9 +1998,7 @@ impl Runtime {
             },
             inputs,
         };
-        let snapshot = self.owner.store.publish_question(session, &question)?;
-        self.file_share = Some(pending);
-        Ok(StepOutcome::Waiting { snapshot })
+        Ok(Ok((pending, question)))
     }
 
     fn resume_file_share(

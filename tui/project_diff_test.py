@@ -111,7 +111,8 @@ def exercise(binary, allow, secret, *, delayed=False, chat=False, connection='vl
                             if lifecycle != 'running':
                                 break
                         time.sleep(.05)
-                    assert len(posts) == 1 and posts[0].get('tools') and file.read_text() == original
+                    assert len(posts) == 2 and posts[0].get('tools') and file.read_text() == original
+                    assert 'const STOCK: u8 = 41;' in json.dumps(posts[1]), 'the read was not shared with the served connection'
                     with sqlite3.connect((data/'runtime/rivect.db').as_uri()+'?mode=ro', uri=True) as db:
                         assert not db.execute(
                             "select 1 from attempts where effect_class in ('write','exec')").fetchone()

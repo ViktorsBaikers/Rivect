@@ -4138,6 +4138,17 @@ impl TaskStore {
         Ok(Lifecycle::from_db(&lifecycle))
     }
 
+    /// Whether the operator started this task with an ordinary prompt. Such a
+    /// task carries the prompt's consent to show the selected provider the
+    /// project files it reads; `/task` keeps the per-file disclosure card.
+    pub fn task_is_ui_message(&self, task_id: &TaskId) -> Result<bool> {
+        self.conn()?
+            .query_row(sql::TASK_IS_UI_MESSAGE, params![task_id.0], |row| {
+                row.get(0)
+            })
+            .map_err(storage)
+    }
+
     // ----- snapshots -----
 
     fn snapshot_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &TaskId) -> Result<TaskSnapshot> {
