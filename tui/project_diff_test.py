@@ -98,10 +98,19 @@ def exercise(binary, allow, secret, *, delayed=False, chat=False, connection='vl
                 assert match, 'independent terminal witness did not paint its challenge'
                 os.write(master, match[1] + b'\r')
             try:
-                see('Message'); send('update inventory\r' if chat else '/task update inventory\r'); see('Begin the first step')
-                answer()
+                see('Message'); send('update inventory\r' if chat else '/task update inventory\r')
+                if not chat:
+                    see('Begin the first step')
+                    answer()
                 if chat:
-                    see('blocked')
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        if posts:
+                            with sqlite3.connect((data / 'runtime/rivect.db').as_uri() + '?mode=ro', uri=True) as db:
+                                lifecycle = db.execute('select lifecycle from tasks').fetchone()[0]
+                            if lifecycle != 'running':
+                                break
+                        time.sleep(.05)
                     assert len(posts) == 1 and not posts[0].get('tools') and file.read_text() == original
                     with sqlite3.connect((data/'runtime/rivect.db').as_uri()+'?mode=ro', uri=True) as db:
                         assert not db.execute('select 1 from attempts').fetchone()

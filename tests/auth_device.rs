@@ -20,6 +20,7 @@ use rivect::commands::{Ingress, dispatch_runtime_request};
 use rivect::config::Config;
 use rivect::model::{Broker, NullLedger};
 use rivect::providers::kimi::{self, KimiProvider};
+use rivect::providers::login_catalog::{PROVIDERS, method};
 use rivect::providers::openai_login::{
     self, CANONICAL_PROFILE, DeviceAdvance, DeviceEndpoints, DeviceLoginSession,
     LoginError as CodexLoginError, canonical_reference, read_credential,
@@ -2293,4 +2294,56 @@ fn browser_redirect_completes_without_a_paste() {
     );
     assert_eq!(completed["profile"], CANONICAL_PROFILE);
     assert!(store.occupied(&reference).expect("the store answers"));
+}
+
+/// Every catalogue row that advertises a stored-key method must declare its
+/// connection and land the key in the local document. This is the offline
+/// matrix behind "the other providers work too"; interactive legs are opened
+/// only against their recorded peers and stay out of this check.
+#[test]
+fn every_stored_key_catalogue_row_logs_in_locally() {
+    let config = support::base_config();
+    let mut world = support::open_world("catalogue-login", Some(&config));
+    let mut profiles = Vec::new();
+    for provider in PROVIDERS {
+        if method(provider, "api_key").is_none() {
+            continue;
+        }
+        rpc_ok(
+            &mut world,
+            "provider.connect",
+            json!({"schema_version": 1, "id": provider.id}),
+        );
+        let key = format!("sk-{}-matrix", provider.id);
+        let receipt = rpc_ok(
+            &mut world,
+            "auth.login.apikey",
+            json!({"schema_version": 1, "connection": provider.id, "key": key}),
+        );
+        assert_eq!(receipt["profile"], provider.profile, "{}", provider.id);
+        assert_eq!(receipt["replaced"], false, "{}", provider.id);
+        profiles.push((provider.profile, key));
+    }
+    assert!(
+        profiles.len() >= 40,
+        "the served stored-key roster shrank: {}",
+        profiles.len()
+    );
+    let document: Value = serde_json::from_slice(
+        &std::fs::read(world.root.join("runtime/credentials.json")).expect("local document"),
+    )
+    .expect("valid document");
+    for (profile, key) in profiles {
+        let scope = format!("rivect/{profile}");
+        let stored = document["entries"][scope.as_str()]
+            .as_array()
+            .unwrap_or_else(|| panic!("no entry for {scope}: {document}"));
+        let bytes = stored
+            .iter()
+            .map(Value::as_u64)
+            .collect::<Option<Vec<_>>>()
+            .expect("byte entry");
+        let expected = key.bytes().map(u64::from).collect::<Vec<_>>();
+        assert_eq!(bytes, expected, "{scope}");
+    }
 }

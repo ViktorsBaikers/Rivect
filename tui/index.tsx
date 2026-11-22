@@ -212,13 +212,37 @@ export function Thread(opened: Startup) {
   }
   const reviewingHistory = () => !!editor?.plainText || selected() !== undefined || choices().length > 0 ||
     history.scrollTop + history.height < history.scrollHeight;
-  async function loadQuestion(owner: CoreClient, task: Task, mode: 'open' | 'inspect' | 'update' = 'open', answered?: Question) {
+  const startedTask = new Set<string>();
+  const isTaskStart = (value: Question) => value.pin.question_id === 'task-start:' + value.pin.task_id;
+  async function loadQuestion(owner: CoreClient, task: Task, mode: 'open' | 'inspect' | 'update' = 'open', answered?: Question, autoStart = false) {
     try {
       const value = await owner.question(task);
       if (disposed || core !== owner) return;
       if (value && value.session === task.session && value.pin.task_id === task.id) {
         if (answered && sameFork(value, answered)) return;
         if (mode === 'update' && reviewingHistory()) return;
+        // An ordinary prompt carries the operator's start consent already:
+        // answer the reserved first step silently instead of publishing a
+        // one-option card and asking for a second terminal witness.
+        if (autoStart && !image && isTaskStart(value)) {
+          if (!startedTask.has(value.pin.question_id)) {
+            startedTask.add(value.pin.question_id);
+            let attempts = 0;
+            const begin = () => {
+              if (disposed || core !== owner) return;
+              if (sending && attempts++ < 40) { setTimeout(begin, 25); return; }
+              if (question()) return;
+              if (attempts >= 40) {
+                pendingSubject = task;
+                setQuestion(value);
+                return;
+              }
+              void answer({kind: 'option', option_id: 'begin'}, value);
+            };
+            setTimeout(begin, 0);
+          }
+          return;
+        }
         pendingSubject = task;
         dismissedFork = undefined;
         setChoices([]);
@@ -247,19 +271,19 @@ export function Thread(opened: Startup) {
     setQuestion(next);
     setNotice('Question changed.');
   }
-  async function answer(selection: Selection) {
-    const pending = question(), owner = core;
+  async function answer(selection: Selection, silentStart?: Question) {
+    const pending = silentStart ?? question(), owner = core;
     const task = turns().find(t => t.session === pending?.session && t.id === pending?.pin.task_id);
     if (sending || !pending || !owner || !task) return;
     sending = true;
     clearTimeout(timer);
     try {
       await reading;
-      if (disposed || pending !== question()) return;
-      await renderer.suspend();
+      if (disposed || (!silentStart && pending !== question())) return;
+      if (!silentStart) await renderer.suspend();
       let lines: string[];
-      try { lines = await owner.answer(pending, selection, image); }
-      finally { if (!disposed) await renderer.resume(); }
+      try { lines = await owner.answer(pending, selection, image, silentStart !== undefined); }
+      finally { if (!silentStart && !disposed) await renderer.resume(); }
       image = undefined;
       if (disposed) return;
       if (reviewedPatch?.question === pending && selection.kind === 'option' && selection.option_id === 'allow-write-once') {
@@ -271,13 +295,16 @@ export function Thread(opened: Startup) {
       const next = await owner.refresh(task);
       replace(task, next);
       if (!disposed && next.state === 'waiting') await loadQuestion(owner, next, 'update', pending);
-    } catch {
+    } catch (error) {
       if (!disposed) {
         dismissedFork = pending;
         setQuestion(undefined);
-        const previousNotice = notice();
-        await loadQuestion(owner, task, 'open', pending);
-        if (!disposed && notice() === previousNotice) setNotice('Check /decision before attempting another answer.');
+        if (silentStart) setNotice('First step refused: ' + (error instanceof Error ? error.message : 'unknown cause') + '. Use /decision to retry.');
+        else {
+          const previousNotice = notice();
+          await loadQuestion(owner, task, 'open', pending);
+          if (!disposed && notice() === previousNotice) setNotice('Check /decision before attempting another answer.');
+        }
       }
     } finally { sending = false; watch(); }
   }
@@ -569,7 +596,7 @@ export function Thread(opened: Startup) {
         setTurns(previous => [...previous, task]);
         setNotice('');
         if (task.state !== 'running') await loadPermission(owner);
-        if (task.state === 'waiting') await loadQuestion(owner, task);
+        if (task.state === 'waiting') await loadQuestion(owner, task, 'open', undefined, !project);
       }
       if (!listSessions) setRecent([]);
       if (editor.plainText === goal) editor.clear();

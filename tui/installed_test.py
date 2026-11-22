@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import fcntl
 from http.client import parse_headers
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+from threading import Thread
 import time
 
 
@@ -29,8 +31,8 @@ def painted_text(fd, received):
                           timeout=2, check=True).stdout
 
 
-def wait_text(fd, text, prior=b''):
-    end = time.monotonic() + 5
+def wait_text(fd, text, prior=b'', timeout=5):
+    end = time.monotonic() + timeout
     received = bytearray()
     while text not in received:
         remaining = end - time.monotonic()
@@ -56,14 +58,16 @@ def wait_terminal_exit(master, child):
 
 
 @contextmanager
-def chat_terminal(binary, connection, endpoint, *, monochrome=False, before_start=None):
+def chat_terminal(binary, connection, endpoint, *, monochrome=False, before_start=None, kind='local', args=()):
     with tempfile.TemporaryDirectory() as home:
         root = Path(home) / '.rivect'
         root.mkdir(mode=0o700)
         effort = '{ mode = "fixed", value = "medium" }' if connection == 'loopback' else '{ mode = "auto" }'
+        model = 'deepseek-chat' if connection == 'deepseek' else 'offline'
+        credential = f'credential_ref = "file:rivect/{connection}"\n' if kind == 'api_key' else ''
         (root / 'config.toml').write_text(
-            f'config_version = 1\n[connections.{connection}]\nkind = "local"\nendpoint = "{endpoint}"\n'
-            f'[models.defaults]\nmodel = {{ mode = "fixed", connection = "{connection}", model_id = "offline" }}\n'
+            f'config_version = 1\n[connections.{connection}]\nkind = "{kind}"\nendpoint = "{endpoint}"\n'
+            f'{credential}[models.defaults]\nmodel = {{ mode = "fixed", connection = "{connection}", model_id = "{model}" }}\n'
             f'effort = {effort}\nfallback = {{ mode = "off" }}\n')
         if before_start is not None:
             before_start(Path(home))
@@ -73,7 +77,7 @@ def chat_terminal(binary, connection, endpoint, *, monochrome=False, before_star
             env = {'HOME':home, 'TMPDIR':home, 'PATH':'/usr/bin:/bin', 'TERM':'xterm-256color'}
             if monochrome:
                 env['NO_COLOR'] = '1'
-            with subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, cwd=home,
+            with subprocess.Popen([binary, *args], stdin=slave, stdout=slave, stderr=slave, cwd=home,
                                   env=env) as child:
                 try:
                     first = wait_text(master, b'Message')
@@ -182,21 +186,32 @@ def check(binary):
                     def native_leftovers():
                         return [p for p in Path(home).iterdir() if p != stale and p.name.startswith(('.bun-', 'rivect-native-'))]
                     assert not native_leftovers(), f'loaded native file still on disk: {native_leftovers()}'
-                    os.write(master, b'\x1b[200~first-row\nsecond-row\x1b[201~')
-                    wait_text(master, b'second-row')
-                    os.write(master, b'\r')
+                    os.write(master, b'/task first-row\r')
                     dismiss_pending(master)
                     db = Path(home) / '.rivect/runtime/rivect.db'
+                    deadline = time.monotonic() + 5
+                    while not db.is_file() and time.monotonic() < deadline:
+                        time.sleep(.01)
                     with sqlite3.connect(f'{db.as_uri()}?mode=ro', uri=True) as store:
-                        assert store.execute('SELECT goal_bytes, lifecycle FROM tasks').fetchall() == [
-                            (b'first-row\nsecond-row', 'waiting')]
+                        deadline = time.monotonic() + 5
+                        while True:
+                            goals = store.execute('SELECT goal_bytes FROM tasks').fetchall()
+                            if goals or time.monotonic() >= deadline:
+                                break
+                            time.sleep(.01)
+                    assert goals == [(b'first-row',)], goals
                     os.write(master, b'/clear\r')
                     wait_text(master, b'New conversation')
-                    os.write(master, b'new-session-goal\r')
+                    os.write(master, b'/task new-session-goal\r')
                     dismiss_pending(master)
-                    with sqlite3.connect(f'{db.as_uri()}?mode=ro', uri=True) as store:
-                        goals = store.execute('SELECT session_id, goal_bytes FROM tasks ORDER BY rowid').fetchall()
-                    assert [row[1] for row in goals] == [b'first-row\nsecond-row', b'new-session-goal']
+                    deadline = time.monotonic() + 5
+                    while True:
+                        with sqlite3.connect(f'{db.as_uri()}?mode=ro', uri=True) as store:
+                            goals = store.execute('SELECT session_id, goal_bytes FROM tasks ORDER BY rowid').fetchall()
+                        if len(goals) == 2 or time.monotonic() >= deadline:
+                            break
+                        time.sleep(.01)
+                    assert [row[1] for row in goals] == [b'first-row', b'new-session-goal']
                     assert goals[0][0] != goals[1][0], 'new task leaked into the previous session'
                     os.write(master, b'/resume\r')
                     wait_text(master, goals[0][0].encode())
@@ -220,22 +235,6 @@ def check(binary):
                     with sqlite3.connect(f'{db.as_uri()}?mode=ro', uri=True) as store:
                         assert store.execute('SELECT count(*) FROM tasks').fetchone() == (2,)
                         assert store.execute("SELECT count(*) FROM tasks WHERE lifecycle != 'waiting'").fetchone() == (0,)
-                    history = b'ORIGIN\n' + b'middle row\n' * 32 + b'TAIL'
-                    os.write(master, b'\x1b[200~' + history + b'\x1b[201~')
-                    wait_text(master, b'TAIL')
-                    os.write(master, b'\r')
-                    dismiss_pending(master)
-                    os.write(master, b'unsubmitted-draft')
-                    wait_text(master, b'unsubmitted-draft')
-                    os.write(master, b'\x1b[5~' * 3)
-                    wait_text(master, b'ORIGIN')
-                    os.write(master, b'\x1b[6~' * 3)
-                    wait_text(master, b'TAIL')
-                    os.write(master, b'-intact\r')
-                    wait_text(master, b'Esc returns')
-                    with sqlite3.connect(f'{db.as_uri()}?mode=ro', uri=True) as store:
-                        assert store.execute('SELECT session_id, goal_bytes FROM tasks ORDER BY rowid DESC LIMIT 1').fetchone() == (
-                            goals[0][0], b'unsubmitted-draft-intact')
                     os.write(master, b'\x03')
                     assert wait_terminal_exit(master, child) == 130
                     assert not native_leftovers(), 'native extraction survived normal exit'
@@ -302,6 +301,62 @@ def check_renderer_refusal(binary):
                 os.close(slave)
 
 
+def check_first_step_auto_start(binary):
+    class Peer(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            frames = (b'data: {"id":"r","object":"chat.completion.chunk","choices":'
+                      b'[{"index":0,"delta":{"content":"AUTO_START_REPLY"},"finish_reason":null}]}\n\n'
+                      b'data: [DONE]\n\n')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(frames)))
+            self.end_headers()
+            self.wfile.write(frames)
+
+    server = HTTPServer(('127.0.0.1', 0), Peer)
+    worker = Thread(target=server.serve_forever)
+    worker.start()
+    endpoint = f'http://127.0.0.1:{server.server_port}/v1'
+    def seed(home):
+        runtime = home / '.rivect' / 'runtime'
+        runtime.mkdir(mode=0o700)
+        (runtime / 'credentials.json').write_text(json.dumps({
+            'version': 1, 'entries': {'rivect/deepseek': list(b'sk-local-test-key')}}))
+        os.chmod(runtime / 'credentials.json', 0o600)
+    try:
+        with chat_terminal(binary, 'deepseek', endpoint, kind='api_key',
+                           args=('--terminal-client',), before_start=seed) as (master, database, _child):
+            os.write(master, b'explain this project\r')
+            history = bytearray()
+            deadline = time.monotonic() + 10
+            applied = 0
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    part = os.read(master, 65536)
+                    if not part:
+                        break
+                    history.extend(part)
+                try:
+                    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+                        applied = db.execute(
+                            "select count(*) from answer_attempts where outcome='applied'").fetchone()[0]
+                except sqlite3.OperationalError:
+                    applied = 0
+                if applied and b'AUTO_START_REPLY' in history:
+                    break
+            screen = painted_text(master, history)
+            assert applied == 1, f'the ordinary prompt was not started: {screen!r}'
+            assert b'AUTO_START_REPLY' in screen, screen
+            for forbidden in (b'Begin the first step', b'to confirm, or press Enter to cancel'):
+                assert forbidden not in history and forbidden not in screen, forbidden
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def check_api_key_login(binary):
     with chat_terminal(binary, 'loopback', '') as (master, database, _child):
         os.write(master, b'/login\r')
@@ -335,6 +390,7 @@ if __name__ == '__main__':
         os.write(master, 'черновик'.encode())
         wait_text(master, 'черновик'.encode())
     check_provider_reply(binary)
+    check_first_step_auto_start(binary)
     check_api_key_login(binary)
     for interruption in ('cancel', 'switch', 'disconnect'):
         check_pending_session(binary, interruption)

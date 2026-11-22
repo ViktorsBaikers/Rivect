@@ -70,7 +70,7 @@ export interface CoreClient {
   resolvePermission(permission: Permission, choice: PermissionChoice): Promise<{closed:boolean; note:string}>;
   question(task: Task): Promise<Question | undefined>;
   reveal(question: Question): Promise<string>;
-  answer(question: Question, selection: Selection, image?: Image): Promise<string[]>;
+  answer(question: Question, selection: Selection, image?: Image, autoStart?: boolean): Promise<string[]>;
   command(kind: 'compact' | 'rewind' | 'image' | 'read', detail: {task_id?: string; path?: string}): Promise<{lines: string[]; image?: Image}>;
   newSession(): Promise<{session: string; previous: string} | {running: string}>;
   recentSessions(): Promise<string[]>;
@@ -253,9 +253,10 @@ export async function connectCore(): Promise<CoreClient> {
       if (typeof diff !== 'string' || !diff || Buffer.byteLength(diff) > 65536) throw new Error('invalid proposal');
       return diff;
     },
-    async answer(question, selection, image) {
+    async answer(question, selection, image, autoStart) {
       if (question.session !== session) throw new Error('inactive question session');
-      return strings((await request('operator.answer', {...question.pin, session_id: session, selection, ...(image && {image})})).lines);
+      return strings((await request('operator.answer', {...question.pin, session_id: session, selection,
+        ...(image && {image}), ...(autoStart && {auto_start:true})})).lines);
     },
     async command(kind, detail) {
       const reply = await request('composer.command', {...detail, kind, session_id: await currentSession()});

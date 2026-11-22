@@ -635,7 +635,7 @@ finally:
         with subprocess.Popen([command], cwd=self.home, env=env, stdin=slave, stdout=slave, stderr=slave) as child:
             try:
                 wait_text(master, b"Message")
-                os.write(master, b"before-switch\r")
+                os.write(master, b"/task before-switch\r")
                 dismiss_pending(master)
                 db = self.home / ".rivect/runtime/rivect.db"
                 with sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True) as store:

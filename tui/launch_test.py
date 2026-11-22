@@ -94,7 +94,7 @@ class Launch(unittest.TestCase):
         root = self.home / 'state with spaces'
         with self.terminal('--linear', '--data-root', str(root)) as (ui, master):
             transcript = wait_text(master, b'Message')
-            os.write(master, b'linear goal\r')
+            os.write(master, b'/task linear goal\r')
             transcript += wait_text(master, b'waiting')
             os.write(master, b'\x04')
             transcript += restored_linear_output(master, ui)
@@ -105,7 +105,7 @@ class Launch(unittest.TestCase):
     def test_inline_retains_turn_outside_fullscreen(self):
         with self.terminal('--tui', 'inline') as (ui, master):
             transcript = wait_text(master, b'Message')
-            os.write(master, b'inline goal\r')
+            os.write(master, b'/task inline goal\r')
             transcript += wait_text(master, b'waiting')
             os.write(master, b'\x03')
             deadline = time.monotonic() + 5
@@ -114,7 +114,7 @@ class Launch(unittest.TestCase):
                     transcript += os.read(master, 65536)
             self.assertEqual(ui.wait(timeout=1), 130)
             self.assertNotIn(b'\x1b[?1049h', transcript)
-            self.assertIn(b'You: inline goal', painted_text(master, transcript))
+            self.assertIn(b'Machine: inline goal', painted_text(master, transcript))
 
     def test_roundtrip_switches_capture(self):
         with self.terminal('--tui', 'inline') as (ui, master):
@@ -123,7 +123,7 @@ class Launch(unittest.TestCase):
             wait_text(master, b'\x1b[?1049h')
             os.write(master, b'\x14')  # Ctrl+T returns to captured scrollback.
             raw = wait_text(master, b'\x1b[?1049l')
-            os.write(master, b'captured turn\r')
+            os.write(master, b'/task captured turn\r')
             raw += wait_text(master, b'waiting')
             if b'Enter selects' not in raw: raw += wait_text(master, b'Enter selects')
             time.sleep(.23)
@@ -134,7 +134,7 @@ class Launch(unittest.TestCase):
             while ui.poll() is None and time.monotonic() < deadline:
                 if select.select([master], [], [], .05)[0]: raw += os.read(master, 65536)
             self.assertEqual(ui.wait(timeout=1), 0)
-            self.assertIn(b'You: captured turn', painted_text(master, raw))
+            self.assertIn(b'Machine: captured turn', painted_text(master, raw))
             with sqlite3.connect((self.home / '.rivect/runtime/rivect.db').as_uri() + '?mode=ro', uri=True) as db:
                 self.assertEqual(db.execute('SELECT count(*) FROM answer_attempts').fetchone(), (0,))
 

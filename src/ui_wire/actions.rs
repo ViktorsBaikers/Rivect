@@ -2,7 +2,7 @@
 
 use super::{Refusal, dispatch_common, string};
 use rivect::commands::{EconomySnapshot, Ingress, Runtime};
-use rivect::contracts::{Availability, ErrorCode, SessionId, TaskId};
+use rivect::contracts::{Availability, ErrorCode, QuestionId, SessionId, TaskId};
 use rivect::resources::sanitize_status_cause;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -513,12 +513,17 @@ pub(super) fn answer(
         return Err(Refusal::Denied);
     }
     let image = params.get("image");
-    if params
-        .as_object()
-        .is_none_or(|f| f.len() != 7 + usize::from(image.is_some()))
-    {
+    let auto_start = params.get("auto_start");
+    if params.as_object().is_none_or(|f| {
+        f.len() != 7 + usize::from(image.is_some()) + usize::from(auto_start.is_some())
+    }) {
         return Err(Refusal::Invalid);
     }
+    let auto_start = match auto_start {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(Refusal::Invalid),
+    };
     if let Some(image) = image
         && (image.as_object().is_none_or(|f| f.len() != 5)
             || string(image, "path")?.is_empty()
@@ -570,8 +575,22 @@ pub(super) fn answer(
     } else {
         None
     };
-    if !crate::ui_launch::confirm(&frame, params).map_err(Refusal::Witness)? {
+    if !auto_start && !crate::ui_launch::confirm(&frame, params).map_err(Refusal::Witness)? {
         return Err(Refusal::Denied);
+    }
+    if auto_start {
+        let task = TaskId(string(params, "task_id")?.to_owned());
+        let start =
+            rivect::contracts::Question::is_task_start_question(&QuestionId(id.to_owned()), &task);
+        // The first step carries no fork and no new authority: the operator
+        // just typed the goal. Every other question keeps the independent
+        // terminal witness, and an image still needs the manual card.
+        if preview.is_some() {
+            return Err(Refusal::Denied);
+        }
+        if !start {
+            return Err(Refusal::Invalid);
+        }
     }
     let mut request = json!({"schema_version":1,"kind":"answer","session_id":frame["session_id"],"task_id":frame["task_id"],
         "command_id":rivect::contracts::CommandId::generate(),"question_id":id,"expected_intent_revision":intent,

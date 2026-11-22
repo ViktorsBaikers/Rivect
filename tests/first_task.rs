@@ -3186,6 +3186,31 @@ fn dismiss_start_card(pty: &mut support::PtySession) -> String {
     id
 }
 
+/// The task id of an ordinary prompt that starts without a card.
+fn silent_task_id(pty: &mut support::PtySession) -> String {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let path = pty.data_root().join("runtime/rivect.db");
+        let id = path
+            .is_file()
+            .then(|| {
+                task_store(pty)
+                    .query_row(
+                        "SELECT task_id FROM tasks ORDER BY rowid DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok()
+            })
+            .flatten();
+        if let Some(id) = id {
+            return id;
+        }
+        assert!(std::time::Instant::now() < deadline, "no task receipt");
+        pty.pump_for(Duration::from_millis(25)).expect("pump task");
+    }
+}
+
 fn answer_card(pty: &mut support::PtySession, prompt: &str, second: bool) {
     see(pty, prompt);
     if second {
@@ -3251,7 +3276,7 @@ fn tui_lowercase_q_starts_composer_and_dispatches_exact_goal() {
     see_draft(&mut pty, "q");
     pty.send(b"uery the root\r")
         .expect("submit q-first message");
-    let id = dismiss_start_card(&mut pty);
+    let id = silent_task_id(&mut pty);
     see(&pty, "query the root");
     assert_saved_goal(&pty, &id, b"query the root");
     exit_thread(pty);
@@ -3265,7 +3290,7 @@ fn tui_bracketed_paste_fills_the_composer_without_submitting() {
     let draft = see_draft(&mut pty, "multi line\npaste goal");
     assert!(draft.contains("No active task"), "{draft}");
     pty.send(b"\r").expect("submit pasted message");
-    let id = dismiss_start_card(&mut pty);
+    let id = silent_task_id(&mut pty);
     assert_eq!(session_counts(&pty).0, 1, "exactly one task submitted");
     assert_saved_goal(&pty, &id, b"multi line\npaste goal");
     exit_thread(pty);
@@ -3279,7 +3304,7 @@ fn tui_char_chords_never_type_their_letter_into_the_composer() {
     pty.send(b"x").expect("bare x");
     see_draft(&mut pty, "x");
     pty.send(b"\r").expect("submit");
-    let id = dismiss_start_card(&mut pty);
+    let id = silent_task_id(&mut pty);
     assert_eq!(session_counts(&pty).0, 1, "exactly one task submitted");
     assert_saved_goal(&pty, &id, b"x");
     exit_thread(pty);
