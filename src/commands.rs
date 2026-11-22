@@ -123,6 +123,25 @@ pub(crate) fn tui_project_marker(root: &Path) -> String {
     format!("tui-project-{}-", config::hex(&digest))
 }
 
+/// The config-scoped recipient identity for a connection that is neither
+/// Codex nor keyless loopback. It deliberately hashes only config data and the
+/// resolved credential reference: a file disclosure must re-check the exact
+/// endpoint and binding the operator saw, never read material to name it.
+fn generic_disclosure_identity(config: &config::Config, id: &str) -> Option<String> {
+    use sha2::Digest as _;
+    let entry = config.connections.get(id)?;
+    let credential = crate::providers::resolve_credential(config, id).ok()?;
+    let identity = format!(
+        "{id}\n{}\n{}\n{}\n{}\n{}",
+        entry.kind,
+        entry.endpoint,
+        entry.region.as_deref().unwrap_or_default(),
+        entry.profile.as_deref().unwrap_or_default(),
+        credential.raw()
+    );
+    Some(config::hex(&sha2::Sha256::digest(identity.as_bytes())))
+}
+
 /// The runtime's closed binding: the owner and the policy are read through
 /// accessors and never rebound from outside the crate.
 ///
@@ -2112,6 +2131,26 @@ impl Runtime {
             return Some("loopback-keyless".to_string());
         }
         None
+    }
+
+    /// The recipient a file disclosure may name: the private-context identity
+    /// for Codex and keyless loopback, or a config-scoped identity for any
+    /// other connection whose credential reference resolves. The latter never
+    /// reads key material; the resolved reference, endpoint, region and
+    /// profile are config data and change together with a different binding.
+    pub(crate) fn disclosure_recipient(&self, config: &config::Config, id: &str) -> Option<String> {
+        use crate::providers::openai_login as codex;
+        let canonical_codex = config.connections.get(id).is_some_and(|entry| {
+            id == codex::CANONICAL_PROFILE
+                && entry.endpoint == "https://chatgpt.com/backend-api/codex"
+        });
+        if canonical_codex {
+            // The account identity is the Codex disclosure boundary; a
+            // config-only hash must never stand in for it.
+            return self.private_context_recipient(config, id);
+        }
+        self.private_context_recipient(config, id)
+            .or_else(|| generic_disclosure_identity(config, id))
     }
 
     /// The applied effective config snapshot: a borrowed read of what
@@ -9619,6 +9658,37 @@ mod tests {
     use serde_json::Value;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    const REMOTE_CONFIG: &str = "config_version = 1\n[connections.remote]\nkind = \"api_key\"\nendpoint = \"https://api.example/v1\"\ncredential_ref = \"file:rivect/remote\"\n[models.defaults]\nmodel = { mode = \"fixed\", connection = \"remote\", model_id = \"fixture\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n";
+
+    #[test]
+    fn generic_disclosure_identity_binds_the_remote_connection() -> TestResult {
+        let mut parsed = config::Config::parse_validated(REMOTE_CONFIG)?;
+        let first =
+            super::generic_disclosure_identity(&parsed, "remote").expect("resolved binding");
+        parsed
+            .connections
+            .get_mut("remote")
+            .expect("remote")
+            .endpoint = "https://api.example/v2".to_string();
+        let moved =
+            super::generic_disclosure_identity(&parsed, "remote").expect("resolved binding");
+        assert_ne!(
+            first, moved,
+            "endpoint change must change the recipient identity"
+        );
+        parsed
+            .connections
+            .get_mut("remote")
+            .expect("remote")
+            .credential_ref = None;
+        assert_eq!(
+            super::generic_disclosure_identity(&parsed, "remote"),
+            None,
+            "an unresolved credential names no recipient"
+        );
+        Ok(())
+    }
 
     type AnswerObserver = dyn FnMut(
             &(

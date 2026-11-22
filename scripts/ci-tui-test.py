@@ -11,7 +11,7 @@ from time import monotonic
 ROOT = Path(__file__).resolve().parents[1]
 PRIVATE_CLIENT = frozenset({
     "input_test.py", "installed_test.py", "operator_test.py",
-    "scroll_test.py", "session_test.py", "streaming_test.py", "thread_test.py",
+    "scroll_test.py", "share_test.py", "session_test.py", "streaming_test.py", "thread_test.py",
 })
 
 

@@ -1767,24 +1767,27 @@ impl Runtime {
         digest: &str,
     ) -> Result<StepOutcome, ControllerError> {
         let config = self.config_for_broker();
-        let selected = self.economy().connection.as_deref();
-        let allowed = selected.and_then(|connection| {
-            let entry = config.connections.get(connection)?;
-            let canonical_codex = connection == crate::providers::openai_login::CANONICAL_PROFILE
-                && entry.endpoint == "https://chatgpt.com/backend-api/codex";
-            let loopback = entry.kind == crate::config::ConnKind::Local
-                && crate::providers::loopback_base(connection, &entry.endpoint).is_ok();
-            (canonical_codex || loopback).then_some((connection, entry.endpoint.as_str()))
-        });
-        let Some((connection, endpoint)) = allowed else {
+        // The latest served connection is the one the reply came from; the
+        // bound profile covers the first dispatch before the economy
+        // projection has observed its settlement.
+        let selected = self
+            .economy()
+            .connection
+            .clone()
+            .or_else(|| self.broker.bound_profile().map(|bound| bound.connection));
+        let Some(connection) = selected else {
             return self.refuse_effect(task, "file disclosure is unavailable for this connection");
         };
-        let Some(identity) = self.private_context_recipient(&config, connection) else {
+        let Some(entry) = config.connections.get(&connection) else {
+            return self.refuse_effect(task, "file disclosure is unavailable for this connection");
+        };
+        let Some(identity) = self.disclosure_recipient(&config, &connection) else {
             return self.refuse_effect(
                 task,
                 "file disclosure requires a verified connection identity",
             );
         };
+        let endpoint = entry.endpoint.as_str();
         let Ok(text) = std::str::from_utf8(bytes) else {
             return self.refuse_effect(task, "file disclosure requires utf-8");
         };
@@ -1831,7 +1834,7 @@ impl Runtime {
             path: path.to_path_buf(),
             digest: digest.to_string(),
             recipient: ApprovedRecipient {
-                connection: connection.to_string(),
+                connection: connection.clone(),
                 endpoint: endpoint.to_string(),
                 config_revision: self.effective().sources_digest.clone(),
                 identity,
@@ -1902,7 +1905,7 @@ impl Runtime {
     fn recipient_current(&self, recipient: &ApprovedRecipient) -> bool {
         recipient.config_revision == self.effective().sources_digest
             && self
-                .private_context_recipient(&self.config_for_broker(), &recipient.connection)
+                .disclosure_recipient(&self.config_for_broker(), &recipient.connection)
                 .is_some_and(|identity| identity == recipient.identity)
             && self.policy.decide(
                 std::path::Path::new(&recipient.endpoint),
