@@ -49,7 +49,7 @@ use super::anthropic_login::{LoginError, read_subscription};
 use super::sse::{MAX_STREAM_BYTES, SseEvent, SseParser};
 use super::{
     CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply, ToolCall,
-    WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
+    TransportCause, WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
     open_proxy_connection, payload_reason, positive_count, read_catalog_body, read_chunk,
     resolve_admitted_credential_in, retain_lineage_epoch, retire_displaced_epochs, route_for,
     routes_for, sse, transport, transport_status, violation, wire_body, wire_effort,
@@ -528,9 +528,24 @@ impl MessagesBody for ForegroundBody<'_> {
         mut visit: impl FnMut(&[u8]) -> Result<(), ProviderError>,
     ) -> Result<(), ProviderError> {
         self.post.drive(connection, async {
-            while let Some(chunk) = self.response.chunk().await.map_err(|err| {
-                super::transport_io(connection, std::io::Error::other(err.without_url()))
-            })? {
+            while let Some(chunk) = {
+                // The async client request timeout ends at the headers, so
+                // each body read carries the remaining shared budget itself:
+                // a peer that holds the response open still trips the
+                // recorded deadline instead of hanging the stream.
+                let remaining = deadline.saturating_sub(started.elapsed());
+                match tokio::time::timeout(remaining, self.response.chunk()).await {
+                    Ok(chunk) => chunk.map_err(|err| {
+                        super::transport_io(connection, std::io::Error::other(err.without_url()))
+                    })?,
+                    Err(_elapsed) => {
+                        return Err(ProviderError::Transport {
+                            connection: connection.to_owned(),
+                            cause: TransportCause::Deadline { budget: deadline },
+                        });
+                    }
+                }
+            } {
                 self.post.check_cancel(connection)?;
                 check_deadline(connection, deadline, started)?;
                 visit(&chunk)?;

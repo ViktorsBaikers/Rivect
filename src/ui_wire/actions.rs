@@ -606,5 +606,12 @@ pub(super) fn answer(
             .map_err(Refusal::Core)?,
     ));
     let snapshot = super::committed_snapshot(rt, &session, &task)?;
-    Ok(json!({"lines":["decision answer recorded"],"snapshot":snapshot}))
+    // The implicit task-start answer the operator never confirmed by hand
+    // stays silent; a manual card answer reports its receipt.
+    let lines: &[&str] = if auto_start {
+        &[]
+    } else {
+        &["decision answer recorded"]
+    };
+    Ok(json!({"lines":lines,"snapshot":snapshot}))
 }

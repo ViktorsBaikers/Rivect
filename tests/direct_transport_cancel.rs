@@ -172,3 +172,72 @@ fallback = {{ mode = "manual" }}
     assert!(matches!(listener.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock));
     Ok(())
 }
+
+/// Regression for the silent-stream hang (v0.1.24): the async client
+/// request timeout ends at the headers, so a peer that answers `200`
+/// and then never sends a byte parked the foreground dispatch forever
+/// — the user-visible "streaming" that never completes. Each body read
+/// must carry the remaining send budget itself.
+#[test]
+fn a_silent_sse_body_trips_the_send_deadline() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    let config = Config::parse_validated(&format!(
+        r#"config_version = 1
+[connections.anthropic]
+kind = "api_key"
+endpoint = "http://127.0.0.1:{port}/v1"
+credential_ref = "keyring:rivect-test/anthropic"
+[models.defaults]
+model = {{ mode = "fixed", connection = "anthropic", model_id = "claude-opus-4-8" }}
+effort = {{ mode = "auto" }}
+fallback = {{ mode = "off" }}
+"#
+    ))?;
+    let store: Arc<dyn CredentialStore> = Arc::new(support::MapStore::seeded(
+        StoreKind::Keychain,
+        &[("keyring:rivect-test/anthropic", "fixture-only")],
+    ));
+    let provider = rivect::providers::anthropic::MessagesProvider::with_deadline(
+        &config,
+        "anthropic",
+        store,
+        Duration::from_secs(2),
+    )?;
+    let mut broker = Broker::new(Box::new(provider));
+    let world = "/world/stall";
+    let manifest = broker.prepare("main", &config, world, "fixture")?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    // The detached worker lets the test prove the dispatch returned:
+    // without the bound this call never yields, and a scoped join would
+    // hang the suite instead of failing it.
+    let worker_cancel = Arc::clone(&cancel);
+    let (report, outcome) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("stalled-stream-dispatch".to_string())
+        .spawn(move || {
+            let mut ledger = NullLedger;
+            let result = broker.dispatch_with_cancel(
+                &mut ledger,
+                world,
+                &manifest,
+                Some(worker_cancel.as_ref()),
+            );
+            let _dropped = report.send(result);
+        })?;
+    let (mut stream, _) = listener.accept()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    receive_post(&mut stream)?;
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: keep-alive\n\n",
+    )?;
+    let reply = outcome.recv_timeout(Duration::from_secs(30))?;
+    assert!(
+        matches!(
+            reply,
+            Err(ModelError::Provider(ProviderError::Transport { .. }))
+        ),
+        "the stalled stream must end on the send deadline, got {reply:?}"
+    );
+    Ok(())
+}
